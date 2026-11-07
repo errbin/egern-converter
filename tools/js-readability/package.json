@@ -1,0 +1,6 @@
+{
+  "name": "egern-hub-js-readability",
+  "private": true,
+  "type": "module",
+  "dependencies": {"acorn": "8.15.0", "astring": "1.9.0"}
+}

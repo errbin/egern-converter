@@ -1,0 +1,672 @@
+import {parse} from '../core/syntax.mjs';
+import {index,patch,property,key,children,functions,initializedAfter,factoryArgument} from '../core/ast.mjs';
+import {methodContract} from './clients.mjs';
+import {platformFold} from './globals.mjs';
+import {simplify} from '../transforms/simplify.mjs';
+import {reviewedHTTPDelegate} from '../http/requests.mjs';
+
+// Specialize closed, reviewed Env factories for completion or plain-key storage.
+// Constructors and completion retain their original logging/time expressions.
+// No Env object or unused storage/HTTP/Node implementation is emitted.
+
+const loggingFactory='6223927216aa9cf3b5c62c458e0671173d029bfca0e1eb74db808e5e40e1986f';
+const storageFactory='694d53adc2d0165bc78820fdf1ffbe2bb47da163ff61c665f20c0cf02481096b';
+// Reviewed older Env: same constructor/plain-key storage; done logs elapsed
+// time before the authored Surge/Loon/QX completion branch. No dynamic eval or
+// Node method is reachable from this closed, combined entry contract.
+const storageCompletionFactory='a09db6912dfa6bc7afb42c6d23330f816b666ee88d1e1687054d95c252fdef58';
+
+// Retain the complete constructor/helper closure, but omit unreachable instance
+// methods before contract matching. A new unused platform method cannot change
+// the reviewed completion/storage semantics; constructor/used edits still do.
+export function envMethodContract(fn,entries){
+ const root=fn.body.body.find(n=>n.type==='ReturnStatement'&&n.argument?.type==='NewExpression'&&n.argument.callee.type==='ClassExpression')?.argument.callee;
+ if(!root||root.superClass||root.body.body.some(m=>m.type!=='MethodDefinition'||m.static||m.computed||!['method','constructor'].includes(m.kind)))return null;
+ const methods=new Map(root.body.body.map(m=>[key(m),m]));
+ if(methods.size!==root.body.body.length||entries.some(name=>!methods.has(name)))return null;
+ const reachable=new Set(['constructor',...entries]),queue=[...reachable];
+ while(queue.length){
+  const method=methods.get(queue.shift());if(!method)continue;
+  for(const n of index(method.value).nodes)if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'){
+   const name=property(n);if(name===undefined)return null;
+   if(methods.has(name)&&!reachable.has(name)){reachable.add(name);queue.push(name);}
+  }
+ }
+ function reduce(n){
+  if(n===root)return {...n,body:{...n.body,body:n.body.body.filter(m=>reachable.has(key(m)))}};
+  const result={...n};for(const [k,c]of children(n)){
+   if(Array.isArray(n[k])){if(result[k]===n[k])result[k]=[...n[k]];result[k][n[k].indexOf(c)]=reduce(c);}
+   else result[k]=reduce(c);
+  }return result;
+ }
+ return methodContract(reduce(fn));
+}
+
+export function lowerEnv(source,format){
+ if(!['surge','loon','qx','stash','shadowrocket'].includes(format))return source;
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,bindings}=ix,replace=new WeakMap(),removed=new WeakSet();
+ const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let value=base,i=2;while(names.has(value))value=base+i++;names.add(value);return value;};
+ for(const fn of nodes.filter(n=>n.type==='FunctionDeclaration')){
+  if(!fn.body.body.some(n=>n.type==='ReturnStatement'&&n.argument?.type==='NewExpression'&&n.argument.callee.type==='ClassExpression'))continue;
+  const binding=bindings.get(fn.id);
+  if(!binding?.refs.length||binding.writes.length)continue;
+  const storageOnly=envMethodContract(fn,['getdata','setdata'])===storageFactory;
+  const storageCompletion=envMethodContract(fn,['getdata','done'])===storageCompletionFactory;
+  if(!storageOnly&&!storageCompletion&&envMethodContract(fn,['done'])!==loggingFactory)continue;
+  if(nodes.filter(n=>n.type==='FunctionDeclaration'&&bindings.get(n.id)===binding).length!==1)continue;
+  const local=index(fn);
+  if(local.nodes.some(n=>local.free(n)&&!ix.free(n)))continue;
+  const constructors=binding.refs.map(ref=>parents.get(ref));
+  if(constructors.some(n=>n?.type!=='NewExpression'||n.callee.type!=='Identifier'||bindings.get(n.callee)!==binding||n.arguments.length!==1||n.arguments[0].type!=='Literal'||typeof n.arguments[0].value!=='string'))continue;
+  const plans=[];
+  for(const call of constructors){
+   const d=parents.get(call),declaration=parents.get(d),block=parents.get(declaration);
+   if(d?.type!=='VariableDeclarator'||d.init!==call||d.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1||!['Program','BlockStatement'].includes(block?.type)){plans.length=0;break;}
+   const instance=bindings.get(d.id);
+   if(!instance?.refs.length||instance.writes.length){plans.length=0;break;}
+   const calls=[];
+   for(const ref of instance.refs){
+    const member=parents.get(ref),use=parents.get(member);
+    const method=property(member);
+    const allowed=storageOnly&&['getdata','setdata'].includes(method)||storageCompletion&&method==='done'||!storageOnly&&!storageCompletion&&method==='done';
+    if(member?.type!=='MemberExpression'||member.object!==ref||!allowed||use?.type!=='CallExpression'||use.callee!==member||use.arguments.some(a=>a.type==='SpreadElement')){calls.length=0;break;}
+    const storage=method!=='done';
+    if(storage){
+     const key=use.arguments[method==='getdata'?0:1];
+     if(use.arguments.length!==(method==='getdata'?1:2)||key?.type!=='Literal'||typeof key.value!=='string'||key.value.startsWith('@')){calls.length=0;break;}
+    }else if(use.arguments.length>1||parents.get(use)?.type!=='ExpressionStatement'){calls.length=0;break;}
+    let statement=use;while(parents.get(statement)&&parents.get(statement)!==block)statement=parents.get(statement);
+    const nested=ix.owners.get(ref)!==ix.owners.get(declaration);
+    if(parents.get(statement)!==block||statement.start<declaration.end||nested&&(!storage||block.type!=='Program'||block.body[0]!==declaration)){calls.length=0;break;}
+    calls.push(use);
+   }
+   if(!calls.length){plans.length=0;break;}
+   plans.push({declaration,calls,name:JSON.stringify(call.arguments[0].value),started:fresh('envStarted'),storageOnly});
+  }
+  if(!plans.length)continue;
+  removed.add(fn);
+  for(const {declaration,calls,name,started,storageOnly} of plans){
+   replace.set(declaration,`const ${started} = new Date().getTime();console.log('\\n🔔' + ${name} + ', 开始!');`);
+   for(const call of calls){
+    if(property(call.callee)!=='done'){replace.set(call,()=>property(call.callee)==='getdata'?`$persistentStore.read(${render(call.arguments[0])})`:`$persistentStore.write(${call.arguments.map(render).join(', ')})`);continue;}
+    const value=fresh('completionValue');
+    replace.set(parents.get(call),()=>`{const ${value} = ${call.arguments[0]?render(call.arguments[0]):'{}'};console.log('\\n🔔' + ${name} + ', 结束! 🕛 ' + ((new Date().getTime() - ${started}) / 1000) + ' 秒');console.log('');$done(${value});}`);
+   }
+  }
+ }
+ function render(n){if(removed.has(n))return '';const value=replace.get(n);return value===undefined?patch(source,n,render):typeof value==='function'?value():value;}
+ return render(tree);
+}
+
+// Erase stateless, closed Env object factories. Reachability is derived from
+// local calls, never author/file names. Unused platform/Node methods disappear;
+// used bodies proceed through the ordinary direct-native compiler.
+
+export function lowerClosedEnv(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,bindings,owners}=ix,replacements=new WeakMap(),removed=new WeakSet();
+ const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let s=base,i=2;while(names.has(s))s=base+i++;names.add(s);return s;};
+ for(const factory of nodes.filter(n=>n.type==='FunctionDeclaration'&&!n.async&&!n.generator&&!n.params.length)){
+  if(factory.body.body.length!==1||factory.body.body[0].type!=='ReturnStatement')continue;
+  const object=factory.body.body[0].argument;
+  if(object?.type!=='ObjectExpression'||!object.properties.length)continue;
+  const methods=new Map();let valid=true;
+  for(const p of object.properties){
+   if(p.type!=='Property'){valid=false;break;}
+   const fn=p.value,name=key(p);
+   if(p.type!=='Property'||p.computed||p.kind!=='init'||typeof name!=='string'||name==='__proto__'||methods.has(name)||!functions.has(fn?.type)||fn.id||fn.generator){valid=false;break;}
+   methods.set(name,{fn,dependencies:new Set(),calls:[]});
+  }
+  if(!valid)continue;
+  const binding=bindings.get(factory.id);
+  if(!binding?.refs.length||binding.writes.length||binding.init!==factory||nodes.some(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding)||nodes.filter(n=>n.type==='FunctionDeclaration'&&bindings.get(n.id)===binding).length!==1)continue;
+  const instances=[],used=new Set(),outside=[];
+  for(const ref of binding.refs){
+   const call=parents.get(ref),d=parents.get(call),decl=parents.get(d),block=parents.get(decl);
+   if(!['CallExpression','NewExpression'].includes(call?.type)||call.callee!==ref||call.arguments.length||d?.type!=='VariableDeclarator'||d.id.type!=='Identifier'||d.init!==call||decl?.type!=='VariableDeclaration'||!['Program','BlockStatement'].includes(block?.type)){valid=false;break;}
+   const b=bindings.get(d.id);if(!b?.refs.length||b.writes.length||nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===b).length!==1){valid=false;break;}
+   for(const r of b.refs){
+    const m=parents.get(r),use=parents.get(m),name=property(m);
+    if(m?.type!=='MemberExpression'||m.object!==r||m.optional||use?.type!=='CallExpression'||use.callee!==m||use.optional||!methods.has(name)){valid=false;break;}
+    let statement=r;while(parents.get(statement)&&parents.get(statement)!==block)statement=parents.get(statement);
+    const first=block.type==='Program'&&block.body.filter(n=>!['FunctionDeclaration','EmptyStatement'].includes(n.type))[0]===decl&&decl.declarations[0]===d;
+    if(parents.get(statement)!==block||statement.start<decl.end||owners.get(r)!==owners.get(decl)&&!first){valid=false;break;}
+    used.add(name);outside.push([m,name]);
+   }
+   if(!valid)break;instances.push(d);
+  }
+  if(!valid)continue;
+  // No dynamic receiver, mutation, alias, this capture or object escape. A
+  // direct this.other(...) edge is the only supported internal dependency.
+  const queue=[...used];
+  while(queue.length&&valid){
+   const name=queue.shift(),info=methods.get(name),local=index(info.fn);
+   for(const n of local.nodes){
+    if(local.free(n,'arguments')||n.type==='Super'||n.type==='MetaProperty'){valid=false;break;}
+    if(n.type!=='ThisExpression')continue;
+    let owner=local.parents.get(n);while(owner&&!functions.has(owner.type))owner=local.parents.get(owner);
+    const member=local.parents.get(n),call=local.parents.get(member),dependency=property(member);
+    if(info.fn.type==='ArrowFunctionExpression'||owner!==info.fn||member?.type!=='MemberExpression'||member.object!==n||member.optional||call?.type!=='CallExpression'||call.callee!==member||call.optional||!methods.has(dependency)){valid=false;break;}
+    info.calls.push([member,dependency]);
+    if(!used.has(dependency)){used.add(dependency);queue.push(dependency);}
+   }
+  }
+  if(!valid)continue;
+  const identifiers=new Map([...used].map(n=>[n,fresh('env_'+n.replace(/\W/g,'_'))]));
+  for(const name of used)for(const [member,dependency]of methods.get(name).calls)replacements.set(member,()=>identifiers.get(dependency));
+  for(const [member,name]of outside)replacements.set(member,()=>identifiers.get(name));
+  for(const d of instances)removed.add(d);
+  replacements.set(factory,()=>[...used].map(name=>{
+   const fn=methods.get(name).fn,params=fn.params.map(render).join(', '),body=fn.body.type==='BlockStatement'?render(fn.body):'{return '+render(fn.body)+';}';
+   return `${fn.async?'async ':''}function ${identifiers.get(name)}(${params}) ${body}`;
+  }).join('\n'));
+ }
+ function render(n){
+  if(removed.has(n))return '';
+  const r=replacements.get(n);if(r)return r();
+  if(n.type==='VariableDeclaration'){
+   const keep=n.declarations.filter(d=>!removed.has(d));
+   if(keep.length!==n.declarations.length)return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';
+  }
+  return patch(source,n,render);
+ }
+ return render(tree);
+}
+
+// Erase stateless, closed environment/clients whose factory returns an object.
+// Reachability is derived from local member calls, never author or file names.
+
+export function lowerExtendedClosedEnv(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,bindings,owners}=ix,replacements=new WeakMap(),removed=new WeakSet();
+ const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let s=base,i=2;while(names.has(s))s=base+i++;names.add(s);return s;};
+ for(const factory of nodes.filter(n=>n.type==='FunctionDeclaration'&&!n.async&&!n.generator&&!n.params.length)){
+  const statements=factory.body?.body||[],last=statements.at(-1);
+  if(last?.type!=='ReturnStatement'||last.argument?.type!=='ObjectExpression'||!last.argument.properties.length||statements.length===1)continue;
+  const localDeclarations=new Map();let valid=true;
+  for(const statement of statements.slice(0,-1)){
+   if(statement.type==='EmptyStatement')continue;
+   if(statement.type==='VariableDeclaration'){
+    for(const d of statement.declarations){if(d.id.type!=='Identifier'||!d.init){valid=false;break;}const b=bindings.get(d.id);if(!b||b.writes.length||localDeclarations.has(b)){valid=false;break;}localDeclarations.set(b,d);}
+   }else if(statement.type==='FunctionDeclaration'&&statement.id){const b=bindings.get(statement.id);if(!b||b.writes.length||localDeclarations.has(b)){valid=false;break;}localDeclarations.set(b,statement);}
+   else{valid=false;break;}
+   if(!valid)break;
+  }
+  if(!valid)continue;
+  const local=index(factory);
+  const resolveFunction=value=>{
+   if(functions.has(value?.type)&&!value.id&&!value.generator)return {fn:value,binding:null};
+   if(value?.type==='Identifier'){
+    const b=bindings.get(value),d=localDeclarations.get(b);
+    if(d?.type==='VariableDeclarator'&&functions.has(d.init?.type)&&!d.init.id&&!d.init.generator)return {fn:d.init,binding:b};
+    if(d?.type==='FunctionDeclaration'&&!d.async&&!d.generator)return {fn:d,binding:b};
+   }
+   return null;
+  };
+  const entries=new Map();
+  for(const p of last.argument.properties){
+   if(p.type!=='Property'||p.computed||p.kind!=='init'){valid=false;break;}
+   const name=key(p);if(typeof name!=='string'||name==='__proto__'||entries.has(name)){valid=false;break;}
+   const resolved=resolveFunction(p.value);
+   entries.set(name,resolved?{name,kind:'function',fn:resolved.fn,binding:resolved.binding,dependencies:new Set(),calls:[]}:{name,kind:'field',value:p.value,dependencies:new Set()});
+  }
+  if(!valid)continue;
+  const binding=bindings.get(factory.id);
+  if(!binding?.refs.length||binding.writes.length||binding.init!==factory||nodes.some(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding)||nodes.filter(n=>n.type==='FunctionDeclaration'&&bindings.get(n.id)===binding).length!==1)continue;
+  const inert=value=>!value||value.type==='Literal'||value.type==='ArrayExpression'&&value.elements.every(inert);
+  const safePrefix=declaration=>{
+   const block=parents.get(declaration);
+   return block.body.slice(0,block.body.indexOf(declaration)).every(s=>s.type==='EmptyStatement'||s.type==='FunctionDeclaration'||s.type==='VariableDeclaration'&&s.declarations.every(d=>d.id.type==='Identifier'&&inert(d.init)));
+  };
+  const instances=[],used=new Set(),outside=[];
+  for(const ref of binding.refs){
+   const call=parents.get(ref),d=parents.get(call),decl=parents.get(d),block=parents.get(decl);
+   if(!['CallExpression','NewExpression'].includes(call?.type)||call.callee!==ref||call.arguments.length||d?.type!=='VariableDeclarator'||d.id.type!=='Identifier'||d.init!==call||decl?.type!=='VariableDeclaration'||decl.declarations.length!==1||!['Program','BlockStatement'].includes(block?.type)){valid=false;break;}
+   const b=bindings.get(d.id);if(!b?.refs.length||b.writes.length||nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===b).length!==1){valid=false;break;}
+   for(const r of b.refs){
+    const m=parents.get(r),use=parents.get(m),name=property(m);
+    if(m?.type!=='MemberExpression'||m.object!==r||m.optional||name===undefined){valid=false;break;}
+    if(!entries.has(name))continue;
+    const entry=entries.get(name);
+    if(entry.kind==='function'&&(use?.type!=='CallExpression'||use.callee!==m||use.optional)){valid=false;break;}
+    if(entry.kind==='field'&&(use?.type==='AssignmentExpression'&&use.left===m||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')){valid=false;break;}
+    let statement=r;while(parents.get(statement)&&parents.get(statement)!==block)statement=parents.get(statement);
+    const safeBefore=safePrefix(decl);
+    if(parents.get(statement)!==block||statement.start<decl.end||owners.get(r)!==owners.get(decl)&&!safeBefore){valid=false;break;}
+    if(entry.kind==='function')used.add(name);
+    outside.push([m,entry]);
+   }
+   if(!valid)break;instances.push({d,declaration:decl,block});
+  }
+  if(!valid||instances.length!==1)continue;
+  if([...entries.values()].some(entry=>entry.kind==='function'&&index(entry.fn).nodes.some(n=>n.type==='ThisExpression'||n.type==='Super'||n.type==='MetaProperty'||ix.free(n,'arguments'))))continue;
+  // Map scope-local binding objects back to the outer index, then retain only
+  // locals reachable from selected methods and fields.
+  const localToOuter=new Map();
+  for(const [outer,d]of localDeclarations){const id=d.type==='VariableDeclarator'?d.id:d.id,lb=local.bindings.get(id);if(lb)localToOuter.set(lb,outer);}
+  const needed=new Set(),queue=[];
+  // Initializers can have effects even when their value is never read.
+  for(const [b,d]of localDeclarations)if(d.type==='VariableDeclarator'&&!functions.has(d.init?.type)){needed.add(b);queue.push(b);}
+  const addDependencies=range=>{
+   for(const n of local.nodes)if(n.start>=range.start&&n.end<=range.end){
+    const b=local.bindings.get(n),outer=localToOuter.get(b);
+    if(outer&&localDeclarations.has(outer)&&!needed.has(outer)){needed.add(outer);queue.push(outer);}
+   }
+  };
+  for(const name of used){
+   const entry=entries.get(name);if(entry.binding&&!needed.has(entry.binding)){needed.add(entry.binding);queue.push(entry.binding);}
+   addDependencies(entry.fn);
+  }
+  for(const [_,entry]of outside)if(entry.kind==='field')addDependencies(entry.value);
+  while(queue.length){
+   const b=queue.shift(),d=localDeclarations.get(b),expr=d.type==='VariableDeclarator'?d.init:d;
+   addDependencies(expr);
+  }
+  if(!valid)continue;
+  const identifiers=new Map([...needed].map(b=>[b,fresh('env_'+String(b.name||'local').replace(/\W/g,'_'))]));
+  const fieldIdentifiers=new Map(),inlineFunctions=new Map();
+  function entryName(entry){
+   if(entry.kind==='function'){
+    const direct=[...localDeclarations.entries()].find(([b,d])=>d?.type==='VariableDeclarator'&&d.init===entry.fn||d===entry.fn);
+    if(direct)return identifiers.get(direct[0]);
+    if(!inlineFunctions.has(entry))inlineFunctions.set(entry,fresh('env_'+String(entry.name).replace(/\W/g,'_')));
+    return inlineFunctions.get(entry);
+   }
+   const direct=[...localDeclarations.entries()].find(([b,d])=>d?.type==='VariableDeclarator'&&d.init===entry.value);
+   if(direct)return identifiers.get(direct[0]);
+   if(!fieldIdentifiers.has(entry))fieldIdentifiers.set(entry,fresh('env_'+String(entry.name).replace(/\W/g,'_')));
+   return fieldIdentifiers.get(entry);
+  }
+  // Scope objects from a nested index are distinct; bridge by declaration node.
+  const localNames=new Map();
+  for(const [b,d]of localDeclarations){const id=d.type==='VariableDeclarator'?d.id:d.id,lb=local.bindings.get(id);if(lb&&identifiers.has(b))localNames.set(lb,identifiers.get(b));}
+  for(const n of local.nodes){const b=local.bindings.get(n);if(b&&localNames.has(b))replacements.set(n,localNames.get(b));}
+  for(const name of used)for(const [member,dependency]of entries.get(name).calls)replacements.set(member,()=>entryName(entries.get(dependency)));
+  for(const [member,entry]of outside)replacements.set(member,()=>entryName(entry));
+  for(const entry of entries.values())if(entry.kind==='field')entryName(entry);
+  const definitions=[];
+  for(const [b,d]of localDeclarations){
+   if(!needed.has(b))continue;
+   const name=identifiers.get(b);
+   if(d.type==='FunctionDeclaration'){const fn=d,params=fn.params.map(render).join(', '),body=fn.body.type==='BlockStatement'?render(fn.body):'{return '+render(fn.body)+';}';definitions.push(`${fn.async?'async ':''}function ${name}(${params}) ${body}`);}
+   else{
+    const init=d.init;
+    if(functions.has(init?.type)&&!init.id){const params=init.params.map(render).join(', '),body=init.body.type==='BlockStatement'?render(init.body):'{return '+render(init.body)+';}';definitions.push(`${init.async?'async ':''}function ${name}(${params}) ${body}`);}
+    else definitions.push(`const ${name} = (${render(init)});`);
+   }
+  }
+  for(const [entry,name]of inlineFunctions){const fn=entry.fn,params=fn.params.map(render).join(', '),body=fn.body.type==='BlockStatement'?render(fn.body):'{return '+render(fn.body)+';}';definitions.push(`${fn.async?'async ':''}function ${name}(${params}) ${body}`);}
+  for(const [entry,name]of fieldIdentifiers)if(!([...localDeclarations.values()].some(d=>d?.init===entry.value)))definitions.push(`const ${name} = ${render(entry.value)};`);
+  for(const {d,declaration}of instances)replacements.set(declaration,()=>definitions.join('\n')+'\nconst '+d.id.name+' = {};');
+  removed.add(factory);
+ }
+ function render(n){
+  if(removed.has(n))return '';
+  const r=replacements.get(n);if(r)return typeof r==='function'?r():r;
+  if(n.type==='VariableDeclaration'){
+   const keep=n.declarations.filter(d=>!removed.has(d));if(keep.length!==n.declarations.length)return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';
+  }
+  return patch(source,n,render);
+ }
+ return render(tree);
+}
+
+// Fold pure platform probes of closed local Env instances and prune methods
+// unreachable from those instances. No name alone establishes an API contract.
+
+function targetMethodValues(source,cls,methods,format){
+ const known=new Map();
+ for(let pass=0;pass<3;pass++)for(const [name,method] of methods){
+  if(method.value.params.length||method.value.async||method.value.generator||method.value.body.type!=='BlockStatement')continue;
+  const render=n=>{
+   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.callee.object.type==='ThisExpression'&&!n.arguments.length&&known.has(property(n.callee)))return JSON.stringify(known.get(property(n.callee)));
+   return patch(source,n,render);
+  };
+  const text=platformFold(simplify('(function()'+render(method.value.body)+')'),format).source;
+  const result=parse(text,{ecmaVersion:'latest'}).body[0]?.expression.body.body;
+  if(result?.length===1&&result[0].type==='ReturnStatement'&&result[0].argument?.type==='Literal'&&['string','boolean'].includes(typeof result[0].argument.value))known.set(name,result[0].argument.value);
+ }
+ return known;
+}
+
+function falseNodeTest(node,known){
+ const call=node?.type==='UnaryExpression'&&node.operator==='!'?node.argument:node;
+ const negative=node!==call;
+ return known.get('isNode')===false&&call?.type==='CallExpression'&&call.callee.type==='MemberExpression'&&call.callee.object.type==='ThisExpression'&&property(call.callee)==='isNode'&&!call.arguments.length&&!negative;
+}
+function trueNodeTest(node,known){
+ return node?.type==='UnaryExpression'&&node.operator==='!'&&known.get('isNode')===false&&node.argument?.type==='CallExpression'&&node.argument.callee.type==='MemberExpression'&&node.argument.callee.object.type==='ThisExpression'&&property(node.argument.callee)==='isNode'&&!node.argument.arguments.length;
+}
+function unreachableNodeGuard(ix,ref,cls,known){
+ if(known.get('isNode')!==false)return false;
+ const {parents}=ix;let child=ref;
+ for(let parent=parents.get(child);parent&&parent!==cls;child=parent,parent=parents.get(parent)){
+  if(parent.type!=='IfStatement')continue;
+  let arm=null;for(let node=child;node&&node!==parent;node=parents.get(node)){if(node===parent.consequent){arm='consequent';break;}if(node===parent.alternate){arm='alternate';break;}}
+  if(arm==='consequent'&&falseNodeTest(parent.test,known)||arm==='alternate'&&trueNodeTest(parent.test,known))return true;
+ }
+ let method=parents.get(ref);while(method&&method.type!=='MethodDefinition'&&method!==cls)method=parents.get(method);
+ if(method?.type!=='MethodDefinition'||parents.get(parents.get(method))!==cls)return false;
+ const body=method.value.body;if(body?.type!=='BlockStatement')return false;
+ let statement=ref;while(parents.get(statement)&&parents.get(statement)!==body)statement=parents.get(statement);
+ const index=body.body.indexOf(statement);if(index<0)return false;
+ return body.body.slice(0,index).some(node=>node.type==='IfStatement'&&trueNodeTest(node.test,known)&&node.consequent.type==='ReturnStatement'&&!node.alternate);
+}
+
+function plans(ix,source,format){
+ const {nodes,parents,bindings}=ix,output=[];
+ const covered=new Set();
+ function classShape(cls){
+  if(!cls||cls.superClass)return null;
+  const methods=new Map(),members=new Set();
+  for(const member of cls.body.body){
+   const name=key(member);
+   if(typeof name!=='string'||member.computed||members.has(name))return null;
+   members.add(name);
+   if(member.type==='MethodDefinition'&&!member.static&&['method','constructor'].includes(member.kind)){
+    methods.set(name,member);
+    continue;
+   }
+   // Ordinary instance fields are allowed only when their initializers are
+   // inert data. Static/computed fields and effectful initializers can run
+   // before the environment predicates and are outside this specialization.
+   if(member.type!=='PropertyDefinition'||member.static||!inertField(member.value))return null;
+  }
+  return methods;
+ }
+ function inertField(node){
+  if(!node)return true;
+  if(['Literal','FunctionExpression','ArrowFunctionExpression'].includes(node.type))return true;
+  if(node.type==='Identifier')return ['undefined','NaN','Infinity'].includes(node.name)&&ix.free(node,node.name);
+  if(node.type==='ArrayExpression')return node.elements.every(e=>!e||e.type!=='SpreadElement'&&inertField(e));
+  if(node.type==='ObjectExpression')return node.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.computed&&p.key.type!=='PrivateIdentifier'&&inertField(p.value));
+  if(node.type==='TemplateLiteral')return node.expressions.every(inertField);
+  if(node.type==='UnaryExpression')return ['!','void','+','-','~','typeof'].includes(node.operator)&&inertField(node.argument);
+  if(['BinaryExpression','LogicalExpression'].includes(node.type))return inertField(node.left)&&inertField(node.right);
+  if(node.type==='ConditionalExpression')return inertField(node.test)&&inertField(node.consequent)&&inertField(node.alternate);
+  return false;
+ }
+ function classReceiverThis(node,cls){
+  let owner=parents.get(node);
+  while(owner&&owner!==cls){
+   if(owner.type==='ArrowFunctionExpression'){owner=parents.get(owner);continue;}
+   if(functions.has(owner.type)){
+    const method=parents.get(owner);
+    return method?.type==='MethodDefinition'&&parents.get(parents.get(method))===cls;
+   }
+   owner=parents.get(owner);
+  }
+  return owner===cls;
+ }
+ function finiteStrings(node,seen=new Set()){
+  if(node?.type==='Literal'&&typeof node.value==='string')return new Set([node.value]);
+  if(node?.type==='TemplateLiteral'&&!node.expressions.length)return new Set([node.quasis[0].value.cooked]);
+  if(node?.type==='Identifier'){
+   const binding=bindings.get(node);if(!binding?.init||binding.writes.length||seen.has(binding))return null;
+   const next=new Set(seen);next.add(binding);return finiteStrings(binding.init,next);
+  }
+  if(node?.type==='ConditionalExpression'){
+   const left=finiteStrings(node.consequent,new Set(seen)),right=finiteStrings(node.alternate,new Set(seen));
+   return left&&right?new Set([...left,...right]):null;
+  }
+  return null;
+ }
+ for(const factory of nodes.filter(n=>n.type==='FunctionDeclaration'&&!n.async&&!n.generator)){
+  const returned=factory.body.body.find(n=>n.type==='ReturnStatement')?.argument;
+  let cls=returned?.type==='NewExpression'&&returned.callee.type==='ClassExpression'?returned.callee:null;
+  if(!cls&&returned?.type==='NewExpression'&&returned.callee.type==='Identifier'){
+   const classBinding=bindings.get(returned.callee),candidate=classBinding?.init;
+   // Some classic Env factories name the local class before returning its
+   // instance. Admit that equivalent shape only when the class binding is
+   // immutable and this return is its sole reference.
+   if(candidate?.type==='ClassDeclaration'&&!classBinding.writes.length&&classBinding.refs.length===1&&classBinding.refs[0]===returned.callee)cls=candidate;
+  }
+  if(!cls)continue;
+  const methods=classShape(cls),classNodes=index(cls).nodes;
+  if(!methods||!methods.has('isNode'))continue;
+  const known=targetMethodValues(source,cls,methods,format);
+  // Some compatibility Env implementations expose only getEnv()/isNode(),
+  // rather than one predicate per proxy app. Admit them only when the full
+  // isNode method has been statically reduced to a boolean for this target.
+  // This keeps the specialization tied to proven host facts, not method names.
+  if(typeof known.get('isNode')!=='boolean')continue;
+  // Captured outer bindings inside ordinary instance methods are evaluated
+  // only after construction unless the constructor can reach that method.
+  // Follow direct this.method calls from the constructor, skipping calls in
+  // branches already proven impossible for the selected native runtime.
+  const constructorReachable=new Set(['constructor']),constructorQueue=['constructor'];
+  while(constructorQueue.length){
+   const method=methods.get(constructorQueue.shift());if(!method)continue;
+   for(const call of classNodes){
+    if(call.type!=='CallExpression'||call.start<method.start||call.end>method.end||call.callee.type!=='MemberExpression'||call.callee.object.type!=='ThisExpression')continue;
+    const name=property(call.callee);if(name===undefined){for(const candidate of methods.keys())if(!constructorReachable.has(candidate)){constructorReachable.add(candidate);constructorQueue.push(candidate);}continue;}
+    if(methods.has(name)&&!constructorReachable.has(name)&&!unreachableNodeGuard(ix,call,cls,known)){constructorReachable.add(name);constructorQueue.push(name);}
+   }
+  }
+  const binding=bindings.get(factory.id);if(!binding?.refs.length||binding.writes.length)continue;
+  const used=new Set(),instances=new Set(),constructions=[],helpers=new Map();let valid=true;
+  for(const n of classNodes)if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='ThisExpression'&&n.right.type==='NewExpression'&&n.right.arguments.length===1&&n.right.arguments[0].type==='ThisExpression'){
+   const b=bindings.get(n.right.callee),helper=b?.init,field=property(n.left);
+   if(typeof field!=='string'||methods.has(field)||!b||b.writes.length||b.refs.length!==1||helper?.type!=='ClassDeclaration'||!reviewedHTTPDelegate(helper)||!safeReceiverRetention(helper))continue;
+   const dependencies=index(helper).nodes.filter(r=>r.type==='Identifier'&&['Promise','Error','setTimeout'].includes(r.name));
+   if(dependencies.some(r=>!ix.free(r,r.name)))continue;
+   helpers.set(field,{allocation:n.right,methods:new Set(helper.body.body.map(key))});
+  }
+  for(const ref of binding.refs){
+   const call=parents.get(ref),d=parents.get(call),decl=parents.get(d);
+   if(!['NewExpression','CallExpression'].includes(call?.type)||call.callee!==ref||call.arguments.length>Math.max(1,factory.params.length)||call.arguments.some(a=>a.type==='SpreadElement')||d?.type!=='VariableDeclarator'||d.id.type!=='Identifier'||d.init!==call||decl?.type!=='VariableDeclaration'){valid=false;break;}
+   const b=bindings.get(d.id);if(!b||b.writes.length){valid=false;break;}
+   const shadowed=new Set();
+   for(const name of methods.keys()){
+    // A script may use a method name as an own data field (e.g. a delay
+    // named time). The prototype method is unobservable only after a closed,
+    // unconditional own-property assignment and with no internal lookup.
+    if(classNodes.some(n=>n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&property(n)===name))continue;
+    const refs=b.refs.filter(r=>{const m=parents.get(r);return m?.type==='MemberExpression'&&m.object===r&&property(m)===name;});
+    const first=refs.find(r=>{const m=parents.get(r),write=parents.get(m),statement=parents.get(write);return write?.type==='AssignmentExpression'&&write.operator==='='&&write.left===m&&statement?.type==='ExpressionStatement'&&parents.get(statement)===nodes[0];});
+    if(!first)continue;
+    const statement=parents.get(parents.get(parents.get(first)));
+    if(refs.every(r=>{const m=parents.get(r),use=parents.get(m);return r===first||initializedAfter(ix,statement,r)&&!(use?.type==='CallExpression'&&use.callee===m||use?.operator==='delete');}))shadowed.add(name);
+   }
+   for(const r of b.refs){
+    const m=parents.get(r),u=parents.get(m),name=property(m);
+    const ownerMethod=classNodes.find(node=>node.type==='MethodDefinition'&&r.start>=node.start&&r.end<=node.end),ownerName=ownerMethod&&key(ownerMethod);
+    const deferredInstanceMethod=ownerMethod?.kind==='method'&&!constructorReachable.has(ownerName);
+    if(!initializedAfter(ix,decl,r)&&!unreachableNodeGuard(ix,r,cls,known)&&!deferredInstanceMethod||m?.type!=='MemberExpression'||m.object!==r){valid=false;break;}
+    if(name===undefined){
+     // A dynamic call cannot overwrite a probe, but may invoke any method.
+     // Prune to a finite, immutable string set when the selector proves one;
+     // otherwise retain every possible target.
+     if(u?.type!=='CallExpression'||u.callee!==m){valid=false;break;}
+     const selected=finiteStrings(m.property);
+     if(selected&&[...selected].every(value=>methods.has(value)))for(const value of selected)used.add(value);
+     else for(const value of methods.keys())used.add(value);
+    }
+    if(methods.has(name)){
+     if(shadowed.has(name))continue;
+     if(u?.type!=='CallExpression'||u.callee!==m){valid=false;break;}
+     used.add(name);
+    }else if(helpers.has(name)){
+     const call=parents.get(u),helper=helpers.get(name);
+     if(u?.type!=='MemberExpression'||u.object!==m||!helper.methods.has(property(u))||call?.type!=='CallExpression'||call.callee!==u){valid=false;break;}
+    }
+   }
+   if(!valid)break;constructions.push(call);instances.add(b);
+  }
+  if(!valid)continue;
+  // Probe folding is invalid if a constructor/method overwrites a method or
+  // exposes its receiver to an unreviewed callback.
+  for(const n of classNodes){
+   if(n.type!=='ThisExpression'||!classReceiverThis(n,cls))continue;
+   const p=parents.get(n),u=parents.get(p),name=property(p);
+   if(p?.type==='MemberExpression'&&p.object===n&&name!==undefined){
+    if(methods.has(name)&&(u?.type==='AssignmentExpression'&&u.left===p||u?.type==='UpdateExpression'||u?.operator==='delete'))valid=false;
+    if(helpers.has(name)){
+     const helper=helpers.get(name),call=parents.get(u);
+     if(!(u?.type==='AssignmentExpression'&&u.operator==='='&&u.left===p&&u.right===helper.allocation||u?.type==='MemberExpression'&&u.object===p&&helper.methods.has(property(u))&&call?.type==='CallExpression'&&call.callee===u))valid=false;
+    }
+   }else if(p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&ix.free(p.callee.object,'Object')&&property(p.callee)==='assign'&&p.arguments[0]===n){
+    // Omitted optional factory options cannot shadow the selected methods.
+    const ctor=ix.owners.get(n),value=p.arguments[1],position=ctor.params.findIndex(param=>bindings.get(param.type==='AssignmentPattern'?param.left:param)===bindings.get(value));
+    if(parents.get(ctor)?.kind!=='constructor'||position<0||p.arguments.length!==2)valid=false;
+    else for(const call of constructions){
+     const actual=factoryArgument(ix,factory,call,returned,ctor,position);
+     if(actual&&!(actual.type==='Literal'&&actual.value===null)&&!(actual.type==='ObjectExpression'&&actual.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.computed&&key(p)!=='__proto__'&&!methods.has(String(key(p))))))valid=false;
+    }
+   }else if(p?.type==='NewExpression'&&[...helpers.values()].some(h=>h.allocation===p)&&p.arguments[0]===n){
+    // Reviewed allocation-only HTTP delegates retain this solely to call its
+    // get/post methods. Keep both targets while pruning the rest of the Env.
+    used.add('get');used.add('post');
+   // An unknown helper may mutate methods or expose the receiver elsewhere.
+   }else valid=false;
+  }
+  if(valid){output.push({factory,cls,methods,used,instances,known});covered.add(cls);}
+ }
+ // Some compatibility environments instantiate an anonymous class directly
+ // instead of returning it from a factory. Admit only a closed local instance:
+ // every outside reference must be a static property access, and method values
+ // may be used only as direct calls. This lets the same platform proof remove
+ // Node-only branches without relying on a class or variable name.
+ for(const declaration of nodes.filter(n=>n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init?.type==='NewExpression'&&n.init.callee.type==='ClassExpression')){
+  const cls=declaration.init.callee;
+  if(covered.has(cls))continue;
+  const methods=classShape(cls),instance=bindings.get(declaration.id),classNodes=index(cls).nodes;
+  if(!methods||!methods.has('isNode')||!instance?.refs.length||instance.writes.length)continue;
+  const used=new Set(['constructor']),instances=new Set([instance]),known=targetMethodValues(source,cls,methods,format);let valid=true;
+  if(typeof known.get('isNode')!=='boolean')continue;
+  for(const ref of instance.refs){
+   const member=parents.get(ref),use=parents.get(member),name=property(member);
+   if(member?.type!=='MemberExpression'||member.object!==ref||member.optional||typeof name!=='string'||
+      use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||
+      use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===member){valid=false;break;}
+   if(methods.has(name)){
+    if(use?.type!=='CallExpression'||use.callee!==member||use.optional){valid=false;break;}
+    used.add(name);
+   }
+  }
+  // The class may keep ordinary data fields, but it cannot let its receiver
+  // escape or overwrite a predicate that the specialization folds.
+  for(const n of classNodes){
+   if(n.type!=='ThisExpression'||!classReceiverThis(n,cls))continue;
+   const member=parents.get(n),use=parents.get(member),name=property(member);
+   if(member?.type==='MemberExpression'&&member.object===n&&typeof name==='string'){
+    if(methods.has(name)&&(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===member))valid=false;
+    continue;
+   }
+   // Passing this to any call could mutate the methods after the static proof.
+   valid=false;
+  }
+  if(valid)output.push({cls,methods,used,instances,known});
+ }
+ return output;
+ function safeReceiverRetention(helper){
+  const constructor=helper.body.body.find(method=>method.type==='MethodDefinition'&&method.kind==='constructor');
+  if(!constructor)return false;
+  const receiver=constructor.value.params[0];if(receiver?.type!=='Identifier')return false;
+  const binding=bindings.get(receiver);if(!binding||!binding.refs.length)return false;
+  return binding.refs.every(ref=>{
+   const assignment=parents.get(ref);
+   return assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===ref&&
+    assignment.left.type==='MemberExpression'&&assignment.left.object.type==='ThisExpression'&&property(assignment.left)!==undefined;
+  });
+ }
+}
+
+export function foldTargetEnvironments(source,format){
+ const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true})),replace=new WeakMap();
+ for(const {cls,methods,instances,known} of plans(ix,source,format)){
+  for(const n of ix.nodes)if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&!n.arguments.length&&known.has(property(n.callee))&&
+    (n.start>=cls.start&&n.end<=cls.end&&n.callee.object.type==='ThisExpression'||instances.has(ix.bindings.get(n.callee.object))))replace.set(n,JSON.stringify(known.get(property(n.callee))));
+ }
+ const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(ix.nodes[0]);
+}
+
+export function pruneTargetEnvironments(source,format){
+ const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true})),remove=new WeakSet();
+ for(const {methods,used} of plans(ix,source,format)){
+  const reachable=new Set(['constructor',...used]),queue=[...reachable];let valid=true;
+  while(queue.length&&valid){
+   const method=methods.get(queue.shift());if(!method)continue;
+   for(const n of index(method.value).nodes)if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'){
+    const name=property(n);if(name===undefined){valid=false;break;}
+    if(methods.has(name)&&!reachable.has(name)){reachable.add(name);queue.push(name);}
+   }
+  }
+  if(valid)for(const [name,method]of methods)if(!reachable.has(name))remove.add(method);
+ }
+ const render=n=>remove.has(n)?'':patch(source,n,render);
+ return pruneUnusedClosedClassMethods(render(ix.nodes[0]));
+}
+
+// A closed environment can contain platform-only methods whose only callers
+// were removed when a platform switch folded. Remove those methods as well so
+// dead Node branches do not leave free `require` references in the Egern file.
+// Every instance and method edge must be statically closed; unknown/computed
+// dispatch or receiver escape keeps the original class intact.
+function pruneUnusedClosedClassMethods(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,bindings}=ix,remove=new WeakSet();
+ function returnedClass(fn){
+  const statements=fn?.body?.body;
+  const returned=Array.isArray(statements)?statements.find(statement=>statement.type==='ReturnStatement')?.argument:null;
+  return returned?.type==='NewExpression'&&returned.callee.type==='ClassExpression'?returned.callee:null;
+ }
+ function classForCall(call){
+  if(call?.type==='NewExpression'&&call.callee.type==='ClassExpression')return call.callee;
+  if(['CallExpression','NewExpression'].includes(call?.type)&&call.callee.type==='Identifier')return returnedClass(bindings.get(call.callee)?.fn);
+  return null;
+ }
+ const groups=new Map();
+ for(const call of nodes.filter(node=>['CallExpression','NewExpression'].includes(node.type))){
+  const cls=classForCall(call);if(!cls)continue;
+  const declaration=parents.get(parents.get(call));
+  if(parents.get(call)?.type!=='VariableDeclarator'||parents.get(call).init!==call||parents.get(call).id.type!=='Identifier'||declaration?.type!=='VariableDeclaration')continue;
+  const binding=bindings.get(parents.get(call).id);if(!binding||binding.writes.length)continue;
+  if(!groups.has(cls))groups.set(cls,{instances:[],factories:new Set(),calls:new Set()});
+  const group=groups.get(cls);group.instances.push(binding);group.calls.add(call);
+  if(call.callee.type==='Identifier')group.factories.add(bindings.get(call.callee));
+ }
+ for(const [cls,group] of groups){
+  if(cls.superClass)continue;
+  const {instances}=group;
+  if([...group.factories].some(factory=>!factory||factory.writes.length||factory.refs.length!==group.calls.size||factory.refs.some(ref=>!group.calls.has(parents.get(ref)))))continue;
+  const methods=cls.body.body.filter(member=>member.type==='MethodDefinition'&&!member.static&&member.kind==='method');
+  const constructor=cls.body.body.find(member=>member.type==='MethodDefinition'&&member.kind==='constructor');
+  if(methods.length+Number(!!constructor)!==cls.body.body.length||methods.some(member=>member.computed||typeof key(member)!=='string')||new Set(methods.map(key)).size!==methods.length)continue;
+  const methodNames=new Set(methods.map(key)),used=new Set(),edges=new Map([...methods.map(member=>[key(member),new Set()]),['constructor',new Set()]]);
+  let valid=true;
+  for(const instance of instances)for(const ref of instance.refs){
+   const member=parents.get(ref),use=parents.get(member),name=property(member);
+   if(member?.type!=='MemberExpression'||member.object!==ref||member.optional||typeof name!=='string'||['constructor','__proto__'].includes(name)){valid=false;break;}
+   if(methodNames.has(name)){
+    const mutation=use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===member;
+    if(mutation||use?.type!=='CallExpression'||use.callee!==member||use.optional){valid=false;break;}used.add(name);
+   }
+  }
+  if(!valid)continue;
+  const classOwner=node=>{let owner=parents.get(node);while(owner&&owner!==cls){if(owner.type==='ArrowFunctionExpression'){owner=parents.get(owner);continue;}if(functions.has(owner.type)){const method=parents.get(owner);if(method?.type!=='MethodDefinition'||method.value!==owner||parents.get(parents.get(method))!==cls)return false;}owner=parents.get(owner);}return owner===cls;};
+  for(const node of nodes)if(node.type==='ThisExpression'&&node.start>=cls.start&&node.end<=cls.end&&classOwner(node)){
+   const member=parents.get(node),use=parents.get(member),name=property(member),owner=parents.get(node);
+   if(member?.type!=='MemberExpression'||member.object!==node||member.optional||typeof name!=='string'||['constructor','__proto__'].includes(name)){valid=false;break;}
+   if(methodNames.has(name)){
+    if(use?.type!=='CallExpression'||use.callee!==member||use.optional||
+       use.type==='AssignmentExpression'||use.type==='UpdateExpression'){valid=false;break;}
+    let method=owner;while(method&&!(method.type==='MethodDefinition'&&method.value&&node.start>=method.start&&node.end<=method.end))method=parents.get(method);
+    if(!method||!['method','constructor'].includes(method.kind)||method.static){valid=false;break;}
+    edges.get(key(method))?.add(name);
+   }
+  }
+  if(!valid)continue;
+  const reachable=new Set(['constructor',...used]),queue=[...reachable];
+  while(queue.length){
+   const name=queue.shift();for(const dependency of edges.get(name)??[])if(!reachable.has(dependency)){reachable.add(dependency);queue.push(dependency);}
+  }
+  for(const method of methods)if(!reachable.has(key(method)))remove.add(method);
+ }
+ const emit=node=>remove.has(node)?'':patch(source,node,emit);
+ return emit(tree);
+}

@@ -1,0 +1,586 @@
+import {pathSetterField} from '../http/requests.mjs';
+import {finiteLiteralMember} from '../analysis/values.mjs';
+import {parse} from '../core/syntax.mjs';
+import {index,patch,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
+import {evaluationBindings} from './evaluation.mjs';
+
+// Specialize immutable primitive parameters only when every call is closed and
+// supplies the same literal (including omitted/defaulted undefined). The calls
+// and their argument evaluation remain in place; no object identity is copied.
+const UNKNOWN=Symbol('unknown');
+export function specializeParameters(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings,free}=ix;
+ const evaluated=evaluationBindings(ix,source);
+ const primitive=n=>!n?undefined:n.type==='Literal'&&!n.regex&&typeof n.value!=='bigint'&&(typeof n.value!=='number'||Number.isFinite(n.value))?n.value:free(n,'undefined')||n.type==='UnaryExpression'&&n.operator==='void'&&n.argument.type==='Literal'?undefined:UNKNOWN;
+ const closedCalls=new Map(),parameters=new Map(),declarationCounts=new Map(),usesArguments=new WeakSet();
+ // Build these once: rescanning every node and re-indexing nested function
+ // bodies for each function made bundled SDKs quadratic in source size.
+ for(const n of nodes){
+  if(n.type==='FunctionDeclaration'||n.type==='VariableDeclarator'){
+   const b=bindings.get(n.id);if(b)declarationCounts.set(b,(declarationCounts.get(b)||0)+1);
+  }
+  if(free(n,'arguments'))for(let p=parents.get(n);p;p=parents.get(p))if(functions.has(p.type))usesArguments.add(p);
+ }
+ const initialized=(b,n)=>{
+  const d=parents.get(b.init),s=parents.get(d),block=parents.get(s);if(d?.type!=='VariableDeclarator'||s?.type!=='VariableDeclaration')return false;
+  let entry=n,owner=ix.owners.get(n),declarationOwner=ix.owners.get(s);
+  while(owner!==declarationOwner&&functions.has(owner?.type)&&owner.type!=='FunctionDeclaration'&&!['MethodDefinition','Property'].includes(parents.get(owner)?.type)){entry=owner;owner=ix.owners.get(parents.get(owner));}
+  if(owner===declarationOwner){let p=entry;while(parents.get(p)&&parents.get(p)!==block)p=parents.get(p);return parents.get(p)===block&&(p.start>=s.end||entry===n&&n.start>=b.init.end&&n.end<=s.end);}
+  return block===tree&&initializedAfter(ix,s,n);
+ };
+ for(const fn of nodes.filter(n=>functions.has(n.type))){
+  const p=parents.get(fn),id=fn.id??(p?.type==='VariableDeclarator'?p.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
+  const direct=p?.type==='CallExpression'&&p.callee===fn&&!p.optional;
+  if(evaluated.has(binding)||!direct&&(!binding||binding.writes.length||!binding.refs.length||declarationCounts.get(binding)!==1)||usesArguments.has(fn))continue;
+  const calls=direct?[p]:binding.refs.map(r=>parents.get(r));
+  if(calls.some((c,i)=>c?.type!=='CallExpression'||!direct&&c.callee!==binding.refs[i]||c.optional||c.arguments.some(a=>a.type==='SpreadElement')))continue;
+  closedCalls.set(fn,calls);
+  fn.params.forEach((p,i)=>{const id=p.type==='AssignmentPattern'?p.left:p;if(id.type==='Identifier')parameters.set(bindings.get(id),{fn,p,i});});
+  fn.params.forEach((parameter,i)=>{
+   const id=parameter.type==='AssignmentPattern'?parameter.left:parameter,b=id.type==='Identifier'?bindings.get(id):null;
+   if(!b||b.writes.length||evaluated.has(b))return;
+   const values=calls.map(c=>{const v=primitive(c.arguments[i]);return v===undefined&&parameter.type==='AssignmentPattern'?primitive(parameter.right):v;});
+   const value=values[0];if(value===UNKNOWN||!values.every(v=>Object.is(v,value)))return;
+   const literal=value===undefined?'(void 0)':JSON.stringify(value);
+   for(const ref of b.refs)if(ref.start>=fn.body.start)replace.set(ref,literal);
+  });
+ }
+ // An absent request option stays absent through a closed forwarding helper
+ // when neither the helper nor any caller writes/escapes that property.
+ const fieldFacts=new WeakMap();
+ function fieldUnmodified(b,field,seen=new Set()){
+  if(!b)return false;
+  if(!seen.size&&fieldFacts.get(b)?.has(field))return fieldFacts.get(b).get(field);
+  const result=checkFieldUnmodified(b,field,seen);
+  if(!seen.size){if(!fieldFacts.has(b))fieldFacts.set(b,new Map());fieldFacts.get(b).set(field,result);}
+  return result;
+ }
+ function checkFieldUnmodified(b,field,seen=new Set()){
+  if(!b||b.writes.length||evaluated.has(b))return false;if(seen.has(b))return true;seen=new Set(seen);seen.add(b);
+  for(const ref of b.refs){const p=parents.get(ref),use=parents.get(p);
+   if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
+   if(p?.type==='MemberExpression'&&p.object===ref){const k=property(p);if(k!==undefined&&k!==field)continue;}
+   let nonObject=false;
+   for(let guard=parents.get(ref);guard;guard=parents.get(guard))if(guard.type==='SwitchCase'&&guard.test&&isolatedSwitchCase(ix,guard)){const test=parents.get(guard)?.discriminant;if(test?.type==='UnaryExpression'&&test.operator==='typeof'&&bindings.get(test.argument)===b&&(guard.test.type==='Literal'&&guard.test.value!=='object'||guard.test.type==='UnaryExpression'&&guard.test.operator==='void'))nonObject=true;}
+   if(nonObject)continue;
+   if(p?.type==='MemberExpression'&&p.object===ref){const k=property(p);if(k===undefined||k===field&&(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'))return false;continue;}
+   if(p?.type==='BinaryExpression'&&p.operator==='in'&&p.right===ref&&p.left.type==='Literal')continue;
+   if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='ObjectPattern'&&p.id.properties.every(p=>p.type==='Property'&&p.kind==='init'&&key(p)!==undefined&&p.value.type==='Identifier'&&!bindings.get(p.value)?.writes.length))continue;
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+    const mutation=pathSetterField(ix,p,ref);if(mutation&&mutation!==field)continue;
+    if(p.arguments[0]===ref&&p.callee.type==='MemberExpression'&&(free(p.callee.object,'$httpClient')||free(p.callee.object,'$task')))continue;
+    const callee=bindings.get(p.callee)?.fn;if(closedCalls.has(callee)){const param=callee.params[p.arguments.indexOf(ref)],id=param?.type==='AssignmentPattern'?param.left:param,pb=id?.type==='Identifier'?bindings.get(id):null;if(fieldUnmodified(pb,field,seen))continue;}
+   }
+   return false;
+  }
+  return true;
+ }
+ function absent(n,field,seen=new Set(),allowMissing=false){
+  if(allowMissing&&(!n||free(n,'undefined')||n.type==='UnaryExpression'&&n.operator==='void'))return true;
+  if(n?.type==='ObjectExpression')return n.properties.every(p=>p.type==='Property'&&p.kind==='init'&&key(p)!==undefined&&key(p)!=='__proto__'&&key(p)!==field);
+  if(n?.type!=='Identifier')return false;const b=bindings.get(n);if(!b||!fieldUnmodified(b,field)||seen.has(b))return false;seen=new Set(seen);seen.add(b);
+  if(b.init)return initialized(b,n)&&absent(b.init,field,seen,allowMissing);
+  const entry=parameters.get(b);return !!entry&&n.start>=entry.fn.body.start&&closedCalls.get(entry.fn).every(c=>{
+   const supplied=c.arguments[entry.i],actual=primitive(supplied)===undefined&&entry.p.type==='AssignmentPattern'?entry.p.right:supplied;
+   return absent(actual,field,new Set(seen),allowMissing);
+  });
+ }
+ const objectGuarded=n=>{for(let p=parents.get(n);p;p=parents.get(p))if(p.type==='SwitchCase'&&p.test?.type==='Literal'&&p.test.value==='object'&&isolatedSwitchCase(ix,p)){const s=parents.get(p),v=s?.discriminant;if(v?.type==='UnaryExpression'&&v.operator==='typeof'&&v.argument.type==='Identifier'&&bindings.get(v.argument)===bindings.get(n.object))return true;}return false;};
+ const unstablePrototype=new Set(Object.getOwnPropertyNames(Object.prototype));
+ // A fresh literal still inherits properties. Reflection or escaped constructors
+ // can expose/mutate its prototype without spelling Object.prototype directly.
+ let unknownPrototype=nodes.some(n=>{
+  if(n.type==='MemberExpression'&&['__proto__','constructor','getPrototypeOf','getOwnPropertyDescriptor','getOwnPropertyDescriptors','__defineGetter__','__defineSetter__','__lookupGetter__','__lookupSetter__'].includes(property(n)))return true;
+  if(free(n,'Object')||free(n,'Reflect')){const p=parents.get(n);return p?.type==='MemberExpression'&&p.object===n?property(p)===undefined:p?.type!=='CallExpression'||p.callee!==n;}
+  return false;
+ });
+ for(const n of nodes)if(n.type==='MemberExpression'&&free(n.object,'Object')&&property(n)==='prototype'){
+  const p=parents.get(n),use=parents.get(p);
+  if(p?.type==='MemberExpression'&&p.object===n){
+   const field=property(p);if(field===undefined){unknownPrototype=true;continue;}
+   if(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.operator==='delete'||['ForInStatement','ForOfStatement'].includes(use?.type)&&use.left===p)unstablePrototype.add(field);
+   else if(!(use?.type==='CallExpression'&&use.callee===p&&field==='hasOwnProperty'))unknownPrototype=true;
+  }else if(p?.type==='CallExpression'&&p.arguments[0]===n&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&property(p.callee)==='defineProperty'&&p.arguments[1]?.type==='Literal')unstablePrototype.add(p.arguments[1].value);
+  else unknownPrototype=true;
+ }
+ for(const n of nodes)if(!unknownPrototype){
+  if(n.type==='MemberExpression'&&n.object.type==='Identifier'&&typeof property(n)==='string'&&!unstablePrototype.has(property(n))){const p=parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete')continue;if(absent(n.object,property(n),new Set(),objectGuarded(n)))replace.set(n,'(void 0)');}
+  if(n.type==='BinaryExpression'&&n.operator==='in'&&n.left.type==='Literal'&&typeof n.left.value==='string'&&!unstablePrototype.has(n.left.value)&&absent(n.right,n.left.value))replace.set(n,'false');
+  if(n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.init?.type==='Identifier')for(const p of n.id.properties){
+   const b=p.type==='Property'&&p.value.type==='Identifier'?bindings.get(p.value):null;
+   if(b&&!b.writes.length&&key(p)!==undefined&&!unstablePrototype.has(key(p))&&absent(n.init,key(p)))for(const ref of b.refs)replace.set(ref,'(void 0)');
+  }
+ }
+ function knownType(n,seen=new Set()){
+  if(!n)return 'undefined';if(seen.has(n))return null;seen=new Set(seen);seen.add(n);
+  const value=primitive(n);if(value!==UNKNOWN)return typeof value;
+  if(n.type==='ObjectExpression'||n.type==='ArrayExpression')return 'object';
+  if(n.type==='TemplateLiteral')return 'string';
+  if(n.type!=='Identifier')return null;
+  const b=bindings.get(n);if(!b||evaluated.has(b))return null;
+  const written=b.writes.map(w=>w.type==='AssignmentExpression'&&w.operator==='='&&w.left.type==='Identifier'&&bindings.get(w.left)===b?knownType(w.right,new Set(seen)):null);
+  if(written.some(t=>!t))return null;
+  if(b.init){
+   let t=initialized(b,n)?knownType(b.init,seen):null;
+   if(!t&&initialized(b,n)&&b.init.type==='MemberExpression'){
+    const candidates=finiteLiteralMember(ix,b.init),types=candidates?.map(v=>v.type==='TemplateLiteral'?'string':typeof v.value);
+    if(types?.length&&types.every(v=>v===types[0]))t=types[0];
+   }
+   return t&&written.every(v=>v===t)?t:null;
+  }
+  const entry=parameters.get(b);if(!entry||n.start<entry.fn.body.start)return null;
+  const all=closedCalls.get(entry.fn).map(c=>{const arg=c.arguments[entry.i],t=knownType(arg,new Set(seen));return t==='undefined'&&entry.p.type==='AssignmentPattern'?knownType(entry.p.right,new Set(seen)):t;});
+  return all[0]&&[...all,...written].every(t=>t===all[0])?all[0]:null;
+ }
+ function possibleTypes(n,seen=new Set()){
+  const known=knownType(n);if(known)return new Set([known]);
+  if(n?.type!=='Identifier'||seen.has(n))return null;seen=new Set(seen);seen.add(n);
+  const b=bindings.get(n),entry=parameters.get(b);if(!b||b.writes.length||!entry)return null;
+  const result=new Set();
+  for(const c of closedCalls.get(entry.fn)){
+   let actual=c.arguments[entry.i];if(knownType(actual)==='undefined'&&entry.p.type==='AssignmentPattern')actual=entry.p.right;
+   const types=possibleTypes(actual,new Set(seen));if(!types)return null;for(const type of types)result.add(type);
+  }
+  return result;
+ }
+ for(const clause of nodes)if(clause.type==='SwitchCase'&&clause.test?.type==='Literal'&&isolatedSwitchCase(ix,clause)){
+  const test=parents.get(clause).discriminant;
+  if(test.type==='UnaryExpression'&&test.operator==='typeof'){
+   const types=possibleTypes(test.argument);
+   if(types&&!types.has(clause.test.value)&&!nodes.some(n=>n.type==='Identifier'&&n.start>=clause.start&&n.end<=clause.end&&!ix.reference(n)&&bindings.get(n)?.refs.some(r=>r.start<clause.start||r.end>clause.end)))replace.set(clause,'');
+  }
+ }
+ function emptyRecord(n,seen=new Set()){
+  if(n?.type==='ObjectExpression')return !n.properties.length;
+  if(n?.type!=='Identifier')return false;const b=bindings.get(n);if(!b||b.writes.length||evaluated.has(b)||seen.has(b))return false;
+  if(b.refs.some(r=>{const p=parents.get(r),q=parents.get(p);return !(p?.type==='UnaryExpression'&&p.operator==='typeof'||p?.type==='MemberExpression'&&p.object===r&&property(p)!==undefined&&!(q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.operator==='delete')||p?.type==='CallExpression'&&p.arguments.length===1&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&property(p.callee)==='keys');}))return false;
+  seen=new Set(seen);seen.add(b);
+  if(b.init)return initialized(b,n)&&emptyRecord(b.init,seen);
+  const entry=parameters.get(b);return !!entry&&closedCalls.get(entry.fn).every(c=>{const arg=c.arguments[entry.i];return emptyRecord(!arg||free(arg,'undefined')?entry.p.type==='AssignmentPattern'?entry.p.right:null:arg,new Set(seen));});
+ }
+ function knownTruth(n,seen=new Set()){
+  if(!n)return false;if(seen.has(n))return UNKNOWN;seen=new Set(seen);seen.add(n);
+  const value=primitive(n);if(value!==UNKNOWN)return !!value;
+  if(['ObjectExpression','ArrayExpression'].includes(n.type))return true;
+  if(n.type!=='Identifier')return UNKNOWN;
+  const b=bindings.get(n);if(!b||b.writes.length||evaluated.has(b))return UNKNOWN;
+  if(b.init)return initialized(b,n)?knownTruth(b.init,seen):UNKNOWN;
+  const entry=parameters.get(b);if(!entry||n.start<entry.fn.body.start)return UNKNOWN;
+  const all=closedCalls.get(entry.fn).map(c=>{const arg=c.arguments[entry.i],missing=knownType(arg,new Set(seen))==='undefined';return knownTruth(missing&&entry.p.type==='AssignmentPattern'?entry.p.right:arg,new Set(seen));});
+  return all.length&&all.every(v=>v===all[0])?all[0]:UNKNOWN;
+ }
+ for(const n of nodes)if(n.type==='UnaryExpression'&&n.operator==='typeof'){const type=knownType(n.argument);if(type)replace.set(n,JSON.stringify(type));}
+ else if(n.type==='UnaryExpression'&&n.operator==='!'&&n.argument.type==='Identifier'){const truth=knownTruth(n.argument);if(truth!==UNKNOWN)replace.set(n,JSON.stringify(!truth));}
+ else if(n.type==='MemberExpression'&&property(n)==='length'&&n.object.type==='CallExpression'&&n.object.arguments.length===1&&n.object.callee.type==='MemberExpression'&&free(n.object.callee.object,'Object')&&property(n.object.callee)==='keys'&&emptyRecord(n.object.arguments[0]))replace.set(n,'0');
+ const render=n=>replace.has(n)?replace.get(n):n.type==='Property'&&n.shorthand&&replace.has(n.value)?`${source.slice(n.key.start,n.key.end)}: ${render(n.value)}`:patch(source,n,render);return render(tree);
+}
+
+// Give an unconditional input-normalization assignment its own binding. This
+// keeps evaluation and identity intact while allowing closed-call field facts.
+export function normalizeRecordParameters(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),changes=new WeakMap(),names=new Set(ix.nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const evaluated=evaluationBindings(ix,source);
+ for(const fn of ix.nodes.filter(n=>functions.has(n.type)&&ix.parents.get(n)?.type!=='MethodDefinition'))for(const id of fn.params){
+  if(id.type!=='Identifier')continue;const b=ix.bindings.get(id),write=b?.writes[0],stmt=ix.parents.get(write),block=ix.parents.get(stmt);
+  if(!b||evaluated.has(b)||b.init||b.writes.length!==1||write.type!=='AssignmentExpression'||write.operator!=='='||write.left!==id&&ix.bindings.get(write.left)!==b||stmt?.type!=='ExpressionStatement'||block?.type!=='BlockStatement'||ix.owners.get(write)!==fn||block.body[0]!==stmt||write.right.type!=='ConditionalExpression')continue;
+  if(!b.refs.every(r=>r===write.left||r.start>=write.right.start&&r.end<=write.right.end||r.start>stmt.end&&r.end<block.end))continue;
+  // The declaration remains in its original block. No catch/finally reference
+  // may depend on the old parameter after its normalization.
+  let name='input_'+id.name,i=2;while(names.has(name))name='input_'+id.name+i++;names.add(name);
+  changes.set(id,name);for(const r of b.refs)if(r.start>=write.right.start&&r.end<=write.right.end)changes.set(r,name);
+  changes.set(stmt,()=>`const ${id.name} = ${render(write.right)};`);
+ }
+ // The same normalization also occurs immediately after a local input
+ // declaration. Preserve that initializer once, then bind the selected record.
+ for(const d of ix.nodes.filter(n=>n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init)){
+  const b=ix.bindings.get(d.id),decl=ix.parents.get(d),block=ix.parents.get(decl),write=b?.writes[0],stmt=ix.parents.get(write);
+  if(!b||evaluated.has(b)||b.writes.length!==1||decl?.type!=='VariableDeclaration'||decl.kind!=='let'||decl.declarations.length!==1||!['Program','BlockStatement'].includes(block?.type)||stmt?.type!=='ExpressionStatement'||ix.parents.get(stmt)!==block||block.body.indexOf(stmt)!==block.body.indexOf(decl)+1||write.type!=='AssignmentExpression'||write.operator!=='='||write.right.type!=='ConditionalExpression'||ix.bindings.get(write.left)!==b)continue;
+  if(!b.refs.every(r=>r===write.left||r.start>=write.right.start&&r.end<=write.right.end||r.start>stmt.end))continue;
+  let name='input_'+d.id.name,i=2;while(names.has(name))name='input_'+d.id.name+i++;names.add(name);
+  changes.set(d.id,name);for(const r of b.refs)if(r.start>=write.right.start&&r.end<=write.right.end)changes.set(r,name);
+  changes.set(stmt,()=>`const ${d.id.name} = ${render(write.right)};`);
+ }
+ const render=n=>changes.has(n)?typeof changes.get(n)==='function'?changes.get(n)():changes.get(n):patch(source,n,render);return render(tree);
+}
+
+// Project a single closed message consumer onto the fields it actually uses.
+// This is a local data object, never an injected proxy-platform API/runtime.
+export function lowerMessageParameters(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings,free}=ix;
+ for(const kind of ['$request','$response']){
+  const refs=nodes.filter(n=>free(n,kind)&&!(parents.get(n)?.type==='UnaryExpression'&&parents.get(n).operator==='typeof'));
+  if(refs.length!==1)continue;
+  const ref=refs[0],call=parents.get(ref),binding=bindings.get(call?.callee),fn=binding?.fn;
+  if(call?.type!=='CallExpression'||call.arguments.some(n=>n.type==='SpreadElement')||!functions.has(fn?.type)||binding.writes.length||binding.refs.length!==1||parents.get(binding.refs[0])!==call)continue;
+  const p=fn.params[call.arguments.indexOf(ref)],parameter=p?.type==='Identifier'?bindings.get(p):null;
+  if(!parameter?.refs.length||parameter.writes.length)continue;
+  const fields=new Set();let valid=true;
+  for(const r of parameter.refs){const member=parents.get(r),key=property(member);if(member?.type!=='MemberExpression'||member.object!==r||!['url','method','headers','body','bodyBytes','status','statusCode'].includes(key)){valid=false;break;}fields.add(key);}
+  if(valid)replace.set(ref,'{'+[...fields].map(key=>JSON.stringify(key)+':'+kind+'['+JSON.stringify(key)+']').join(', ')+'}');
+ }
+ const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+}
+
+// A closed callback helper can have different completion contracts at different
+// call sites. Clone its declaration, not its arguments: evaluation, closures and
+// defaults still belong to the original calls. No callback runtime is injected.
+export function specializeCallbacks(source,generated){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap(),names=new Set(ix.nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const declarationCounts=new Map(),usesArguments=new WeakSet();
+ for(const n of ix.nodes){
+  if(n.type==='VariableDeclarator'||n.type==='FunctionDeclaration'){
+   const b=ix.bindings.get(n.id);if(b)declarationCounts.set(b,(declarationCounts.get(b)||0)+1);
+  }
+  if(ix.free(n,'arguments'))for(let p=ix.parents.get(n);p;p=ix.parents.get(p))if(functions.has(p.type))usesArguments.add(p);
+ }
+ const fresh=base=>{let n=base,i=2;while(names.has(n))n=base+i++;names.add(n);return n;};
+ for(const fn of ix.nodes.filter(n=>functions.has(n.type)&&!n.generator)){
+  const parent=ix.parents.get(fn),d=parent?.type==='VariableDeclarator'?parent:null,id=fn.type==='FunctionDeclaration'?fn.id:d?.id;
+  if(id?.type!=='Identifier'||fn.type!=='FunctionDeclaration'&&fn.id||d&&ix.parents.get(d).declarations.length!==1)continue;
+  const b=ix.bindings.get(id),statement=d?ix.parents.get(d):fn;
+  if(!b||b.writes.length||b.refs.length<2||b.refs.length>16||declarationCounts.get(b)!==1)continue;
+  const calls=b.refs.map(r=>ix.parents.get(r));if(calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==b.refs[i]||c.optional||c.arguments.some(a=>a.type==='SpreadElement')||c.start>=fn.start&&c.end<=fn.end))continue;
+  if(usesArguments.has(fn))continue;
+  const positions=fn.params.map((p,i)=>{const id=p.type==='AssignmentPattern'?p.left:p,pb=ix.bindings.get(id);return id.type==='Identifier'&&pb&&!pb.writes.length&&pb.refs.some(r=>{const c=ix.parents.get(r);return c?.type==='CallExpression'&&c.callee===r;})?i:-1;}).filter(i=>i>=0);
+  if(!positions.some(i=>calls.every(c=>functions.has(c.arguments[i]?.type))&&new Set(calls.map(c=>c.arguments[i])).size>1))continue;
+  const copies=[];
+  for(let i=0;i<calls.length;i++){
+   const name=fresh(id.name+'Callback'+(i+1));generated.add(name);replace.set(b.refs[i],name);
+   copies.push(fn.type==='FunctionDeclaration'?source.slice(fn.start,id.start)+name+source.slice(id.end,fn.end):ix.parents.get(d).kind+' '+name+' = '+source.slice(fn.start,fn.end)+';');
+  }
+  replace.set(statement,copies.join('\n'));
+ }
+ const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+}
+
+// Specialize closed receiver arguments and finite method selectors. No SDK
+// receiver escapes, selector evaluation or argument side effects are discarded.
+export function lowerClosedReceiverArguments(source, objectOnly=false){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings}=ix;
+ const receivers=new Set();
+ for(const d of nodes)if(d.type==='VariableDeclarator'&&parents.get(parents.get(d))===tree){
+  const b=bindings.get(d.id),c=d.init,f=bindings.get(c?.callee)?.fn,last=f?.body.type==='BlockStatement'?f.body.body.at(-1):null;
+  const returnedClass=last?.type==='ReturnStatement'&&last.argument?.type==='NewExpression'&&last.argument.callee.type==='ClassExpression';
+  const returnedObject=last?.type==='ReturnStatement'&&last.argument?.type==='ObjectExpression'&&f.body.body.length>1;
+  if(b&&!b.writes.length&&['CallExpression','NewExpression'].includes(c?.type)&&f&&(returnedObject||!objectOnly&&returnedClass))receivers.add(b);
+ }
+ if(!receivers.size)return source;
+ const definitions=new Map();for(const n of nodes)if(n.type==='FunctionDeclaration'){const b=bindings.get(n.id);definitions.set(b,(definitions.get(b)??0)+1);}
+ for(const fn of nodes.filter(n=>n.type==='FunctionDeclaration'&&!n.generator)){
+  const b=bindings.get(fn.id);if(!b||b.writes.length||!b.refs.length||definitions.get(b)!==1)continue;
+  const calls=b.refs.map(r=>parents.get(r));if(calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==b.refs[i]||c.optional||c.arguments.some(a=>a.type==='SpreadElement')))continue;
+  if(!fn.params.some((p,i)=>p.type==='Identifier'&&calls.every(c=>c.arguments[i]?.type==='Identifier'&&receivers.has(bindings.get(c.arguments[i]))))||index(fn).nodes.some(n=>ix.free(n,'arguments')))continue;
+  for(let i=0;i<fn.params.length;i++){
+   const p=fn.params[i],param=p.type==='Identifier'?bindings.get(p):null;if(!param||param.writes.length||!param.refs.length)continue;
+   const actual=calls.map(c=>c.arguments[i]);if(actual.some(a=>a?.type!=='Identifier'))continue;
+   const receiver=bindings.get(actual[0]);if(!receivers.has(receiver)||actual.some(a=>bindings.get(a)!==receiver))continue;
+   const d=parents.get(receiver.init),declaration=parents.get(d);if(d?.type!=='VariableDeclarator'||parents.get(declaration)!==tree||calls.some(c=>!initializedAfter(ix,declaration,c)))continue;
+   if(nodes.some(n=>n.type==='Identifier'&&n.name===actual[0].name&&n.start>=fn.start&&n.end<=fn.end&&bindings.has(n)&&bindings.get(n)!==receiver))continue;
+   if(param.refs.some(r=>{const m=parents.get(r);return m?.type!=='MemberExpression'||m.object!==r||m.optional||property(m)===undefined;}))continue;
+   for(const r of param.refs)replace.set(r,actual[0].name);
+   // The discarded argument is an initialized immutable local read. Keeping
+   // its unused formal avoids shifting later argument/default evaluation.
+   for(const a of actual)replace.set(a,'void 0');
+  }
+ }
+ const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+}
+
+export function lowerFiniteMethodCalls(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings,owners}=ix,UNKNOWN=Symbol('unknown'),parameters=new Map(),names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let value=base,i=2;while(names.has(value))value=base+i++;names.add(value);return value;};
+ const factory=b=>{const c=b?.init,f=bindings.get(c?.callee)?.fn;return !b?.writes.length&&['NewExpression','CallExpression'].includes(c?.type)&&f?.body.type==='BlockStatement'&&f.body.body.at(-1)?.argument?.callee?.type==='ClassExpression'?f:null;};
+ const calls=nodes.filter(call=>{
+  if(call.type!=='CallExpression'||call.optional||call.callee.type!=='MemberExpression'||!call.callee.computed||property(call.callee)!==undefined||call.arguments.some(a=>a.type==='SpreadElement'))return false;
+  let receiver=call.callee.object;if(receiver.type==='MemberExpression'&&property(receiver)!==undefined)receiver=receiver.object;
+  return receiver.type==='Identifier'&&!!factory(bindings.get(receiver));
+ });
+ if(!calls.length)return source;
+ const definitions=new Map(),parameterOwners=new Map();
+ for(const n of nodes){if(['FunctionDeclaration','VariableDeclarator'].includes(n.type)){const b=bindings.get(n.id);definitions.set(b,(definitions.get(b)??0)+1);}if(functions.has(n.type))n.params.forEach((p,i)=>{const id=p.type==='AssignmentPattern'?p.left:p;if(id.type==='Identifier')parameterOwners.set(bindings.get(id),{fn:n,i,defaultValue:p.type==='AssignmentPattern'?p.right:null});});}
+ function closedCalls(fn){
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),b=bindings.get(id);
+  if(b&&!b.writes.length&&b.refs.length&&definitions.get(b)===1){
+   const calls=b.refs.map(r=>parents.get(r));
+   if(calls.every((c,i)=>c?.type==='CallExpression'&&c.callee===b.refs[i]&&!c.optional&&!c.arguments.some(a=>a.type==='SpreadElement')))return calls;
+   // A closed array callback is also a finite call site. Resolve each literal
+   // element as the callback's first argument; this is analysis only, so the
+   // original map/forEach call and its evaluation order remain intact.
+   const callbackInputs=[];
+   for(let i=0;i<calls.length;i++){
+    const call=calls[i],ref=b.refs[i],callee=call?.callee;
+    if(call?.type!=='CallExpression'||call.optional||callee?.type!=='MemberExpression'||!['map','forEach'].includes(property(callee))||
+       call.arguments[0]!==ref||call.arguments.length>2||call.arguments.some(a=>a.type==='SpreadElement')||
+       index(fn).nodes.some(n=>n.type==='ThisExpression'&&n.start>=fn.start&&n.end<=fn.end))return null;
+    const elements=arrayElements(callee.object);if(!elements)return null;
+    callbackInputs.push(...elements.map(value=>({arguments:[value]})));
+   }
+   if(callbackInputs.length)return callbackInputs;
+  }
+  if(parent?.type!=='MethodDefinition'||parent.static||parent.computed||parent.kind!=='method')return null;
+  const cls=parents.get(parents.get(parent)),cb=cls?.type==='ClassDeclaration'?bindings.get(cls.id):null;
+  if(!cb||cb.writes.length||!cb.refs.length||cb.refs.some(r=>parents.get(r)?.type!=='NewExpression'||parents.get(r).callee!==r))return null;
+  const members=nodes.filter(n=>n.type==='MemberExpression'&&property(n)===key(parent));
+  if(!members.length||members.some(m=>m.object.type!=='ThisExpression'||m.start<cls.start||m.end>cls.end||parents.get(m)?.type!=='CallExpression'||parents.get(m).callee!==m||parents.get(m).arguments.some(a=>a.type==='SpreadElement')))return null;
+  return members.map(m=>parents.get(m));
+ }
+ function arrayElements(n,seen=new Set()){
+  if(!n||seen.has(n))return null;seen=new Set(seen);seen.add(n);
+  if(n.type==='ChainExpression')return arrayElements(n.expression,seen);
+  if(n.type==='ArrayExpression')return n.elements.every(e=>e?.type!=='SpreadElement')?n.elements.filter(Boolean):null;
+  if(n.type==='ConditionalExpression'||n.type==='LogicalExpression'){
+   const a=arrayElements(n.consequent??n.left,new Set(seen)),b=arrayElements(n.alternate??n.right,new Set(seen));return a&&b?[...a,...b]:null;
+  }
+  if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['find','filter'].includes(property(n.callee))&&n.arguments.length===1&&functions.has(n.arguments[0]?.type))return arrayElements(n.callee.object,seen);
+  if(n.type==='MemberExpression'&&n.computed){
+   const values=arrayElements(n.object,seen);if(!values)return null;
+   const indexValue=n.property.type==='Literal'&&Number.isInteger(n.property.value)?n.property.value:null;
+   return indexValue===null?values:values[indexValue]?[values[indexValue]]:[];
+  }
+  if(n.type==='Identifier'){
+   const b=bindings.get(n);if(!b)return null;
+   const writes=b.writes.filter(w=>!(w.type==='AssignmentExpression'&&w.operator==='='&&w.left.type==='Identifier'&&bindings.get(w.left)===b));
+   if(writes.some(w=>w.type!=='AssignmentExpression'||w.operator!=='='||w.left.type!=='Identifier'||bindings.get(w.left)!==b))return null;
+   const inputs=[b.init,...writes.map(w=>w.right)].filter(Boolean);
+   if(inputs.length)return inputs.flatMap(value=>arrayElements(value,new Set(seen))??[]);
+   const entry=parameterOwners.get(b),sites=entry&&closedCalls(entry.fn);if(!sites)return null;
+   const sets=sites.map(c=>arrayElements(c.arguments[entry.i]??entry.defaultValue,new Set(seen)));return sets.every(Boolean)?sets.flat():null;
+  }
+  return null;
+ }
+ function objectRecords(n,seen=new Set(),at=Infinity){
+  if(!n||seen.has(n))return null;seen=new Set(seen);seen.add(n);
+  if(n.type==='ChainExpression')return objectRecords(n.expression,seen,at);
+  if(n.type==='ObjectExpression')return [n];
+  // Primitive request shorthand (for example, a URL string) has no own
+  // method/body fields. Retain it as a closed record so optional property
+  // reads can be proven absent without treating the string as an object.
+  if(n.type==='Literal'&&['string','number','boolean'].includes(typeof n.value))return [n];
+  if(n.type==='ConditionalExpression'||n.type==='LogicalExpression'){
+   const a=objectRecords(n.consequent??n.left,new Set(seen),at),b=objectRecords(n.alternate??n.right,new Set(seen),at);return a&&b?[...a,...b]:null;
+  }
+  if(n.type==='MemberExpression'&&n.computed)return arrayElements(n.object,seen)?.flatMap(value=>objectRecords(value,new Set(seen),at)??[])??null;
+  if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['find','filter'].includes(property(n.callee))&&n.arguments.length===1&&functions.has(n.arguments[0]?.type))return arrayElements(n.callee.object,seen)?.flatMap(value=>objectRecords(value,new Set(seen),at)??[])??null;
+  if(n.type==='MemberExpression'&&property(n)!==undefined){
+   const records=objectRecords(n.object,seen,at);if(!records)return null;
+   const values=records.map(record=>{
+    if(record.type!=='ObjectExpression'||record.properties.some(p=>p.type!=='Property'||p.kind!=='init'||key(p)===undefined||key(p)==='__proto__'))return undefined;
+    return record.properties.findLast(p=>String(key(p))===String(property(n)))?.value??null;
+   });return values.every(value=>value!==undefined)?values.flatMap(value=>value?objectRecords(value,new Set(seen),at)??[value]:[]):null;
+  }
+  if(n.type==='Identifier'){
+   const b=bindings.get(n);if(!b)return null;
+   const writes=b.writes.filter(w=>w.start<at);
+   if(writes.some(w=>w.type!=='AssignmentExpression'||w.operator!=='='||w.left.type!=='Identifier'||bindings.get(w.left)!==b))return null;
+   // Reassigned record variables are safe only when every read is a static
+   // field access or a direct call into a closed local function.
+   const stable=b.refs.every(ref=>{
+    const p=parents.get(ref),q=parents.get(p);
+    if(p?.type==='MemberExpression'&&p.object===ref){
+     const mutation=q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete';
+     return property(p)!==undefined&&(!mutation||q.start>=at);
+    }
+    if(p?.type==='AssignmentExpression'&&p.left===ref&&p.operator==='=')return true;
+    if(p?.type==='Property'&&p.value===ref&&q?.type==='ObjectExpression')return p.kind==='init';
+    if(p?.type==='ConditionalExpression'&&(p.test===ref||p.consequent===ref||p.alternate===ref)||p?.type==='IfStatement'&&p.test===ref||p?.type==='LogicalExpression'&&(p.left===ref||p.right===ref)||p?.type==='BinaryExpression'||p?.type==='UnaryExpression')return true;
+    if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+     if(p.start>=at)return true;
+     if(calls.includes(p)||ix.free(p.callee,'console'))return true;
+     const fn=bindings.get(p.callee)?.fn;return !!fn&&!!closedCalls(fn);
+    }
+    return false;
+   });
+   if(!stable)return null;
+   const selfBranches=(value)=>{
+    if(value?.type==='Identifier'&&bindings.get(value)===b)return {values:[],self:true};
+    if(value?.type==='ConditionalExpression'){
+     const a=selfBranches(value.consequent),c=selfBranches(value.alternate);return {values:[...a.values,...c.values],self:a.self||c.self};
+    }
+    if(value?.type==='LogicalExpression'&&['&&','||','??'].includes(value.operator)){
+     const a=selfBranches(value.left),c=selfBranches(value.right);return {values:[...a.values,...c.values],self:a.self||c.self};
+    }
+    return {values:[value],self:false};
+   };
+   const branches=writes.map(w=>selfBranches(w.right));if(branches.some(x=>x.self)&&!b.init)return null;
+   const inputs=[b.init,...branches.flatMap(x=>x.values)].filter(Boolean);
+   if(inputs.length)return inputs.flatMap(value=>objectRecords(value,new Set(seen),at)??[]);
+   const entry=parameterOwners.get(b),sites=entry&&closedCalls(entry.fn);if(!sites)return null;
+   const sets=sites.map(c=>objectRecords(c.arguments[entry.i]??entry.defaultValue,new Set(seen),at));return sets.every(Boolean)?sets.flat():null;
+  }
+  return null;
+ }
+ function recordValues(n,field,seen=new Set(),at=Infinity){
+  if(!n||seen.has(n))return null;seen=new Set(seen);
+  if(n.type==='ChainExpression')return recordValues(n.expression,field,seen,at);
+  const records=objectRecords(n,seen,at);if(!records)return null;
+  return records.map(record=>{
+   if(record.type==='Literal'&&['string','number','boolean'].includes(typeof record.value))return null;
+   if(record.type!=='ObjectExpression'||record.properties.some(p=>p.type!=='Property'||p.kind!=='init'||key(p)===undefined||key(p)==='__proto__'))return undefined;
+   return record.properties.findLast(p=>String(key(p))===field)?.value??null;
+  }).every(value=>value!==undefined)?records.map(record=>record.properties.findLast(p=>String(key(p))===field)?.value??null):null;
+ }
+ function values(n,seen=new Set()){
+  if(!n)return new Set([undefined]);if(seen.has(n))return UNKNOWN;seen=new Set(seen);seen.add(n);
+  if(n.type==='Literal'&&(typeof n.value==='string'||n.value===null))return new Set([n.value]);
+  if(n.type==='ChainExpression')return values(n.expression,seen);
+  if(n.type==='MemberExpression'&&property(n)!==undefined){const inputs=recordValues(n.object,String(property(n)),new Set(seen),n.start);if(!inputs)return UNKNOWN;const sets=inputs.map(v=>values(v,new Set(seen)));return sets.some(v=>v===UNKNOWN)?UNKNOWN:new Set(sets.flatMap(v=>[...v]));}
+  if(n.type==='LogicalExpression'&&['||','??'].includes(n.operator)){const a=values(n.left,seen),b=values(n.right,seen);return a===UNKNOWN||b===UNKNOWN?UNKNOWN:new Set([...a].filter(v=>n.operator==='||'?v:v!=null).concat([...b]));}
+  if(n.type==='ConditionalExpression'){
+   const test=values(n.test,new Set(seen));
+   const truthy=test===UNKNOWN?null:[...test].map(Boolean);
+   if(truthy?.every(Boolean))return values(n.consequent,seen);
+   if(truthy?.every(value=>!value))return values(n.alternate,seen);
+   const a=values(n.consequent,seen),b=values(n.alternate,seen);return a===UNKNOWN||b===UNKNOWN?UNKNOWN:new Set([...a,...b]);
+  }
+  if(n.type==='UnaryExpression'&&['!','void','typeof','+','-'].includes(n.operator)){
+   const input=values(n.argument,new Set(seen));if(input===UNKNOWN)return UNKNOWN;const result=new Set();
+   for(const value of input){
+    if(n.operator==='!')result.add(!value);
+    else if(n.operator==='void')result.add(undefined);
+    else if(n.operator==='typeof')result.add(typeof value);
+    else if(['number','string','boolean'].includes(typeof value))result.add(n.operator==='+'?+value:-value);
+    else return UNKNOWN;
+   }
+   return result.size<=8?result:UNKNOWN;
+  }
+  if(n.type==='CallExpression'&&!n.arguments.length&&n.callee.type==='MemberExpression'&&['toLowerCase','toUpperCase'].includes(property(n.callee))){const a=values(n.callee.object,seen);return a===UNKNOWN||[...a].some(v=>v!==undefined&&typeof v!=='string')?UNKNOWN:new Set([...a].filter(v=>v!==undefined).map(v=>property(n.callee)==='toLowerCase'?v.toLowerCase():v.toUpperCase()));}
+  if(n.type!=='Identifier')return UNKNOWN;
+  const b=bindings.get(n);if(!b)return UNKNOWN;
+  if(!b.init&&!parameters.has(b)){const entry=parameterOwners.get(b),sites=entry&&closedCalls(entry.fn);parameters.set(b,sites?.flatMap(c=>{const actual=c.arguments[entry.i];return !actual||ix.free(actual,'undefined')?[entry.defaultValue]:[actual,...(entry.defaultValue?[entry.defaultValue]:[])];})??null);}
+  let inputs=b.init?[b.init]:parameters.get(b);if(!inputs)return UNKNOWN;
+  const writes=b.writes.filter(w=>!(w.type==='AssignmentExpression'&&w.operator==='='&&w.right.type==='Identifier'&&bindings.get(w.right)===b));
+  if(writes.some(w=>w.type!=='AssignmentExpression'||w.operator!=='='||w.left.type!=='Identifier'||bindings.get(w.left)!==b))return UNKNOWN;
+  inputs=[...inputs,...writes.map(w=>w.right)];const result=new Set();
+  for(const v of inputs){const candidate=values(v,seen);if(candidate===UNKNOWN)return UNKNOWN;for(const value of candidate)result.add(value);}
+  return result.size<=8?result:UNKNOWN;
+ }
+ for(const call of calls){
+  const m=call.callee;
+  const candidates=values(m.property);if(candidates===UNKNOWN)continue;
+  const methods=[...candidates].filter(v=>v!==undefined);
+  if(!methods.length||methods.some(v=>!['get','post','put','delete','head','options','patch'].includes(v)))continue;
+  const selector=fresh('selectedMethod'),args=call.arguments.map(()=>fresh('selectedArgument'));
+  replace.set(call,()=>`((${[selector,...args].join(', ')}) => {${methods.map(method=>`if (${selector} === ${JSON.stringify(method)}) return ${render(m.object)}.${method}(${args.join(', ')});`).join('')}throw new TypeError('Unknown HTTP method');})(${[m.property,...call.arguments].map(n=>'('+render(n)+')').join(', ')})`);
+ }
+ const render=n=>replace.has(n)?replace.get(n)():patch(source,n,render);return render(tree);
+}
+
+// Resolve a closed table of function names without evaluating input JavaScript.
+// Unknown strings, mutable tables and reassigned functions remain dynamic eval.
+
+export function lowerFunctionDispatch(source){
+ const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
+ const {nodes,bindings,parents,owners,free}=ix,replace=new WeakMap(),transformations=[];
+ const declarations=new Map();for(const n of nodes)if(['VariableDeclarator','FunctionDeclaration'].includes(n.type)){const b=bindings.get(n.id);if(b)declarations.set(b,(declarations.get(b)??0)+1);}
+ const stableObject=!nodes.some(n=>n.type==='MemberExpression'&&['prototype','__proto__','constructor'].includes(property(n)))&&nodes.filter(n=>free(n,'Object')).every(n=>{const p=parents.get(n),use=parents.get(p);return p?.type==='CallExpression'&&p.callee===n||p?.type==='MemberExpression'&&p.object===n&&['keys','entries','assign'].includes(property(p))&&use?.type==='CallExpression'&&use.callee===p;});
+ const table=n=>{
+  const b=n?.type==='Identifier'?bindings.get(n):null;
+  if(!stableObject||!b||b.writes.length||declarations.get(b)!==1||b.init?.type!=='ObjectExpression')return null;
+  if(!b.refs.every(r=>{const p=parents.get(r);if(p?.type==='MemberExpression'&&p.object===r){const use=parents.get(p);return !(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.operator==='delete')&&!(use?.type==='CallExpression'&&use.arguments.includes(p));}return p?.type==='CallExpression'&&p.arguments.length===1&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&['keys','entries'].includes(property(p.callee));}))return null;
+  return b.init.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.method&&key(p)!==undefined&&key(p)!=='__proto__'&&p.value.type==='Literal'&&typeof p.value.value==='string')?b.init:null;
+ };
+ function values(n,seen=new Set()){
+  if(!n||free(n,'undefined'))return new Set([undefined]);
+  if(n.type==='Literal'&&!n.regex)return new Set([n.value]);
+  if(n.type==='ConditionalExpression'){const a=values(n.consequent,new Set(seen)),b=values(n.alternate,new Set(seen));return a&&b?new Set([...a,...b]):null;}
+  if(n.type==='Identifier'){
+   const b=bindings.get(n);if(!b||b.writes.length||seen.has(b))return null;seen.add(b);
+   if(!b.init){
+    const declaration=nodes.find(d=>d.type==='VariableDeclarator'&&d.id.type==='ArrayPattern'&&d.id.elements[1]?.type==='Identifier'&&bindings.get(d.id.elements[1])===b),loop=parents.get(parents.get(declaration));
+    const call=loop?.type==='ForOfStatement'?loop.right:null;
+    if(call?.type!=='CallExpression'||call.arguments.length!==1||call.callee.type!=='MemberExpression'||!free(call.callee.object,'Object')||property(call.callee)!=='entries')return null;
+    const object=table(call.arguments[0]);return object?new Set(object.properties.map(p=>p.value.value)):null;
+   }
+   return values(b.init,seen);
+  }
+  if(n.type==='MemberExpression'){
+   const object=table(n.object);if(!object)return null;
+   const k=property(n),entries=k===undefined?object.properties:object.properties.filter(p=>String(key(p))===String(k));
+   return new Set([undefined,...entries.map(p=>p.value.value)]);
+  }
+  if(n.type==='CallExpression'&&n.callee.type==='Identifier'){
+   const b=bindings.get(n.callee),fn=b?.init;
+   if(!b||b.writes.length||!functions.has(fn?.type)||fn.async||fn.generator||seen.has(b)||!b.refs.every(r=>parents.get(r)?.type==='CallExpression'&&parents.get(r).callee===r))return null;
+   seen.add(b);const returns=fn.body.type==='BlockStatement'?nodes.filter(r=>r.type==='ReturnStatement'&&owners.get(r)===fn).map(r=>r.argument):[fn.body];
+   const out=new Set([undefined]);for(const r of returns){const v=values(r,new Set(seen));if(!v)return null;for(const x of v)out.add(x);}return out;
+  }
+  return null;
+ }
+ for(const n of nodes)if(n.type==='CallExpression'&&free(n.callee,'eval')&&!n.optional&&n.arguments.length===1){
+  const candidates=values(n.arguments[0]);if(!candidates)continue;
+  const names=[...candidates].filter(v=>typeof v==='string');if(!names.length||names.length>128)continue;
+  let valid=true;
+  for(const name of names){
+   if(!/^[A-Za-z_$][\w$]*$/.test(name)){valid=false;break;}
+   let b;for(let s=ix.scopes.get(n);s;s=s.parent)if(s.names.has(name)){b=s.names.get(name);break;}
+   if(!b||b.writes.length||declarations.get(b)!==1||!functions.has(b.init?.type)||b.init.type!=='FunctionDeclaration'&&!initializedAfter(ix,parents.get(b.init),n)){valid=false;break;}
+  }
+  if(!valid)continue;
+  replace.set(n,`(value => typeof value === 'string' ? ({${names.map(name=>JSON.stringify(name)+': '+name).join(', ')}})[value] : value)(${source.slice(n.arguments[0].start,n.arguments[0].end)})`);
+  transformations.push({kind:'finite-function-dispatch',line:source.slice(0,n.start).split('\n').length,functions:names});
+ }
+ const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
+ return {source:render(ix.nodes[0]),transformations};
+}
+
+// Lower accessors on a single closed factory instance to ordinary local calls.
+// No property descriptor, receiver alias, reflection or prototype escapes qualify.
+export function lowerClosedAccessors(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings,owners}=ix,names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let name=base,i=2;while(names.has(name))name=base+i++;names.add(name);return name;};
+ for(const factory of nodes.filter(n=>n.type==='FunctionDeclaration')){
+  const returned=factory.body.body.at(-1),construction=returned?.type==='ReturnStatement'?returned.argument:null,cls=construction?.type==='NewExpression'?construction.callee:null;
+  if(cls?.type!=='ClassExpression'||cls.superClass||cls.body.body.some(m=>m.type!=='MethodDefinition'||m.static||m.computed))continue;
+  const accessors=new Map();let valid=true;
+  for(const m of cls.body.body)if(['get','set'].includes(m.kind)){
+   const name=key(m);if(['__proto__','constructor','prototype'].includes(name)){valid=false;break;}
+   if(!accessors.has(name))accessors.set(name,{});const pair=accessors.get(name);if(pair[m.kind]){valid=false;break;}pair[m.kind]=m;pair[m.kind+'Name']=fresh('accessor_'+m.kind+'_'+name);
+  }
+  if(!valid||!accessors.size||cls.body.body.some(m=>m.kind==='method'&&accessors.has(key(m))))continue;
+  const fb=bindings.get(factory.id),ref=fb?.refs[0],call=parents.get(ref),d=parents.get(call),decl=parents.get(d);
+  if(!fb||fb.writes.length||fb.refs.length!==1||!['CallExpression','NewExpression'].includes(call?.type)||call.callee!==ref||d?.type!=='VariableDeclarator'||d.id.type!=='Identifier'||decl?.type!=='VariableDeclaration'||decl.declarations.length!==1||parents.get(decl)!==tree)continue;
+  const instance=bindings.get(d.id);if(!instance||instance.writes.length)continue;
+  if(instance.refs.some(r=>{const m=parents.get(r);return m?.type!=='MemberExpression'||m.object!==r||m.optional||property(m)===undefined||!(r.start>=factory.start&&r.end<=factory.end)&&!initializedAfter(ix,decl,r);}))continue;
+  const thisReceiver=n=>{let owner=owners.get(n);while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));return parents.get(owner)?.type==='MethodDefinition'&&parents.get(parents.get(parents.get(owner)))===cls;};
+  const members=new Map();for(const m of cls.body.body){if(!members.has(key(m)))members.set(key(m),[]);members.get(key(m)).push(m);}
+  const live=new Set(['constructor',...instance.refs.filter(r=>r.start<factory.start||r.end>factory.end).map(r=>property(parents.get(r)))]),queue=[...live];
+  while(queue.length)for(const m of members.get(queue.shift())??[])for(const n of index(m.value).nodes)if(n.type==='MemberExpression'&&(bindings.get(n.object)===instance||n.object.type==='ThisExpression'&&thisReceiver(n))){const name=property(n);if(name!==undefined&&!live.has(name)){live.add(name);queue.push(name);}}
+  const unused=cls.body.body.filter(m=>!live.has(key(m))),dead=n=>unused.some(m=>n.start>=m.start&&n.end<=m.end);
+  // Passing this or an alias could observe getters/descriptors or mutate them.
+  if(nodes.some(n=>!dead(n)&&n.type==='ThisExpression'&&n.start>=cls.start&&n.end<=cls.end&&thisReceiver(n)&&(parents.get(n)?.type!=='MemberExpression'||parents.get(n).object!==n||property(parents.get(n))===undefined)))continue;
+  const reads=[];
+  for(const n of nodes)if(!dead(n)&&n.type==='MemberExpression'&&(bindings.get(n.object)===instance||n.object.type==='ThisExpression'&&thisReceiver(n))&&accessors.has(property(n))){
+   const pair=accessors.get(property(n)),p=parents.get(n),write=p?.type==='AssignmentExpression'&&p.left===n;
+   if(p?.type==='UpdateExpression'||p?.operator==='delete'||['ForInStatement','ForOfStatement'].includes(p?.type)&&p.left===n||write&&(p.operator!=='='||!pair.set)){valid=false;break;}
+   reads.push({n,p,pair,write});
+  }
+  if(!valid)continue;
+  const argumentMethods=[];
+  for(const m of cls.body.body.filter(m=>!dead(m)&&m.kind==='method')){
+   const fn=m.value,local=index(fn),refs=local.nodes.filter(n=>local.free(n,'arguments')&&(()=>{let owner=owners.get(n);while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));return owner===fn;})());
+   if(!refs.length)continue;
+   const ids=fn.params.map(p=>p.type==='AssignmentPattern'?p.left:p);
+   if(ids.some(p=>p.type!=='Identifier')||fn.params.some(p=>p.type==='AssignmentPattern'&&index(p.right).nodes.some(n=>n.type==='Identifier'&&bindings.has(n)&&local.nodes.some(d=>['VariableDeclarator','FunctionDeclaration'].includes(d.type)&&bindings.get(d.id)===bindings.get(n))))||refs.some(r=>{const p=parents.get(r),u=parents.get(p);return r.start<fn.body.start||p?.type!=='MemberExpression'||p.object!==r||!(property(p)==='length'||Number.isInteger(property(p))&&property(p)>=0)||u?.type==='AssignmentExpression'&&u.left===p||u?.type==='UpdateExpression'||u?.operator==='delete';})||ids.some(id=>local.nodes.some(n=>['VariableDeclarator','FunctionDeclaration'].includes(n.type)&&bindings.get(n.id)===bindings.get(id)))){valid=false;break;}
+   const args=fresh('methodArguments');argumentMethods.push({m,fn,args});for(const ref of refs)replace.set(ref,()=>args);
+  }
+  if(!valid)continue;
+  for(const m of unused)replace.set(m,()=> '');
+  for(const {n,p,pair,write}of reads){
+   if(write){const value=fresh('assignedValue');replace.set(p,()=>`((${value}) => {${render(n.object)}.${pair.setName}(${value}); return ${value};})(${render(p.right)})`);}
+   else{
+    const body=pair.get?.value.body.body,expr=body?.length===1&&body[0].type==='ReturnStatement'?body[0].argument:null;
+    const local=expr?index(expr):null;
+    const inline=local&&local.nodes.every(v=>['Identifier','Literal','UnaryExpression','BinaryExpression','LogicalExpression','ConditionalExpression'].includes(v.type))&&local.nodes.filter(v=>local.free(v)).every(v=>['$request','$response','undefined'].includes(v.name)&&!nodes.some(id=>id.type==='Identifier'&&id.name===v.name&&bindings.has(id)));
+    replace.set(n,()=>inline?'('+source.slice(expr.start,expr.end)+')':pair.get?`${render(n.object)}.${pair.getName}()`:'(void 0)');
+   }
+  }
+  for(const pair of accessors.values())for(const kind of ['get','set'])if(pair[kind]&&!dead(pair[kind])){const m=pair[kind];replace.set(m,()=>`${pair[kind+'Name']}(${m.value.params.map(render).join(', ')}) ${render(m.value.body)}`);}
+  for(const {m,fn,args}of argumentMethods)replace.set(m,()=>`${fn.async?'async ':''}${fn.generator?'*':''}${source.slice(m.key.start,m.key.end)}(...${args}) {let [${fn.params.map(render).join(', ')}] = ${args};${render(fn.body).slice(1,-1)}}`);
+ }
+ const render=n=>replace.has(n)?replace.get(n)():patch(source,n,render);return render(tree);
+}

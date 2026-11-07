@@ -1,0 +1,50 @@
+{
+  "entrypoints": [
+    "batch.mjs",
+    "check.mjs",
+    "verify.mjs",
+    "widget.mjs"
+  ],
+  "vendor": [
+    "acorn.mjs",
+    "beautify.cjs"
+  ],
+  "categories": {
+    "core": [
+      "ast.mjs",
+      "syntax.mjs"
+    ],
+    "analysis": [
+      "analyze.mjs",
+      "behavior.mjs",
+      "values.mjs",
+      "libraries.mjs",
+      "probes.mjs"
+    ],
+    "transforms": [
+      "decoding.mjs",
+      "evaluation.mjs",
+      "simplify.mjs",
+      "specialization.mjs",
+      "factories.mjs"
+    ],
+    "platform": [
+      "globals.mjs",
+      "environment.mjs",
+      "clients.mjs"
+    ],
+    "http": [
+      "requests.mjs"
+    ],
+    "compiler": [
+      "flow.mjs",
+      "native.mjs"
+    ],
+    "output": [
+      "source.mjs"
+    ],
+    "verification": [
+      "fixtures.mjs"
+    ]
+  }
+}
