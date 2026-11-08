@@ -1187,7 +1187,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(copied){if(use.operator!=='='||!result.has(String(k))||!['url','headers','body'].includes(String(k)))return null;}
       else if(use.operator!=='='||s?.type!=='ExpressionStatement'||!['Program','BlockStatement'].includes(block?.type)||parents.get(enclosing)!==block||s.end>enclosing.start&&!(enclosing===s&&use.end<n.start))return null;
       result.set(String(k),use.right);
-     }else if(use?.operator==='delete'){if(k==='method'&&!result.has('method'))continue;if(!['headers','body','bodyBytes'].includes(String(k)))return null;result.optional??=new Set();result.optional.add(String(k));}else if(use?.type==='UpdateExpression')return null;continue;}
+     }else if(use?.operator==='delete'){
+      if(k==='method'&&!result.has('method'))continue;
+      // A closed adapter may clone its input and remove source-platform fields
+      // before dispatch. Keep that authored normalization; the native request
+      // still receives only the proven live fields projected below.
+      if(!copied&&!['headers','body','bodyBytes'].includes(String(k)))return null;
+      result.optional??=new Set();result.optional.add(String(k));
+     }else if(use?.type==='UpdateExpression')return null;continue;}
     if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='Identifier'){
      const alias=bindings.get(p.id);
      const readAlias=(binding,seen=new Set())=>{

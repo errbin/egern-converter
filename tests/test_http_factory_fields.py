@@ -2,7 +2,7 @@
 import unittest
 
 from tools.egern_hub.convert import ConversionError
-from tools.egern_hub.script_convert import convert_script
+from tools.egern_hub.script_convert import convert_script, convert_scripts
 from tools.egern_hub.verify import compare
 
 URL = 'https://example.test/script.js'
@@ -101,6 +101,52 @@ class HTTPFactoryFieldTests(unittest.TestCase):
                                        'events': {'requests': [{'method': 'POST', 'url': 'https://api.example',
                                                                 'headers': {'x-fixture': 'yes'}, 'body': 'payload'}]}}})
         self.assertEqual(result['status'], 'passed', result)
+
+    def test_closed_adapter_can_remove_source_platform_fields_from_a_copy(self):
+        source = r'''
+        function normalizeOptions(options) {
+          const request = Object.assign({}, options);
+          if (request.hasOwnProperty('header') && !request.hasOwnProperty('headers')) {
+            request.headers = request.header;
+            delete request.header;
+          }
+          if (request.hasOwnProperty('opts')) delete request.opts;
+          request.url += '/normalized';
+          return request;
+        }
+        const state_post = (options, callback) => {
+          const request = normalizeOptions(options);
+          $httpClient.post(request, callback);
+        };
+        function send(options) {
+          return new Promise((resolve, reject) => {
+            state_post(options, (error, response, body) => {
+              if (error) reject(error);
+              else resolve({body, status: response.status, headers: response.headers});
+            });
+          });
+        }
+        send({url: 'https://api.example', headers: {'X-Fixture': 'yes'}, body: 'payload'})
+          .then(response => $done({body: response.body}));
+        '''
+        item = {'id': 'fixture', 'source': source, 'author': 'Fixture', 'url': URL,
+                'license_text': '', 'source_format': 'loon', 'entry_types': ['http_request']}
+        output = convert_scripts([item])['fixture']
+        self.assertNotIn('$httpClient', output)
+        result = compare(source, output, 'loon', URL,
+                         {'name': 'closed adapter normalization', 'event_loop': True,
+                          'request': {'url': URL},
+                          'http': [{'url': 'https://api.example/normalized', 'body': 'ok'}],
+                          'expected': {'result': {'body': 'ok'},
+                                       'events': {'requests': [{'method': 'POST',
+                                                                'url': 'https://api.example/normalized',
+                                                                'headers': {'x-fixture': 'yes'},
+                                                                'body': 'payload'}]}}})
+        self.assertEqual(result['status'], 'passed', result)
+        unsafe = dict(item, id='unknown-option', source=source.replace(
+            "body: 'payload'})", "body: 'payload', unknownOption: true})"))
+        with self.assertRaises(ConversionError):
+            convert_scripts([unsafe])
 
     def test_builder_output_still_rejects_escaped_request_mutation(self):
         source = FACTORY + '''
