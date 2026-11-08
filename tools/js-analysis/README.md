@@ -36,7 +36,7 @@ semantics during organization.
 Run the structure and import checks without rebuilding resources:
 
 ```sh
-python -m unittest tests.test_analysis_architecture -v
+python -m unittest discover -s tests -p 'test_analysis_architecture.py' -v
 ```
 
 ## Analysis and conversion

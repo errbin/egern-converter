@@ -6,7 +6,7 @@ import unittest
 
 from tools.egern_hub.convert import ConversionError
 from tools.egern_hub.script_convert import convert_script
-from tests.support import source_text
+from support import source_text
 
 ROOT = Path(__file__).resolve().parents[1]
 
