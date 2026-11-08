@@ -15,7 +15,7 @@ def converter_revision():
     """Fingerprint the complete conversion toolchain, never generated artifacts."""
     root = Path(__file__).resolve().parents[2]
     files = [root / name for name in ['.node-version', '.python-version',
-        'requirements.txt', 'tools/__init__.py', 'tools/js-readability/index.mjs',
+        'requirements.txt', 'tools/js-readability/index.mjs',
         'tools/js-readability/package-lock.json']]
     files += list((root / 'tools/egern_hub').rglob('*.py'))
     files += list((root / 'tools/js-analysis').rglob('*.mjs'))
