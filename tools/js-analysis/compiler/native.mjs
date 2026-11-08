@@ -193,8 +193,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    for(const fn of nodes.filter(n=>functions.has(n.type))){const position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);if(position<0)continue;
     const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),callee=id?bindings.get(id):null;
     const direct=parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&!parent.arguments.some(a=>a.type==='SpreadElement');
-    if(!direct&&(!callee||callee.writes.length||!callee.refs.length))return null;
-    const calls=direct?[parent]:callee.refs.map(r=>parents.get(r));if(!direct&&calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==callee.refs[i]||c.arguments.some(a=>a.type==='SpreadElement')))return null;
+    let calls;
+    if(direct)calls=[parent];
+    else if(callee&&!callee.writes.length&&callee.refs.length){
+     calls=callee.refs.map(r=>parents.get(r));
+     if(calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==callee.refs[i]||c.arguments.some(a=>a.type==='SpreadElement')))return null;
+    }else if(parent?.type==='MethodDefinition'){
+     calls=closedMethodCalls(parent);if(!calls)return null;
+    }else return null;
     const targets=calls.map(c=>target(c.arguments[position]??(fn.params[position].type==='AssignmentPattern'?fn.params[position].right:null),new Set(seen)));
     return targets[0]&&targets.every(t=>t===targets[0])?targets[0]:null;
    }
@@ -243,7 +249,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  function immutableClass(cls){
   const members=cls.body.body,methods=members.filter(m=>m.type==='MethodDefinition');
   const inert=node=>!node||node.type==='Literal'||node.type==='UnaryExpression'&&['!','void','+','-','~'].includes(node.operator)&&inert(node.argument)||node.type==='BinaryExpression'&&inert(node.left)&&inert(node.right)||node.type==='ObjectExpression'&&node.properties.every(p=>p.type==='Property'&&!p.computed&&p.kind==='init'&&key(p)!=='__proto__'&&inert(p.value));
-  if(members.some(m=>m.computed||m.static||m.type==='MethodDefinition'&&['get','set'].includes(m.kind)||m.type!=='MethodDefinition'&&(m.type!=='PropertyDefinition'||!inert(m.value))))return false;
+  if(members.some(m=>m.computed||m.type==='StaticBlock'||m.type==='MethodDefinition'&&['get','set'].includes(m.kind)||m.type!=='MethodDefinition'&&(m.type!=='PropertyDefinition'||m.static||!inert(m.value))))return false;
   if(new Set(members.map(m=>String(m.static)+':'+key(m))).size!==members.length)return false;
   // No prototype manipulation, reassignment or method shadowing anywhere in the
   // local class/instance references. Field writes to this remain ordinary JS.
@@ -274,6 +280,20 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='CallExpression'&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&['call','apply'].includes(property(p.callee))&&resolve(p.callee.object).type==='Identifier')return true;
    return p?.type==='CallExpression'&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&property(p.callee)==='assign'&&omittedConstructorParameter(p.arguments[1]);
   });
+ }
+ function closedMethodCalls(method){
+  if(method?.type!=='MethodDefinition')return null;
+  const cls=parents.get(parents.get(method)),name=key(method);
+  if(!cls||!immutableClass(cls))return null;
+  const calls=nodes.filter(c=>{
+   if(c.type!=='CallExpression'||c.optional||c.callee.type!=='MemberExpression'||c.callee.optional||property(c.callee)!==name||c.arguments.some(a=>a.type==='SpreadElement'))return false;
+   const receiver=resolve(c.callee.object),classReceiver=['ClassExpression','ClassDeclaration'].includes(receiver?.type);
+   if(classOf(receiver)===cls&&method.static===classReceiver)return true;
+   if(method.static||c.callee.object.type!=='ThisExpression')return false;
+   const owner=owners.get(c.callee.object),ownerMethod=parents.get(owner);
+   return ownerMethod?.type==='MethodDefinition'&&!ownerMethod.static&&parents.get(parents.get(ownerMethod))===cls;
+  });
+  return calls.length?calls:null;
  }
  const compressionNames={ungzip:'gunzip'};
  function compressionMethod(n,seen=new Set()){
@@ -906,9 +926,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
    if(!fn)return null;
    const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fnBinding=id?.type==='Identifier'?bindings.get(id):null;
-   if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
    const position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding);
-   const calls=fnBinding.refs.map(ref=>{
+   let calls;
+   if(parent?.type==='MethodDefinition')calls=closedMethodCalls(parent);
+   else{
+    if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
+    calls=fnBinding.refs.map(ref=>{
     const direct=parents.get(ref);
     if(direct?.type==='CallExpression'&&direct.callee===ref&&!direct.optional&&!direct.arguments.some(a=>a.type==='SpreadElement'))return direct;
     const wrapperCall=direct?.type==='CallExpression'&&direct.arguments.includes(ref)?direct:null;
@@ -929,8 +952,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      return arg.type==='Literal'||arg.type==='TemplateLiteral'&&!arg.expressions.length?arg:null;
     });
     return args.some(a=>!a)?null:{...wrapperCall,arguments:args};
-   });
-   if(!calls.length||calls.some(c=>!c||!c.arguments[position]&&fn.params[position]?.type!=='AssignmentPattern'))return null;
+    });
+   }
+   if(!calls?.length||calls.some(c=>!c||!c.arguments[position]&&fn.params[position]?.type!=='AssignmentPattern'))return null;
    const shape=(node,seen=new Set())=>{
     node=resolve(node,seen);if(!node)return null;
     if(node.type==='Literal'&&typeof node.value==='string'||node.type==='TemplateLiteral')return new Set(['url']);

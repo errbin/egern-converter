@@ -89,7 +89,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type==='FunctionDeclaration'&&done.has(n)&&bindings.get(n.id)?.writes.length)fail(n,'完成函数被重新赋值');
   if(functions.has(n.type)&&(done.has(n)||asyncAdded.has(n))&&n.type!=='FunctionDeclaration'){
    const p=parents.get(n);
-   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
+   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
   }
   if(free(n,'globalThis')){
    const p=parents.get(n);
@@ -251,12 +251,19 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   let head=patch(source,{...n,body:null,end:n.body.start},render);
   if(n.body.type!=='BlockStatement')head=head.slice(0,head.lastIndexOf('=>')+2)+' ';
   if(executorHelpers.has(n)&&(asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await ')))fail(n,'Promise 执行器需要异步提升，不能改变同步执行器契约');
-  if((asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await '))&&!n.async)head='async '+head;
+  const method=parents.get(n)?.type==='MethodDefinition'||parents.get(n)?.type==='Property'&&parents.get(n).method;
+  if((asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await '))&&!n.async&&!method)head='async '+head;
   return head+(prelude?'{'+prelude+'\n'+body.slice(1,-1)+'}':body);
  }
  function hasPromiseCompletion(fn){return nodes.some(n=>owners.get(n)===fn&&n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&done.has(fn));}
  function line(e,ret=false){return e.before.join('\n')+(e.code==='undefined'&&e.before.length?'':'\n'+(ret?'return ':'')+(!ret&&/^\s*(?:function\b|async\s+function\b|class\b|\{)/.test(e.code)?'('+e.code+')':e.code)+';');}
  function asBlock(n){const text=statement(n);return n.type==='BlockStatement'?text:'{'+text+'}';}
+ function httpCallStatement(call,owner){
+  const callback=call.arguments[1],fn=targets(callback)[0];
+  if(done.has(fn)&&!tail(call,true)&&!detachedHTTP.has(call))fail(call,'未等待的 HTTP 完成任务后仍有执行路径，不能串行化原有并发');
+  if(fn)substitutions.set(callback,functionText(fn));
+  return httpStatement(call,guard(owner),executorCompletion&&executorHelpers.has(owner)||detachedHTTP.has(call)||concurrent&&!done.has(fn)?{completion,reject}:null);
+ }
  function statement(n){
   const owner=owners.get(n);
   if(n.type==='Program'||n.type==='BlockStatement'){
@@ -267,11 +274,15 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type==='FunctionDeclaration')return functionText(n);
   if(n.type==='ExpressionStatement'){
    if(deferred?.statement===n)return `{${deferred.promise} = (async () => {${line(expression(n.expression,owner))}})();${guard(owner)}}`;
+   if(n.expression.type==='SequenceExpression'){
+    const flatten=node=>node.type==='SequenceExpression'?node.expressions.flatMap(flatten):[node],parts=flatten(n.expression),calls=parts.filter(part=>isHTTP?.(part));
+    if(calls.length){
+     if(calls.length!==1||parts.at(-1)!==calls[0])fail(n,'HTTP 请求位于有后续求值的逗号表达式中，无法保持完成顺序');
+     return parts.map(part=>part===calls[0]?httpCallStatement(part,owner):line(expression(part,owner))).join('\n');
+    }
+   }
    if(isHTTP?.(n.expression)){
-    const callback=n.expression.arguments[1],fn=targets(callback)[0];
-    if(done.has(fn)&&!tail(n.expression,true)&&!detachedHTTP.has(n.expression))fail(n,'未等待的 HTTP 完成任务后仍有执行路径，不能串行化原有并发');
-    if(fn)substitutions.set(callback,functionText(fn));
-    return httpStatement(n.expression,guard(owner),executorCompletion&&executorHelpers.has(owner)||detachedHTTP.has(n.expression)||concurrent&&!done.has(fn)?{completion,reject}:null);
+    return httpCallStatement(n.expression,owner);
    }
    return line(expression(n.expression,owner));
   }

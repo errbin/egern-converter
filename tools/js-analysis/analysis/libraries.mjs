@@ -17,11 +17,14 @@ export const libraryContracts=new Map([
  ['6e3eebd79b9106279e9203a6d130518b38f8180706305d8aae47fc53ee7d2cdb',{name:'js-base64 3.7.2',source:'https://github.com/dankogai/js-base64',globalReceiver:true}],
  ['316c0b3d3648951f6114259246689eb05f556f1eb29ab8581feabaafbc78ea46',{name:'text-encoding',source:'https://github.com/inexorabletash/text-encoding',globalReceiver:true}],
  ['91cc1549ff57cc7c4d9640918067e06dae8b46343d90e748f699c511123871bc',{name:'protobuf-ts runtime 2.10.0',source:'https://github.com/timostamm/protobuf-ts'}],
+ ['252cb90f0b91a5b68f96733d302b4ae36da9305a6791f57621bd2638214e8bb2',{name:'protobuf-ts runtime 2.9.0',source:'https://github.com/timostamm/protobuf-ts'}],
+ ['157b574f3626f1ac071e56dabc14e74530cec140d75633c4b84b90ad4c2e2211',{name:'pako 2.0.4',source:'https://github.com/nodeca/pako',globalReceiver:true}],
  ['296eed6f8c680e28839fd4184432719194859c0311e0916b0c6469116f60c0e4',{name:'protobuf-ts bundled runtime',source:'https://github.com/timostamm/protobuf-ts'}],
  ['e663fe73297ef644c04d7dd8d79343f90da6d871dae85d33c30f546383df1599',{name:'protobuf-ts bundled runtime',source:'https://github.com/timostamm/protobuf-ts'}],
  ['53846e4888144ff9939fe2d3c5d8d2d41c24c4cad52cefe5d893698f6277e4dc',{name:'protobuf-ts bundled runtime',source:'https://github.com/timostamm/protobuf-ts'}],
  ['fd799507898ebc97f4435cf314c11f7e9e5782ad11cad854a21b83db2ef3b168',{name:'protobuf.js embedded bundle',source:'https://github.com/protobufjs/protobuf.js'}],
  ['9a53e1215029e9c6cab68103f806742227b6974229772d2d46ca459185103312',{name:'js-md5 embedded variant',source:'https://github.com/emn178/js-md5'}],
+ ['20335d8cafc0ac2ce919abb7e57d937ce743dac1251344f80aa47ad9e74cb50a',{name:'js-md5 embedded variant',source:'https://github.com/emn178/js-md5'}],
 ]);
 
 function contract(body){return methodContract({type:'Program',sourceType:'script',start:body[0].start,end:body.at(-1).end,body});}
@@ -152,7 +155,7 @@ export function protectLibraries(source,{sourceType='script'}={}){
    if(n.type==='VariableDeclaration')for(const d of n.declarations){if(d.id.type!=='Identifier')throw Error('Unsupported library export pattern');exports.push(d.id.name);}
   }
   const marker=fresh(),raw=source.slice(start,end);
-  blocks.set(marker,{...known,contract:contract(body),runtime_contract:runtimeContract,raw,start,end,code:known.globalReceiver?`(function(){${raw}}).call(globalThis);`:(known.implicitBindings?.length?'var '+known.implicitBindings.join(', ')+';\n':'')+raw});
+  blocks.set(marker,{...known,contract:contract(body),runtime_contract:runtimeContract,raw,start,end,placeholderBindings:[...new Set(exports)],code:known.globalReceiver?`(function(){${raw}}).call(globalThis);`:(known.implicitBindings?.length?'var '+known.implicitBindings.join(', ')+';\n':'')+raw});
   const dependencies=new Set();
   if(known.retainDependencies)for(const n of ix.nodes)if(n.start>=start&&n.end<=end&&n.type==='Identifier'&&ix.reference(n)){
    const binding=ix.bindings.get(n),initial=binding?.init;
@@ -165,14 +168,21 @@ export function protectLibraries(source,{sourceType='script'}={}){
  }
  const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
  const restore=(code,{globalReceiver=true}={})=>{
-  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set();
+  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set();
   for(const n of i.nodes)if(n.type==='VariableDeclaration'){
    const b=blocks.get(n.declarations[0]?.id?.name);if(!b)continue;
    if(found.has(n.declarations[0].id.name))throw Error('Duplicate public library placeholder');
-   found.add(n.declarations[0].id.name);replacements.set(n,globalReceiver?b.code:b.raw);
+   found.add(n.declarations[0].id.name);for(const name of b.placeholderBindings)placeholderBindings.add(name);replacements.set(n,globalReceiver?b.code:b.raw);
   }
   if(found.size!==blocks.size)throw Error('Public library placeholder lost during compilation');
-  const emit=n=>replacements.has(n)?replacements.get(n):patch(code,n,emit);
+  const emit=n=>{
+   if(replacements.has(n))return replacements.get(n);
+   if(n.type==='VariableDeclaration'){
+    const declarations=n.declarations.filter(d=>!placeholderBindings.has(d.id.type==='Identifier'?d.id.name:null));
+    if(declarations.length!==n.declarations.length)return declarations.length?n.kind+' '+declarations.map(d=>patch(code,d,emit)).join(', ')+';':'';
+   }
+   return patch(code,n,emit);
+  };
   return emit(t);
  };
  return {source:render(tree),restore,valueContracts:[...blocks.values()].flatMap(b=>b.valueContracts??[]),blocks:[...blocks.values()].map(({name,source,start,end,contract})=>({name,source,start,end,contract}))};

@@ -4,11 +4,95 @@ import json
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from tools.egern_hub import js_analysis
 
 
 class BatchAnalysisTests(unittest.TestCase):
+    def test_initializer_order_is_proved_inside_the_same_execution_block(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {parse} from './tools/js-analysis/core/syntax.mjs';
+import {index,initializedAfter} from './tools/js-analysis/core/ast.mjs';
+const inspect=source=>{
+ const ix=index(parse(source,{ecmaVersion:'latest'}));
+ const declaration=ix.nodes.find(n=>n.type==='VariableDeclaration'&&n.declarations.some(d=>d.id?.name==='runtime'));
+ const reference=ix.bindings.get(declaration.declarations[0].id).refs[0];
+ return initializedAfter(ix,declaration,reference);
+};
+assert.equal(inspect('if (ready) { const runtime = create(); runtime.use(); }'),true);
+assert.equal(inspect('if (ready) { const runtime = create(); register(() => runtime.use()); }'),true);
+assert.equal(inspect('if (ready) { function use(){ runtime.use(); } use(); const runtime = create(); }'),false);
+assert.equal(inspect('if (ready) { var runtime = create(); } else { runtime.use(); }'),false);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True)
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_constructor_field_folding_requires_completed_unconditional_writes(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {foldTargetEnvironments} from './tools/js-analysis/platform/environment.mjs';
+const fold=source=>foldTargetEnvironments(source,'surge');
+const direct=fold('function Env(){return new class{constructor(){this.value="set"}isNode(){return false}getValue(){return this.value}}}const runtime=Env();runtime.getValue();');
+assert.match(direct,/getValue\\(\\)\\{return "set"\\}/);
+const conditional=fold('function Env(){return new class{constructor(){if(Math.random())this.value="set"}isNode(){return false}getValue(){return this.value}}}const runtime=Env();runtime.getValue();');
+assert.match(conditional,/getValue\\(\\)\\{return this\\.value\\}/);
+const early=fold('function Env(){return new class{constructor(){return;this.value="set"}isNode(){return false}getValue(){return this.value}}}const runtime=Env();runtime.getValue();');
+assert.match(early,/getValue\\(\\)\\{return this\\.value\\}/);
+const reachable=fold('function Env(){return new class{constructor(){this.getValue();this.value="set"}isNode(){return false}getValue(){return this.value}}}const runtime=Env();runtime.getValue();');
+assert.match(reachable,/getValue\\(\\)\\{return this\\.value\\}/);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_class_method_http_sequence_keeps_callback_behavior(self):
+        source='''const api = new class {
+  post(options, callback = () => {}) {
+    options.headers && delete options.headers["Content-Length"], $httpClient.post(options, (error, response, body) => callback(error, response, body));
+  }
+};
+api.post({url:"https://api.example.test/", headers:{"Content-Length":"99"}, body:"payload"}, (error, response, body) => $done({body}));'''
+        report=js_analysis.analyze_many([(source,'surge')],mode='native')[0]
+        self.assertFalse(report['errors'],report['errors'])
+        runner=str(Path(__file__).resolve().parents[1]/'tools/js-analysis/verify.mjs')
+        fixture={'name':'class method HTTP sequence','request':{'url':'https://example.test/source.js'},
+                 'http':[{'url':'https://api.example.test/','body':'reply'}]}
+        observations=[]
+        for side,code in [('original',source),('converted',report['code'])]:
+            payload={'source':code,'platform':'surge','url':'https://example.test/source.js',
+                     'fixture':fixture,'side':side}
+            result=subprocess.run(['node','--experimental-vm-modules','--max-old-space-size=128',runner],
+                                  input=json.dumps(payload),capture_output=True,text=True,timeout=5,check=True)
+            observations.append(json.loads(result.stdout)['observation'])
+        self.assertEqual(observations[0],observations[1])
+
+    def test_library_restore_removes_split_export_placeholders(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {parse} from './tools/js-analysis/core/syntax.mjs';
+import {methodContract} from './tools/js-analysis/platform/clients.mjs';
+import {libraryContracts,protectLibraries} from './tools/js-analysis/analysis/libraries.mjs';
+const source='const MESSAGE_TYPE = "protobuf-ts/unknown"; class Runtime { constructor(){} fromBinary(){} toBinary(){} internalBinaryRead(){} internalBinaryWrite(){} mergePartial(){} } $done({body:MESSAGE_TYPE});';
+const tree=parse(source,{ecmaVersion:'latest'}),body=tree.body.slice(0,2);
+const contract=methodContract({type:'Program',sourceType:'script',start:body[0].start,end:body.at(-1).end,body});
+libraryContracts.set(contract,{name:'protobuf-ts fixture runtime',source:'https://example.test/library'});
+const library=protectLibraries(source),marker=library.source.match(/var (publicLibraryBlock\\d+), MESSAGE_TYPE, Runtime;/);
+assert.ok(marker);
+const formatted=library.source.replace(marker[0],`var ${marker[1]};\\nvar MESSAGE_TYPE;\\nvar Runtime;`);
+const restored=library.restore(formatted);
+parse(restored,{ecmaVersion:'latest',sourceType:'module'});
+assert.equal((restored.match(/(?:const|let|var)\\s+MESSAGE_TYPE\\b/g)||[]).length,1);
+assert.equal((restored.match(/class Runtime\\b/g)||[]).length,1);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
     def test_native_progress_preserves_reports_and_reports_failed_script_reason(self):
         jobs=[('$done({body:"ok"});','surge'),('$custom();$done({});','surge')]
         progress=[{'kind':'script','stage':'converting','id':name,'index':index,'total':2}

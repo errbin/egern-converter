@@ -114,8 +114,16 @@ export function patch(source,n,render){
 // hoisted declarations require every incoming reference to be dominated.
 export function initializedAfter(ix,statement,ref){
  const {parents,owners,bindings,nodes}=ix,tree=nodes[0];
+ function followsInContainingBlock(n){
+  const block=parents.get(statement);
+  if(!['Program','BlockStatement'].includes(block?.type))return false;
+  let child=n;
+  while(child&&parents.get(child)!==block)child=parents.get(child);
+  return !!child&&child!==statement&&child.start>=statement.end;
+ }
  function after(n,seen){
   const owner=owners.get(n);if(owner!==tree)return entered(owner,seen);
+  if(followsInContainingBlock(n))return true;
   while(parents.get(n)&&parents.get(n)!==tree)n=parents.get(n);
   return parents.get(n)===tree&&n.start>=statement.end;
  }

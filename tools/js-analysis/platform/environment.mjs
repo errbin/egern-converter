@@ -415,6 +415,64 @@ function plans(ix,source,format){
   }
   return null;
  }
+ function constructorLiteralFields(factory,returned,cls,methods,constructions,instances,constructorReachable){
+  const ctor=methods.get('constructor');if(!ctor)return new Map();
+  const fn=ctor.value,classNodes=index(cls).nodes,writes=new Map(),invalid=new Set();
+  const literal=node=>{
+   if(node?.type==='Literal'&&(node.value===null||['boolean','number','string'].includes(typeof node.value)))return {known:true,value:node.value};
+   if(node?.type==='UnaryExpression'){
+    const inner=literal(node.argument);if(!inner.known)return null;
+    if(node.operator==='!')return {known:true,value:!inner.value};
+    if(node.operator==='+'&&typeof inner.value==='number'||node.operator==='-'&&typeof inner.value==='number')return {known:true,value:node.operator==='-'?-inner.value:+inner.value};
+   }
+   return null;
+  };
+  const ownerMethod=node=>{
+   const owner=ix.owners.get(node);
+   return methods.get('constructor')?.value===owner?ctor:null;
+  };
+  const unconditionalWrite=node=>{
+   const statement=parents.get(node);
+   if(statement?.type!=='ExpressionStatement'||parents.get(statement)!==fn.body)return false;
+   return !classNodes.some(exit=>['ReturnStatement','ThrowStatement'].includes(exit.type)&&ix.owners.get(exit)===fn&&exit.start<node.start);
+  };
+  const writeUse=member=>{
+   const use=parents.get(member);
+   if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===member)return true;
+   if(use?.type==='MemberExpression'&&use.object===member){const nested=parents.get(use);return nested?.type==='AssignmentExpression'&&nested.left===use||nested?.type==='UpdateExpression'&&nested.argument===use||nested?.type==='UnaryExpression'&&nested.operator==='delete'&&nested.argument===use;}
+   return false;
+  };
+  for(const node of classNodes)if(node.type==='AssignmentExpression'&&node.left.type==='MemberExpression'&&node.left.object.type==='ThisExpression'){
+   const name=property(node.left),value=literal(node.right);
+   if(typeof name!=='string')continue;
+   if(ownerMethod(node)!==ctor||node.operator!=='='||!value||writes.has(name)||!unconditionalWrite(node))invalid.add(name);
+   else writes.set(name,{value:value.value,member:node.left,assignment:node});
+  }
+  for(const call of classNodes)if(call.type==='CallExpression'&&call.callee.type==='MemberExpression'&&ix.free(call.callee.object,'Object')&&property(call.callee)==='assign'&&call.arguments[0]?.type==='ThisExpression'){
+   if(ix.owners.get(call)!==fn){for(const name of writes.keys())invalid.add(name);continue;}
+   const value=call.arguments[1],position=fn.params.findIndex(param=>ix.bindings.get(param?.type==='AssignmentPattern'?param.left:param)===ix.bindings.get(value));
+   const actuals=position<0?[value]:constructions.map(construction=>factoryArgument(ix,factory,construction,returned,fn,position));
+   if(!actuals.length){for(const name of writes.keys())invalid.add(name);continue;}
+   for(const actual of actuals){
+    if(!actual||actual.type==='Literal'&&actual.value===null||ix.free(actual,'undefined'))continue;
+    if(actual.type==='ObjectExpression'&&actual.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.method&&!p.computed&&key(p)!=='__proto__')){
+     for(const name of writes.keys())if(actual.properties.some(p=>String(key(p))===name))invalid.add(name);
+     continue;
+    }
+    for(const name of writes.keys())invalid.add(name);
+   }
+  }
+  for(const [name,entry]of writes){
+   if(invalid.has(name)||classNodes.some(node=>node.type==='MemberExpression'&&node.object.type==='ThisExpression'&&property(node)===name&&writeUse(node)&&node!==entry.member))continue;
+   let externallyWritten=false;
+   for(const instance of instances)for(const ref of instance.refs){
+    const member=parents.get(ref);if(member?.type==='MemberExpression'&&member.object===ref&&property(member)===name&&writeUse(member))externallyWritten=true;
+   }
+   if(!externallyWritten)writes.set(name,entry.value);
+  }
+  for(const [name,value]of writes)if(typeof value!=='boolean'&&typeof value!=='number'&&typeof value!=='string'&&value!==null)writes.delete(name);
+  return writes;
+ }
  for(const factory of nodes.filter(n=>n.type==='FunctionDeclaration'&&!n.async&&!n.generator)){
   const returned=factory.body.body.find(n=>n.type==='ReturnStatement')?.argument;
   let cls=returned?.type==='NewExpression'&&returned.callee.type==='ClassExpression'?returned.callee:null;
@@ -448,7 +506,7 @@ function plans(ix,source,format){
    }
   }
   const binding=bindings.get(factory.id);if(!binding?.refs.length||binding.writes.length)continue;
-  const used=new Set(),instances=new Set(),constructions=[],helpers=new Map();let valid=true;
+  const used=new Set(),usedHelpers=new Set(),instances=new Set(),constructions=[],helpers=new Map();let valid=true;
   for(const n of classNodes)if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='ThisExpression'&&n.right.type==='NewExpression'&&n.right.arguments.length===1&&n.right.arguments[0].type==='ThisExpression'){
    const b=bindings.get(n.right.callee),helper=b?.init,field=property(n.left);
    if(typeof field!=='string'||methods.has(field)||!b||b.writes.length||b.refs.length!==1||helper?.type!=='ClassDeclaration'||!reviewedHTTPDelegate(helper)||!safeReceiverRetention(helper))continue;
@@ -493,6 +551,7 @@ function plans(ix,source,format){
     }else if(helpers.has(name)){
      const call=parents.get(u),helper=helpers.get(name);
      if(u?.type!=='MemberExpression'||u.object!==m||!helper.methods.has(property(u))||call?.type!=='CallExpression'||call.callee!==u){valid=false;break;}
+     usedHelpers.add(name);
     }
    }
    if(!valid)break;constructions.push(call);instances.add(b);
@@ -519,12 +578,14 @@ function plans(ix,source,format){
     }
    }else if(p?.type==='NewExpression'&&[...helpers.values()].some(h=>h.allocation===p)&&p.arguments[0]===n){
     // Reviewed allocation-only HTTP delegates retain this solely to call its
-    // get/post methods. Keep both targets while pruning the rest of the Env.
-    used.add('get');used.add('post');
+    // get/post methods. Keep both targets only when the helper field itself
+    // is reached from a closed instance call site.
+    const field=[...helpers].find(([,helper])=>helper.allocation===p)?.[0];
+    if(field&&usedHelpers.has(field)){used.add('get');used.add('post');}
    // An unknown helper may mutate methods or expose the receiver elsewhere.
    }else valid=false;
   }
-  if(valid){output.push({factory,cls,methods,used,instances,known});covered.add(cls);}
+  if(valid){const fields=constructorLiteralFields(factory,returned,cls,methods,constructions,instances,constructorReachable);output.push({factory,cls,methods,used,instances,known,fields,constructorReachable});covered.add(cls);}
  }
  // Some compatibility environments instantiate an anonymous class directly
  // instead of returning it from a factory. Admit only a closed local instance:
@@ -578,9 +639,13 @@ function plans(ix,source,format){
 
 export function foldTargetEnvironments(source,format){
  const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true})),replace=new WeakMap();
- for(const {cls,methods,instances,known} of plans(ix,source,format)){
+ for(const {cls,methods,instances,known,fields,constructorReachable} of plans(ix,source,format)){
   for(const n of ix.nodes)if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&!n.arguments.length&&known.has(property(n.callee))&&
     (n.start>=cls.start&&n.end<=cls.end&&n.callee.object.type==='ThisExpression'||instances.has(ix.bindings.get(n.callee.object))))replace.set(n,JSON.stringify(known.get(property(n.callee))));
+  for(const n of ix.nodes)if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&fields?.has(property(n))&&!(ix.parents.get(n)?.type==='AssignmentExpression'&&ix.parents.get(n).left===n)){
+   let method=ix.parents.get(n);while(method&&method.type!=='MethodDefinition'&&method!==cls)method=ix.parents.get(method);
+   if(method?.type==='MethodDefinition'&&method.kind==='method'&&!constructorReachable.has(key(method)))replace.set(n,JSON.stringify(fields.get(property(n))));
+  }
  }
  const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(ix.nodes[0]);
 }
