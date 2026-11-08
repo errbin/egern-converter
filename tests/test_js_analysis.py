@@ -170,6 +170,26 @@ console.log(JSON.stringify({ok:true}));
         self.assertTrue(report['probe_skipped'])
         self.assertIn('跳过自动生成输入',report['limits'][0])
 
+    def test_finite_eval_function_dispatch_is_lowered_and_unknown_targets_reject(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {native} from './tools/js-analysis/compiler/native.mjs';
+const finite='const routes={"/a":"first","/b":"second"};function first(d){d.value="a";}function second(d){d.value="b";}function choose(){const key=Object.keys(routes).find(k=>$request.url.includes(k));return key?routes[key]:null;}const method=choose();const data={};if(method){const fn=eval(method);new fn(data);}$done({body:JSON.stringify(data)});';
+const lowered=native(finite,'surge');
+assert.deepEqual(lowered.errors,[]);
+assert.doesNotMatch(lowered.code,/eval\\(/);
+assert.ok(lowered.static_transformations.some(item=>item.kind==='finite-function-dispatch'));
+const entries=native(finite.replace('const key=Object.keys(routes).find(k=>$request.url.includes(k));return key?routes[key]:null;','for(const [key,value]of Object.entries(routes)){if($request.url.includes(key))return value;}return null;'),'surge');
+assert.deepEqual(entries.errors,[]);
+assert.doesNotMatch(entries.code,/eval\\(/);
+const dynamic=native('const method=$argument;eval(method)();$done({});','loon');
+assert.ok(dynamic.errors.some(error=>error.includes('无法证明动态 eval 函数分派的目标')));
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1],timeout=10)
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
     def test_probe_resource_skip_is_reported_with_script_progress(self):
         job=('x'*(1024*1024+1),'any')
         progress={'kind':'script','stage':'verification_probes','id':'oversized.js','index':1,'total':1}

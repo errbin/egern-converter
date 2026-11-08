@@ -470,11 +470,11 @@ export function lowerFiniteMethodCalls(source){
 }
 
 // Resolve a closed table of function names without evaluating input JavaScript.
-// Unknown strings, mutable tables and reassigned functions remain dynamic eval.
+// The compiler rejects unknown or mutable names when the result is invoked.
 
 export function lowerFunctionDispatch(source){
  const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
- const {nodes,bindings,parents,owners,free}=ix,replace=new WeakMap(),transformations=[];
+ const {nodes,bindings,parents,owners,free}=ix,replace=new WeakMap(),transformations=[],rejected=[];
  const declarations=new Map();for(const n of nodes)if(['VariableDeclarator','FunctionDeclaration'].includes(n.type)){const b=bindings.get(n.id);if(b)declarations.set(b,(declarations.get(b)??0)+1);}
  const stableObject=!nodes.some(n=>n.type==='MemberExpression'&&['prototype','__proto__','constructor'].includes(property(n)))&&nodes.filter(n=>free(n,'Object')).every(n=>{const p=parents.get(n),use=parents.get(p);return p?.type==='CallExpression'&&p.callee===n||p?.type==='MemberExpression'&&p.object===n&&['keys','entries','assign'].includes(property(p))&&use?.type==='CallExpression'&&use.callee===p;});
  const table=n=>{
@@ -488,13 +488,14 @@ export function lowerFunctionDispatch(source){
   if(n.type==='Literal'&&!n.regex)return new Set([n.value]);
   if(n.type==='ConditionalExpression'){const a=values(n.consequent,new Set(seen)),b=values(n.alternate,new Set(seen));return a&&b?new Set([...a,...b]):null;}
   if(n.type==='Identifier'){
-   const b=bindings.get(n);if(!b||b.writes.length||seen.has(b))return null;seen.add(b);
+   const b=bindings.get(n);if(!b||seen.has(b))return null;seen.add(b);
    if(!b.init){
     const declaration=nodes.find(d=>d.type==='VariableDeclarator'&&d.id.type==='ArrayPattern'&&d.id.elements[1]?.type==='Identifier'&&bindings.get(d.id.elements[1])===b),loop=parents.get(parents.get(declaration));
     const call=loop?.type==='ForOfStatement'?loop.right:null;
-    if(call?.type!=='CallExpression'||call.arguments.length!==1||call.callee.type!=='MemberExpression'||!free(call.callee.object,'Object')||property(call.callee)!=='entries')return null;
+    if(b.writes.length!==1||b.writes[0]!==loop||call?.type!=='CallExpression'||call.arguments.length!==1||call.callee.type!=='MemberExpression'||!free(call.callee.object,'Object')||property(call.callee)!=='entries')return null;
     const object=table(call.arguments[0]);return object?new Set(object.properties.map(p=>p.value.value)):null;
    }
+   if(b.writes.length)return null;
    return values(b.init,seen);
   }
   if(n.type==='MemberExpression'){
@@ -511,20 +512,23 @@ export function lowerFunctionDispatch(source){
   return null;
  }
  for(const n of nodes)if(n.type==='CallExpression'&&free(n.callee,'eval')&&!n.optional&&n.arguments.length===1){
-  const candidates=values(n.arguments[0]);if(!candidates)continue;
-  const names=[...candidates].filter(v=>typeof v==='string');if(!names.length||names.length>128)continue;
+  const parent=parents.get(n),binding=parent?.type==='VariableDeclarator'&&parent.init===n&&parent.id.type==='Identifier'?bindings.get(parent.id):null;
+  const invoked=(parent?.type==='CallExpression'||parent?.type==='NewExpression')&&parent.callee===n||
+   !!binding?.refs.some(ref=>{const use=parents.get(ref);return (use?.type==='CallExpression'||use?.type==='NewExpression')&&use.callee===ref;});
+  const candidates=values(n.arguments[0]);if(!candidates){if(invoked)rejected.push({line:source.slice(0,n.start).split('\n').length});continue;}
+  const names=[...candidates].filter(v=>typeof v==='string');if(!names.length||names.length>128){if(invoked)rejected.push({line:source.slice(0,n.start).split('\n').length});continue;}
   let valid=true;
   for(const name of names){
    if(!/^[A-Za-z_$][\w$]*$/.test(name)){valid=false;break;}
    let b;for(let s=ix.scopes.get(n);s;s=s.parent)if(s.names.has(name)){b=s.names.get(name);break;}
    if(!b||b.writes.length||declarations.get(b)!==1||!functions.has(b.init?.type)||b.init.type!=='FunctionDeclaration'&&!initializedAfter(ix,parents.get(b.init),n)){valid=false;break;}
   }
-  if(!valid)continue;
+  if(!valid){if(invoked)rejected.push({line:source.slice(0,n.start).split('\n').length});continue;}
   replace.set(n,`(value => typeof value === 'string' ? ({${names.map(name=>JSON.stringify(name)+': '+name).join(', ')}})[value] : value)(${source.slice(n.arguments[0].start,n.arguments[0].end)})`);
   transformations.push({kind:'finite-function-dispatch',line:source.slice(0,n.start).split('\n').length,functions:names});
  }
  const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
- return {source:render(ix.nodes[0]),transformations};
+ return {source:render(ix.nodes[0]),transformations,rejected};
 }
 
 // Lower accessors on a single closed factory instance to ordinary local calls.
