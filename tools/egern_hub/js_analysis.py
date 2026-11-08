@@ -133,6 +133,14 @@ def _run_batch(jobs, progress_items=None):
             return _run_batch(jobs[:middle],left) + _run_batch(jobs[middle:],right)
         identity = jobs[0].get('options', {}).get('storage_key', '').removeprefix('egern-hub:') if jobs else ''
         message = f'JavaScript 静态分析超时（{len(jobs)} 个输入，60 秒）；请检查对应脚本的分析复杂度'+('：'+identity if identity else '')
+        if jobs and jobs[0].get('mode') == 'probes':
+            skipped='自动探针分析超时（60 秒）；跳过自动生成输入并将该脚本记为未覆盖'
+            progress=progress_items[0] if progress_items else None
+            if progress:
+                emit_progress({**progress,'stage':'probe_generation_skipped','reason':skipped})
+            return [{'paths':[],'containers':[],'json_fields':[],'regexes':[],
+                     'guard_keys':[],'object_keys':[],'strings':[],
+                     'limits':[skipped], 'probe_skipped':True}]
         if jobs and jobs[0].get('mode') == 'native':
             # Keep unrelated modules buildable, while rejecting this dependency
             # explicitly. A timeout is never a successful conversion.
@@ -145,6 +153,11 @@ def _run_batch(jobs, progress_items=None):
     reports = json.loads(stdout)
     if not isinstance(reports, list) or len(reports) != len(jobs):
         raise ValueError('语法分析返回结果不完整')
+    if progress_items:
+        for report,progress in zip(reports,progress_items):
+            if progress and report.get('probe_skipped'):
+                reason='；'.join(report.get('limits',[])) or '自动探针分析跳过'
+                emit_progress({**progress,'stage':'probe_generation_skipped','reason':reason})
     return reports
 
 
@@ -175,8 +188,9 @@ def analyze_many(jobs, *, mode='convert', progress_items=None):
         length = len(job[0].encode('utf-8'))
         # Native compilation runs several scope/provenance passes. Keep a batch
         # small enough that unrelated dependencies cannot exhaust its timeout.
-        if batch and (len(batch) >= (8 if mode == 'native' else 32) or
-                      size + length > (512 if mode == 'native' else 1024) * 1024):
+        max_batch = 8 if mode == 'native' else 32
+        max_bytes = 512 if mode == 'native' else 1024
+        if batch and (len(batch) >= max_batch or size + length > max_bytes * 1024):
             flush()
             size = 0
         batch.append(job)

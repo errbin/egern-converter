@@ -224,7 +224,9 @@ def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
             source = 'if ($environment.variables._hub_enabled === "false") $done({});\n' + source
         curated=[case for case in fixtures.get(url,[]) if applicable(case,script)]
         excluded=[{'name':case['name'],'entry_type':case['entry_type'],'reason':'不属于该转换版本的脚本入口'} for case in fixtures.get(url,[]) if not applicable(case,script)]
-        cases = copy.deepcopy(curated) + (generated_cases(hint,script.get('verification_contexts',[])) if auto else [])
+        probe_cases=(generated_cases(hint,script.get('verification_contexts',[]))
+                     if auto and not hint.get('probe_skipped') else [])
+        cases = copy.deepcopy(curated) + probe_cases
         if script.get('device_type_parameter'):
             cases = device_cases(cases)
         if platform == 'surge':

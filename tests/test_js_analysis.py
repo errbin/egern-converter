@@ -163,6 +163,33 @@ console.log(JSON.stringify({ok:true}));
         self.assertIsNone(reports[0]['code'])
         self.assertEqual(reports[1],{'errors':[],'code':'fast'})
 
+    def test_single_probe_timeout_is_skipped_and_cannot_abort_verification(self):
+        job={'source':'const response = $response.body;','source_format':'any','mode':'probes','options':{}}
+        with patch.object(js_analysis.subprocess,'run',side_effect=subprocess.TimeoutExpired('node',60)):
+            report=js_analysis._run_batch([job])[0]
+        self.assertTrue(report['probe_skipped'])
+        self.assertIn('跳过自动生成输入',report['limits'][0])
+
+    def test_probe_resource_skip_is_reported_with_script_progress(self):
+        job=('x'*(1024*1024+1),'any')
+        progress={'kind':'script','stage':'verification_probes','id':'oversized.js','index':1,'total':1}
+        output=io.StringIO()
+        with patch.dict(os.environ,{'EGERN_PROGRESS_EVENTS':'1'}),contextlib.redirect_stdout(output):
+            report=js_analysis.analyze_many([job],mode='probes',progress_items=[progress])[0]
+        events=[json.loads(line[len(js_analysis.PROGRESS_PREFIX):])
+                for line in output.getvalue().splitlines() if line.startswith(js_analysis.PROGRESS_PREFIX)]
+        self.assertTrue(report['probe_skipped'])
+        self.assertTrue(any(event.get('stage')=='probe_generation_skipped' and event.get('id')=='oversized.js'
+                            for event in events))
+
+    def test_probe_batches_remain_bounded_without_spawning_one_process_per_script(self):
+        jobs=[('const value='+str(index)+';','any') for index in range(33)]
+        def analyze(batch):return [{'paths':[[job['source']]]} for job in batch]
+        with patch.object(js_analysis,'_run_batch',side_effect=analyze) as run:
+            reports=js_analysis.analyze_many(jobs,mode='probes')
+        self.assertEqual([len(call.args[0]) for call in run.call_args_list],[32,1])
+        self.assertEqual(len(reports),33)
+
     def test_jobs_keep_independent_scope_diagnostics_and_source_platform(self):
         source='$httpClient.get({url:"https://example.com",node:"DIRECT"},()=>{$done({})});'
         jobs=[('const $custom=1;$done({body:String($custom)});','surge'),
@@ -189,3 +216,17 @@ console.log(JSON.stringify({ok:true}));
         self.assertEqual(reports[257],reports[3])
         self.assertEqual(reports[258],reports[0])
         self.assertTrue(all(not report['errors'] for report in reports))
+
+    def test_probe_ast_node_limit_skips_large_inputs_without_running_them(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {probes} from './tools/js-analysis/analysis/probes.mjs';
+const source='(()=>{const value={key:1};})();\\n'.repeat(13000);
+const report=probes(source);
+assert.equal(report.probe_skipped,true);
+assert.match(report.limits[0],/AST 节点/);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1],timeout=5)
+        self.assertEqual(json.loads(result.stdout),{'ok':True})

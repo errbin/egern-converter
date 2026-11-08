@@ -132,5 +132,17 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(all(row['coverage']['attempted']>0 for row in report['scripts'].values()))
         self.assertFalse(report['scripts']['change']['coverage']['complete_branch_coverage'])
 
+    def test_skipped_probe_generation_is_not_reported_as_a_pass(self):
+        script={'id':'probe-timeout','url':'https://source.test/slow.js','source_format':'surge',
+                'verification_contexts':[{'stage':'http_response','match':'^https://api.example.test/'}]}
+        source='$done({});'
+        hint={'probe_skipped':True,'limits':['automatic probe analysis timed out']}
+        with patch('tools.egern_hub.verify.analyze_many',return_value=[hint]):
+            report=verify_scripts([script],{'probe-timeout':source},{'probe-timeout':source})
+        row=report['scripts']['probe-timeout']
+        self.assertEqual(row['status'],'not_covered')
+        self.assertEqual(row['coverage']['attempted'],0)
+        self.assertEqual(row['generation_limits'],hint['limits'])
+
 
 if __name__=='__main__':unittest.main()
