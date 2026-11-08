@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -6,6 +9,22 @@ from tools.egern_hub import js_analysis
 
 
 class BatchAnalysisTests(unittest.TestCase):
+    def test_native_progress_preserves_reports_and_reports_failed_script_reason(self):
+        jobs=[('$done({body:"ok"});','surge'),('$custom();$done({});','surge')]
+        progress=[{'kind':'script','stage':'converting','id':name,'index':index,'total':2}
+                  for index,name in enumerate(['good.js','bad.js'],1)]
+        output=io.StringIO()
+        with patch.dict(os.environ,{'EGERN_PROGRESS_EVENTS':'1'}),contextlib.redirect_stdout(output):
+            reports=js_analysis.analyze_many(jobs,mode='native',progress_items=progress)
+        events=[json.loads(line[len(js_analysis.PROGRESS_PREFIX):])
+                for line in output.getvalue().splitlines() if line.startswith(js_analysis.PROGRESS_PREFIX)]
+        self.assertFalse(reports[0]['errors'])
+        self.assertTrue(reports[1]['errors'])
+        self.assertEqual([event['stage'] for event in events],
+                         ['converting','converted','converting','conversion_failed'])
+        self.assertEqual(events[-1]['id'],'bad.js')
+        self.assertIn(reports[1]['errors'][0],events[-1]['reason'])
+
     def test_standard_prototype_receiver_does_not_allow_unknown_object_receivers(self):
         probe="""
 import {analyze} from './tools/js-analysis/analysis/analyze.mjs';

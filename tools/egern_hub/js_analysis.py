@@ -1,8 +1,13 @@
 """Static JavaScript analysis using the vendored MIT-licensed Acorn parser."""
 from functools import lru_cache
 import json
+import os
 from pathlib import Path
+import queue
 import subprocess
+import tempfile
+from threading import Thread
+import time
 
 
 ANALYSIS_CATEGORIES = frozenset({
@@ -10,6 +15,12 @@ ANALYSIS_CATEGORIES = frozenset({
 })
 ANALYSIS_ENTRYPOINTS = frozenset({'batch.mjs', 'check.mjs', 'verify.mjs', 'widget.mjs'})
 ANALYSIS_MODULE_LIMIT = 24
+PROGRESS_PREFIX = '@@EGERN_PROGRESS '
+
+
+def emit_progress(event):
+    if os.environ.get('EGERN_PROGRESS_EVENTS') == '1':
+        print(PROGRESS_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
 
 
 def validate_analysis_layout(tool_dir=None):
@@ -50,15 +61,76 @@ def validate_analysis_layout(tool_dir=None):
         raise ValueError(prefix + f'未登记文件={unknown}；缺失文件={missing}；未登记目录={extra_folders}')
 
 
-def _run_batch(jobs):
+def _run_batch(jobs, progress_items=None):
     validate_analysis_layout()
     tool = Path(__file__).resolve().parents[2] / 'tools/js-analysis/batch.mjs'
+    payload=[]
+    for index,job in enumerate(jobs):
+        item=dict(job)
+        if progress_items and progress_items[index]:
+            item['progress']=progress_items[index]
+        payload.append(item)
+    command=['node', str(tool)]
     try:
-        result = subprocess.run(['node', str(tool)], input=json.dumps(jobs, ensure_ascii=False), text=True, capture_output=True, timeout=60)
+        if not any(progress_items or []):
+            result=subprocess.run(command,input=json.dumps(payload,ensure_ascii=False),text=True,
+                                  capture_output=True,timeout=60)
+            stdout,diagnostics,returncode=result.stdout,result.stderr,result.returncode
+        else:
+            started=time.monotonic()
+            with tempfile.TemporaryFile() as stdout_file:
+                process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=stdout_file,stderr=subprocess.PIPE)
+                messages=queue.Queue()
+                def read_stderr():
+                    for line in process.stderr:
+                        messages.put(line)
+                    messages.put(None)
+                reader=Thread(target=read_stderr,daemon=True)
+                reader.start()
+                diagnostic_lines=[]
+                try:
+                    process.stdin.write(json.dumps(payload,ensure_ascii=False).encode('utf-8'))
+                    process.stdin.close()
+                    while True:
+                        remaining=60-(time.monotonic()-started)
+                        if remaining<=0:
+                            raise subprocess.TimeoutExpired(command,60)
+                        try:
+                            line=messages.get(timeout=min(remaining,1.0))
+                        except queue.Empty:
+                            continue
+                        if line is None:
+                            break
+                        decoded=line.decode('utf-8','replace')
+                        if decoded.startswith(PROGRESS_PREFIX):
+                            try:
+                                emit_progress(json.loads(decoded[len(PROGRESS_PREFIX):]))
+                                continue
+                            except ValueError:
+                                pass
+                        diagnostic_lines.append(decoded)
+                        print(decoded,end='',flush=True)
+                    process.wait(timeout=max(0.01,60-(time.monotonic()-started)))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise
+                finally:
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
+                    if process.stderr:
+                        process.stderr.close()
+                    reader.join(timeout=1)
+                stdout_file.seek(0)
+                stdout=stdout_file.read().decode('utf-8','replace')
+                diagnostics=''.join(diagnostic_lines)
+                returncode=process.returncode
     except subprocess.TimeoutExpired as exc:
         if len(jobs) > 1:
             middle = len(jobs) // 2
-            return _run_batch(jobs[:middle]) + _run_batch(jobs[middle:])
+            left=progress_items[:middle] if any(progress_items or []) else None
+            right=progress_items[middle:] if any(progress_items or []) else None
+            return _run_batch(jobs[:middle],left) + _run_batch(jobs[middle:],right)
         identity = jobs[0].get('options', {}).get('storage_key', '').removeprefix('egern-hub:') if jobs else ''
         message = f'JavaScript 静态分析超时（{len(jobs)} 个输入，60 秒）；请检查对应脚本的分析复杂度'+('：'+identity if identity else '')
         if jobs and jobs[0].get('mode') == 'native':
@@ -68,26 +140,36 @@ def _run_batch(jobs):
         raise ValueError(message) from exc
     except OSError as exc:
         raise ValueError('语法分析需要 Node.js（Pages 构建环境自带），无需 npm 安装') from exc
-    if result.returncode:
-        raise ValueError('语法分析工具失败：' + result.stderr[-800:])
-    reports = json.loads(result.stdout)
+    if returncode:
+        raise ValueError('语法分析工具失败：' + diagnostics[-800:])
+    reports = json.loads(stdout)
     if not isinstance(reports, list) or len(reports) != len(jobs):
         raise ValueError('语法分析返回结果不完整')
     return reports
 
 
-def analyze_many(jobs, *, mode='convert'):
+def analyze_many(jobs, *, mode='convert', progress_items=None):
     """Analyze this build's entire input set; share only identical jobs within it."""
     jobs = list(jobs)
+    if progress_items is not None and len(progress_items)!=len(jobs):
+        raise ValueError('Progress metadata must match the analysis input count')
+    progress_items=list(progress_items) if progress_items is not None else [None]*len(jobs)
     unique = list(dict.fromkeys(jobs))
+    progress_by_job={}
+    for job,item in zip(jobs,progress_items):
+        progress_by_job.setdefault(job,item)
     reports, batch, size = {}, [], 0
+    batch_progress=[]
 
     def flush():
         if batch:
-            result = _run_batch([{'source':job[0], 'source_format':job[1], 'mode':mode,
-                                 'options':json.loads(job[2]) if len(job) > 2 else {}} for job in batch])
+            payload=[{'source':job[0], 'source_format':job[1], 'mode':mode,
+                      'options':json.loads(job[2]) if len(job) > 2 else {}} for job in batch]
+            result = (_run_batch(payload,batch_progress) if any(batch_progress)
+                      else _run_batch(payload))
             reports.update(zip(batch, result))
             batch.clear()
+            batch_progress.clear()
 
     for job in unique:
         length = len(job[0].encode('utf-8'))
@@ -98,6 +180,7 @@ def analyze_many(jobs, *, mode='convert'):
             flush()
             size = 0
         batch.append(job)
+        batch_progress.append(progress_by_job.get(job))
         size += length
     flush()
     return [reports[job] for job in jobs]

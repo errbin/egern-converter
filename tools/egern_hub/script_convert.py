@@ -2,12 +2,13 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 
 from .convert import ConversionError
 from .deobfuscate import deobfuscate
-from .js_analysis import analyze_many
+from .js_analysis import analyze_many, emit_progress
 from .script_usage import DEFAULT_USAGE
 
 
@@ -68,6 +69,9 @@ def convert_scripts(items, *, errors=None, metadata=None):
     """Reconvert every registered script while batching static analysis."""
     items = list(items)
     prepared, jobs = [], []
+    progress_items=[] if os.environ.get('EGERN_PROGRESS_EVENTS') == '1' else None
+    analysis_total=sum(item.get('source_format','surge')!='egern' for item in items)
+    analysis_index=0
     entry_types = {}
     unknown_entries = set()
     def contract(item):
@@ -95,7 +99,11 @@ def convert_scripts(items, *, errors=None, metadata=None):
             if item.get('readable', False):
                 options['layout_source'] = item['source']
             jobs.append((source, fmt, json.dumps(options)))
-    reports = iter(analyze_many(jobs, mode='native'))
+            analysis_index+=1
+            if progress_items is not None:
+                progress_items.append({'kind':'script','stage':'converting','id':item['id'],'url':item['url'],
+                                       'index':analysis_index,'total':analysis_total})
+    reports = iter(analyze_many(jobs, mode='native', progress_items=progress_items))
     generated = {}
     for item, source, needs_analysis in prepared:
         report = next(reports) if needs_analysis else None
@@ -110,6 +118,7 @@ def convert_scripts(items, *, errors=None, metadata=None):
                 binary=item.get('binary', False), source_format=item.get('source_format', 'surge'),
                 ast=item.get('ast', True), license_name=item.get('license'), egern_usage=item.get('egern_usage'), _analysis=report)
         except ValueError as exc:
+            emit_progress({'kind':'script','stage':'conversion_failed','id':item['id'],'url':item['url'],'reason':str(exc)})
             if errors is None:
                 raise
             errors[item['id']] = str(exc)

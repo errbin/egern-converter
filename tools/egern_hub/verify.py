@@ -13,7 +13,7 @@ import tempfile
 import zlib
 
 from .layout import read_source
-from .js_analysis import analyze_many
+from .js_analysis import analyze_many, emit_progress
 from .verification_probes import generated_cases
 from .device_parameters import device_cases
 
@@ -205,7 +205,10 @@ def replay_case(source, platform, url, case):
 
 def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
     fixtures = validate_fixtures(fixture_dir) if fixture_dir else {}
-    hints=analyze_many([(s.get('_verification_source',fetched[s['id']]),'any') for s in scripts],mode='probes') if auto else [{} for _ in scripts]
+    progress_items=([{'kind':'script','stage':'verification_probes','id':script['id'],'url':script['url'],
+                      'index':index,'total':len(scripts)} for index,script in enumerate(scripts,1)]
+                    if auto and os.environ.get('EGERN_PROGRESS_EVENTS')=='1' else None)
+    hints=analyze_many([(s.get('_verification_source',fetched[s['id']]),'any') for s in scripts],mode='probes',progress_items=progress_items) if auto else [{} for _ in scripts]
     def stages(script):
         return set(script.get('entry_types') or [context['stage'] for context in script.get('verification_contexts',[]) if context.get('stage')])
     def applicable(case, script):
@@ -214,6 +217,7 @@ def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
     def verify_one(job):
         script,hint=job
         identity,url = script['id'],script['url']
+        emit_progress({'kind':'verification','stage':'started','id':identity,'url':url})
         source = script.get('_verification_source',fetched[identity])
         platform = script.get('_verification_format',script.get('source_format','surge'))
         if script.get('native_options',{}).get('enabled_env'):
@@ -232,15 +236,20 @@ def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
                 if isinstance(case.get('argument'),str):
                     try: case['argument']=json.loads(case['argument'])
                     except ValueError: pass
-        results = [compare(source,generated[identity],platform,url,
+        def compare_case(case):
+            emit_progress({'kind':'verification','stage':'case_started','id':identity,'url':url,'name':case['name']})
+            result=compare(source,generated[identity],platform,url,
                            dict(case,binary=script.get('binary',False)),
-                           native_evaluation=script.get('native_evaluation',[])) for case in cases]
+                           native_evaluation=script.get('native_evaluation',[]))
+            emit_progress({'kind':'verification','stage':'case_completed','id':identity,'url':url,'result':result})
+            return result
+        results = [compare_case(case) for case in cases]
         pending=[case for case,result in zip(cases,results) if case.get('origin')=='generated' and result['status']=='inconclusive']
         for case in pending[:2]:
             replay=replay_case(source,platform,url,
                                dict(case,binary=script.get('binary',False)))
             if replay:
-                results.append(compare(source,generated[identity],platform,url,replay))
+                results.append(compare_case(replay))
                 break
         successful=[r for r in results if r['status']=='passed']
         effective=[r for r in successful if r.get('observable_change') and (r['origin']=='curated' or
@@ -259,6 +268,7 @@ def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
                         'curated':len(curated), 'complete_branch_coverage':False},
             'excluded_fixtures':excluded,
             'generation_limits':hint.get('limits',[])}
+        emit_progress({'kind':'verification','stage':'completed','id':identity,'url':url,'status':status})
         return identity,row
     with ThreadPoolExecutor(max_workers=4) as pool:
         rows=dict(pool.map(verify_one,zip(scripts,hints)))
