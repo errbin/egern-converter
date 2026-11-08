@@ -360,7 +360,7 @@ class ConversionTests(unittest.TestCase):
             with self.subTest(license_name=license_name):
                 output=convert_scripts([dict(id='demo',source=source,author='baby',url='https://example.com/demo.js',
                     license=license_name,license_text='Repository provenance notes\nEgern 适配：ErrBin — https://github.com/errbin/')])['demo']
-                self.assertTrue(output.startswith('/*\nOriginal author: baby\nSource: https://example.com/demo.js\nEgern adaptation: ErrBin (ErrBin)\nLicense: '+license_name+'\n\nOriginal author notice stays here.\n\n用法\n'))
+                self.assertTrue(output.startswith('/*\nOriginal author: baby\nSource: https://example.com/demo.js\nEgern adaptation: ErrBin\nLicense: '+license_name+'\n\nOriginal author notice stays here.\n\n用法\n'))
                 self.assertNotIn('Repository provenance notes',output)
                 self.assertNotIn('Egern 适配：',output)
                 self.assertEqual(output.count('Original author notice stays here.'),1)

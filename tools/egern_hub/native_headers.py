@@ -38,7 +38,7 @@ def dependencies_for(obj, defaults, repository, ref, origin, path):
             reference.append('}')
         reference.append('$done({headers});')
         body = (f'/*\nOriginal author: {defaults["author"]}\nSource: {origin}\n'
-                'Egern adaptation: ErrBin (ErrBin)\n*/\n\n\n'
+                'Egern adaptation: ErrBin\n*/\n\n\n'
                 f'export default async function(ctx) {{\n  const headers = ctx.{direction}.headers;\n'
                 + '\n'.join(code) + '\n  return {headers};\n}\n')
         script = {**defaults, 'id':identity, 'url':url, 'repository':repository, 'git_ref':ref,

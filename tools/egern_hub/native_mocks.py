@@ -20,7 +20,7 @@ def dependencies_for(obj,defaults,repository,ref,origin,path):
     reference.append('$done({});')
     body='export default async function(ctx) {\n'+'\n'.join(code)+'\n}\n'
     script={**defaults,'id':identity,'url':url,'repository':repository,'git_ref':ref,'source_format':'egern',
-            '_inline_body':f'/*\nOriginal author: {defaults["author"]}\nSource: {origin}\nEgern adaptation: ErrBin (ErrBin)\n*/\n\n\n'+body,
+            '_inline_body':f'/*\nOriginal author: {defaults["author"]}\nSource: {origin}\nEgern adaptation: ErrBin\n*/\n\n\n'+body,
             '_verification_source':'\n'.join(reference),'_verification_format':'surge',
             'output':str(PurePosixPath(path).with_suffix(''))+'.mocks.js'}
     yield script,{'http_request':{'name':PurePosixPath(script['output']).stem,'match':'|'.join('(?:'+r['match']+')' for r in rows),'script_url':url,'body_required':False}}

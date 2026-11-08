@@ -51,7 +51,7 @@ def convert_script(source, author, url, license_text, binary=False, readable=Fal
     for label in (author, url, license_name or ''):
         if '\n' in label or '\r' in label:
             raise ConversionError('署名和来源必须是单行文本')
-    lines = [f'Original author: {author}', f'Source: {url}', 'Egern adaptation: ErrBin (ErrBin)']
+    lines = [f'Original author: {author}', f'Source: {url}', 'Egern adaptation: ErrBin']
     if license_name:
         lines.append('License: ' + license_name)
     # Explicit CLI license text is retained when supplied; website builds use upstream URLs only.
