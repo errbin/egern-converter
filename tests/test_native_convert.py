@@ -1,5 +1,7 @@
 """Direct compilation contracts; no compatibility runtime can be a fallback."""
+import json
 import shutil
+import subprocess
 import unittest
 
 from tests import test_script_convert as execution
@@ -81,6 +83,26 @@ class NativeCompilerTests(unittest.TestCase):
                                {'name':'native completion','request':{'url':'https://example.test/'},
                                 'expected':{'result':{'body':body}}})
                 self.assertEqual(result['status'],'passed',result)
+
+    def test_closed_function_constructor_body_becomes_native_completion(self):
+        from tools.egern_hub.verify import compare
+        source='(+[])["constructor"]["constructor"](\'$done({body:"ok"});\')();'
+        output=compile_source(source,source_format='loon')
+        self.assertNotIn('$done',output)
+        self.assertIn('export default async function(ctx)',output)
+        self.assertIn('return{body:"ok"}',output)
+        fixture={'name':'closed generated body','request':{'url':'https://example.test/'},
+                 'expected':{'result':{'body':'ok'}}}
+        decoded='$done({body:"ok"});'
+        result=compare(decoded,output,'loon','https://example.test/source.js',fixture)
+        self.assertEqual(result['status'],'passed',result)
+
+    def test_returned_string_is_not_treated_as_an_executed_script(self):
+        source='''(+[])["constructor"]["constructor"]("return '$done({body:\\"ok\\"});'")();'''
+        harness="import {lowerFunctionConstructorSource} from './tools/js-analysis/transforms/decoding.mjs';let source='';for await(const chunk of process.stdin)source+=chunk;const result=lowerFunctionConstructorSource(source);process.stdout.write(JSON.stringify({same:result.source===source,layers:result.transformations.length}));"
+        result=subprocess.run(['node','--input-type=module','-e',harness],input=source,text=True,
+                              capture_output=True,check=True,cwd=str(execution.ROOT))
+        self.assertEqual(json.loads(result.stdout),{'same':True,'layers':0})
 
     def test_message_mutation_and_qx_whole_response_fail_closed(self):
         for source in ['$response.body="changed";$done($response);',

@@ -12,7 +12,7 @@ import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowe
 import {protectLibraries} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase} from '../core/ast.mjs';
 import {valueFacts} from '../analysis/values.mjs';
-import {lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
+import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
 // Compile legacy HTTP scripts to direct Egern APIs. No runtime bridge is emitted.
@@ -23,15 +23,16 @@ export function native(source,format='surge',options={}){
 function compileNative(source,format,options){
  let libraries;
  try{
-  // Preserve complete libraries before any numeric, environment or host pass
-  // can change their AST or raw text. Native JavaScript evaluation stays JS.
-  libraries=protectLibraries(source);
+  // Reveal a closed, data-only Function-constructor shell before identifying
+  // embedded libraries. No input body is evaluated during this reduction.
+  const functionSource=lowerFunctionConstructorSource(source);
+  libraries=protectLibraries(functionSource.source);
   const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),nodeRequest=lowerNodeRequestClient(decoded.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
-  return {...compile(source,format,{...options,device},libraries),native_evaluation:evaluation,
-   static_transformations:[...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+  return {...compile(functionSource.source,format,{...options,device},libraries),native_evaluation:evaluation,
+   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[]};}
 }
 function normalizeLegacyNumbers(source){

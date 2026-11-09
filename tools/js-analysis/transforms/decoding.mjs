@@ -14,6 +14,270 @@ const SHELLS=new Set(['2fb24a457e18d87859569d483f1081ed0eaa651a1d4734d4328bb7e51
 const options={ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true};
 const stop=why=>{throw Error('静态字符串表解码：'+why);};
 
+// Reduce closed Function-constructor shells without executing authored code.
+// This is intentionally an abstract interpreter for data-only expressions:
+// Function bodies are parsed; single static return expressions are reduced,
+// while invoked statement bodies are returned to the native compiler. No
+// input statements, host calls, or effects are run. Unsupported input falls
+// through to the normal compiler.
+const shellFunction=Object.freeze({kind:'function-constructor'});
+const shellCtor=name=>Object.freeze({kind:'constructor',name});
+const shellIntrinsic=name=>Object.freeze({kind:'intrinsic',name});
+const shellObject=()=>({kind:'object',properties:new Map()});
+const shellArray=values=>({kind:'array',values});
+const shellBoxed=(type,value)=>({kind:'boxed',type,value});
+const shellGenerated=(params,argument,code)=>({kind:'generated-function',params,argument,code});
+const shellProgram=code=>({kind:'source-program',code});
+const shellUnsupported=()=>{throw Error('not a closed static expression');};
+const shellMaxSteps=120000,shellMaxDepth=192,shellMaxSource=1048576;
+const shellArrayIndex=name=>/^(0|[1-9]\d*)$/.test(name)&&Number(name)<4294967295?Number(name):null;
+
+function shellPrimitive(value){
+ if(value===null||value===undefined||['string','number','boolean'].includes(typeof value))return value;
+ if(value?.kind==='boxed')return value.value;
+ if(value?.kind==='array')return value.values.map(shellPrimitive).map(v=>v==null?'':String(v)).join(',');
+ if(value?.kind==='object'){
+  if(value.properties.has('toString')||value.properties.has('valueOf'))shellUnsupported();
+  return '[object Object]';
+ }
+ shellUnsupported();
+}
+function shellString(value){const v=shellPrimitive(value);return v===null?'null':v===undefined?'undefined':String(v);}
+function shellNumber(value){
+ const v=shellPrimitive(value);
+ if(v===undefined)return NaN;if(v===null)return 0;if(typeof v==='boolean')return v?1:0;
+ if(typeof v==='number')return v;if(typeof v==='string')return v.trim()===''?0:Number(v);
+ return NaN;
+}
+function shellTruthy(value){return !!value;}
+function shellTypeof(value){
+ if(value===undefined)return 'undefined';
+ if(value===null)return 'object';
+ if(['function-constructor','constructor','generated-function','intrinsic'].includes(value?.kind))return 'function';
+ if(['object','array','boxed'].includes(value?.kind))return 'object';
+ return typeof value;
+}
+function shellObjectLike(value){return ['object','array','boxed','function-constructor','constructor','generated-function','intrinsic'].includes(value?.kind);}
+function shellLooseEqual(a,b){
+ if(a===b||a==null&&b==null)return true;
+ if(typeof a==='boolean')return shellLooseEqual(Number(a),b);
+ if(typeof b==='boolean')return shellLooseEqual(a,Number(b));
+ if(shellObjectLike(a)){if(shellObjectLike(b))return false;return shellLooseEqual(shellPrimitive(a),b);}
+ if(shellObjectLike(b))return shellLooseEqual(a,shellPrimitive(b));
+ if(typeof a==='string'&&typeof b==='number')return Number(a)===b;
+ if(typeof b==='string'&&typeof a==='number')return a===Number(b);
+ return false;
+}
+function shellPropertyKey(value){return shellString(value);}
+function shellGet(base,name){
+ if(base===null||base===undefined)shellUnsupported();
+ if(name==='__proto__')shellUnsupported();
+ if(base?.kind==='boxed')return name==='constructor'?shellCtor(base.type):shellGet(base.value,name);
+ if(base?.kind==='object')return base.properties.get(name);
+ if(base?.kind==='array'){
+  if(name==='length')return base.values.length;
+  if(name==='constructor')return shellCtor('Array');
+  const arrayIndex=shellArrayIndex(name);if(arrayIndex!==null)return base.values[arrayIndex];
+  if(['join','push','pop','shift','unshift','reverse','slice','concat','filter','map','forEach'].includes(name))return shellIntrinsic('Array.'+name);
+  return undefined;
+ }
+ if(typeof base==='string'){
+  if(name==='length')return base.length;
+  if(name==='constructor')return shellCtor('String');
+  const stringIndex=shellArrayIndex(name);if(stringIndex!==null)return base[stringIndex];
+  if(['charAt','charCodeAt','codePointAt','slice','substring','substr','indexOf','lastIndexOf','split','toLowerCase','toUpperCase','trim','replace'].includes(name))return shellIntrinsic('String.'+name);
+  return undefined;
+ }
+ if(typeof base==='number'||typeof base==='boolean'){
+  if(name==='constructor')return shellCtor(typeof base==='number'?'Number':'Boolean');
+  return undefined;
+ }
+ if(base?.kind==='constructor')return name==='constructor'?shellFunction:base.name==='String'&&['fromCharCode','fromCodePoint'].includes(name)?shellIntrinsic('String.'+name):undefined;
+ if(base===shellFunction)return name==='constructor'?shellFunction:undefined;
+ if(base?.kind==='intrinsic')return name==='constructor'?shellFunction:undefined;
+ if(base?.kind==='generated-function')return name==='constructor'?shellFunction:undefined;
+ return undefined;
+}
+function shellSet(base,name,value){
+ if(base?.kind==='object'){base.properties.set(name,value);return value;}
+ if(base?.kind==='array'){
+  if(name==='length'&&Number.isInteger(value)&&value>=0&&value<=100000){base.values.length=value;return value;}
+  const arrayIndex=shellArrayIndex(name);if(arrayIndex!==null&&arrayIndex<100000){base.values[arrayIndex]=value;return value;}
+ }
+ shellUnsupported();
+}
+function shellCall(fn,args,state,depth,isNew=false){
+ if(fn===shellFunction||fn?.kind==='constructor'&&fn.name==='Function'){
+  state.usedFunction=true;
+  const body=args.length?shellString(args.at(-1)):'';
+  if(body.length>shellMaxSource) shellUnsupported();
+  const params=args.slice(0,-1).map(shellString);
+  if(params.some(p=>!/^[$A-Z_a-z][$\w]*$/.test(p)))shellUnsupported();
+  const ast=parse(body,options);
+  return shellGenerated(params,ast.body.length===1&&ast.body[0].type==='ReturnStatement'?ast.body[0].argument:null,body);
+ }
+ if(fn?.kind==='generated-function'){
+  if(!fn.argument)return shellProgram(fn.code);
+  const local=new Map(state.env);fn.params.forEach((p,i)=>local.set(p,args[i]));
+  try{return shellEvaluate(fn.argument,{...state,env:local},depth+1);}
+  catch{return shellProgram(fn.code);}
+ }
+ if(fn?.kind==='constructor'){
+  if(fn.name==='String'){const value=args.length?shellString(args[0]):'';return isNew?shellBoxed('String',value):value;}
+  if(fn.name==='Number'){const value=args.length?shellNumber(args[0]):0;return isNew?shellBoxed('Number',value):value;}
+  if(fn.name==='Boolean'){const value=args.length?shellTruthy(args[0]):false;return isNew?shellBoxed('Boolean',value):value;}
+  if(fn.name==='Array'){
+   if(args.length===1&&typeof args[0]==='number'){
+    if(!Number.isInteger(args[0])||args[0]<0||args[0]>100000)shellUnsupported();
+    return shellArray(Array(args[0]));
+   }
+   return shellArray(args);
+  }
+  if(fn.name==='Object'){
+   const value=args[0];if(value===null||value===undefined)return shellObject();
+   if(value?.kind==='object'||value?.kind==='array'||value?.kind==='boxed')return value;
+   if(typeof value==='string'||typeof value==='number'||typeof value==='boolean')return shellBoxed(typeof value==='string'?'String':typeof value==='number'?'Number':'Boolean',value);
+   shellUnsupported();
+  }
+ }
+ if(fn?.kind==='intrinsic'){
+  const [a,b]=args;
+  if(fn.name==='String.fromCharCode')return String.fromCharCode(...args.map(shellNumber));
+  if(fn.name==='String.fromCodePoint')return String.fromCodePoint(...args.map(shellNumber));
+  if(fn.name==='Array.join')return fn.receiver.values.map(shellPrimitive).map(v=>v==null?'':String(v)).join(a===undefined?',':shellString(a));
+  if(fn.name==='Array.push'){fn.receiver.values.push(...args);return fn.receiver.values.length;}
+  if(fn.name==='Array.pop')return fn.receiver.values.pop();
+  if(fn.name==='Array.shift')return fn.receiver.values.shift();
+  if(fn.name==='Array.unshift'){fn.receiver.values.unshift(...args);return fn.receiver.values.length;}
+  if(fn.name==='Array.reverse'){fn.receiver.values.reverse();return fn.receiver;}
+  if(fn.name==='Array.slice')return shellArray(fn.receiver.values.slice(shellNumber(a)||0,b===undefined?undefined:shellNumber(b)));
+  if(fn.name==='Array.concat')return shellArray(fn.receiver.values.concat(...args.map(x=>x?.kind==='array'?x.values:x)));
+  if(fn.name==='String.charAt')return shellString(fn.receiver).charAt(shellNumber(a));
+  if(fn.name==='String.charCodeAt')return shellString(fn.receiver).charCodeAt(shellNumber(a));
+  if(fn.name==='String.codePointAt')return shellString(fn.receiver).codePointAt(shellNumber(a));
+  if(fn.name==='String.slice')return shellString(fn.receiver).slice(a===undefined?0:shellNumber(a),b===undefined?undefined:shellNumber(b));
+  if(fn.name==='String.substring')return shellString(fn.receiver).substring(a===undefined?0:shellNumber(a),b===undefined?undefined:shellNumber(b));
+  if(fn.name==='String.substr')return shellString(fn.receiver).substr(a===undefined?0:shellNumber(a),b===undefined?undefined:shellNumber(b));
+  if(fn.name==='String.indexOf')return shellString(fn.receiver).indexOf(shellString(a),b===undefined?0:shellNumber(b));
+  if(fn.name==='String.lastIndexOf')return shellString(fn.receiver).lastIndexOf(shellString(a),b===undefined?undefined:shellNumber(b));
+  if(fn.name==='String.split')return shellArray(shellString(fn.receiver).split(a===undefined?undefined:shellString(a),b===undefined?undefined:shellNumber(b)));
+  if(fn.name==='String.toLowerCase')return shellString(fn.receiver).toLowerCase();
+  if(fn.name==='String.toUpperCase')return shellString(fn.receiver).toUpperCase();
+  if(fn.name==='String.trim')return shellString(fn.receiver).trim();
+  if(fn.name==='String.replace'&&typeof a==='string')return shellString(fn.receiver).replace(a,b===undefined?'undefined':shellString(b));
+ }
+ if(fn?.kind==='intrinsic'&&fn.name==='parseInt')return Number.parseInt(shellString(args[0]),args.length>1?shellNumber(args[1]):undefined);
+ shellUnsupported();
+}
+function shellEvaluate(node,state,depth=0){
+ if(!node||depth>shellMaxDepth||++state.steps>shellMaxSteps)shellUnsupported();
+ const {env}=state;
+ if(node.type==='Literal')return node.value;
+ if(node.type==='Identifier'){
+  if(env.has(node.name))return env.get(node.name);
+  if(node.name==='undefined')return undefined;if(node.name==='NaN')return NaN;if(node.name==='Infinity')return Infinity;
+  if(node.name==='Function')return shellFunction;
+  if(['String','Number','Boolean','Object','Array'].includes(node.name))return shellCtor(node.name);
+  if(node.name==='parseInt')return shellIntrinsic('parseInt');
+  shellUnsupported();
+ }
+ if(node.type==='ArrayExpression')return shellArray(node.elements.map(e=>e?e.type==='SpreadElement'?shellUnsupported():shellEvaluate(e,state,depth+1):undefined));
+ if(node.type==='ObjectExpression'){
+  const result=shellObject();
+  for(const p of node.properties){if(p.type!=='Property'||p.kind!=='init'||p.method)shellUnsupported();const name=p.computed?shellPropertyKey(shellEvaluate(p.key,state,depth+1)):String(key(p));result.properties.set(name,shellEvaluate(p.value,state,depth+1));}
+  return result;
+ }
+ if(node.type==='MemberExpression'){
+  const base=shellEvaluate(node.object,state,depth+1),name=shellPropertyKey(node.computed?shellEvaluate(node.property,state,depth+1):property(node));
+  const value=shellGet(base,name);return value?.kind==='intrinsic'?{...value,receiver:base}:value;
+ }
+ if(node.type==='UnaryExpression'){
+  const value=shellEvaluate(node.argument,state,depth+1);
+  if(node.operator==='!')return !shellTruthy(value);if(node.operator==='~')return ~shellNumber(value);
+  if(node.operator==='+')return shellNumber(value);if(node.operator==='-')return -shellNumber(value);
+  if(node.operator==='void')return undefined;if(node.operator==='typeof')return shellTypeof(value);
+  shellUnsupported();
+ }
+ if(node.type==='BinaryExpression'&&node.operator==='+'){
+  const parts=[];let current=node;
+  while(current?.type==='BinaryExpression'&&current.operator==='+'){parts.push(current.right);current=current.left;}
+  let result=shellEvaluate(current,state,depth+1);
+  for(let i=parts.length-1;i>=0;i--){const right=shellEvaluate(parts[i],state,depth+1),left=shellPrimitive(result),r=shellPrimitive(right);result=typeof left==='string'||typeof r==='string'?shellString(left)+shellString(r):shellNumber(left)+shellNumber(r);}
+  return result;
+ }
+ if(node.type==='BinaryExpression'){
+  const a=shellEvaluate(node.left,state,depth+1),b=shellEvaluate(node.right,state,depth+1),x=shellPrimitive(a),y=shellPrimitive(b);
+  switch(node.operator){case '-':return shellNumber(x)-shellNumber(y);case '*':return shellNumber(x)*shellNumber(y);case '/':return shellNumber(x)/shellNumber(y);case '%':return shellNumber(x)%shellNumber(y);case '**':return shellNumber(x)**shellNumber(y);case '<<':return shellNumber(x)<<shellNumber(y);case '>>':return shellNumber(x)>>shellNumber(y);case '>>>':return shellNumber(x)>>>shellNumber(y);case '|':return shellNumber(x)|shellNumber(y);case '&':return shellNumber(x)&shellNumber(y);case '^':return shellNumber(x)^shellNumber(y);case '===':return a===b;case '!==':return a!==b;case '==':return shellLooseEqual(a,b);case '!=':return !shellLooseEqual(a,b);case '<':return x<y;case '<=':return x<=y;case '>':return x>y;case '>=':return x>=y;}
+  shellUnsupported();
+ }
+ if(node.type==='LogicalExpression'){
+  const left=shellEvaluate(node.left,state,depth+1);
+  if(node.operator==='&&')return shellTruthy(left)?shellEvaluate(node.right,state,depth+1):left;
+  if(node.operator==='||')return shellTruthy(left)?left:shellEvaluate(node.right,state,depth+1);
+  if(node.operator==='??')return left==null?shellEvaluate(node.right,state,depth+1):left;
+  shellUnsupported();
+ }
+ if(node.type==='ConditionalExpression')return shellEvaluate(shellTruthy(shellEvaluate(node.test,state,depth+1))?node.consequent:node.alternate,state,depth+1);
+ if(node.type==='SequenceExpression'){let result;for(const item of node.expressions)result=shellEvaluate(item,state,depth+1);return result;}
+ if(node.type==='UpdateExpression'){
+  let old;
+  if(node.argument.type==='Identifier'){old=env.get(node.argument.name);if(!env.has(node.argument.name))shellUnsupported();const next=shellNumber(old)+(node.operator==='++'?1:-1);env.set(node.argument.name,next);return node.prefix?next:old;}
+  if(node.argument.type==='MemberExpression'){const base=shellEvaluate(node.argument.object,state,depth+1),name=shellPropertyKey(node.argument.computed?shellEvaluate(node.argument.property,state,depth+1):property(node.argument));old=shellGet(base,name);const next=shellNumber(old)+(node.operator==='++'?1:-1);shellSet(base,name,next);return node.prefix?next:old;}
+  shellUnsupported();
+ }
+ if(node.type==='AssignmentExpression'){
+  let target,name;
+  if(node.left.type==='Identifier')target={kind:'identifier',name:node.left.name};
+  else if(node.left.type==='MemberExpression'){
+   target={kind:'member',base:shellEvaluate(node.left.object,state,depth+1),name:shellPropertyKey(node.left.computed?shellEvaluate(node.left.property,state,depth+1):property(node.left))};
+  }else shellUnsupported();
+  const old=node.operator==='='?undefined:target.kind==='identifier'?env.get(target.name):shellGet(target.base,target.name);
+  const right=shellEvaluate(node.right,state,depth+1);let value=right;
+  if(node.operator!=='='){
+   const a=shellPrimitive(old),b=shellPrimitive(right);
+   if(node.operator==='+=' )value=typeof a==='string'||typeof b==='string'?shellString(a)+shellString(b):shellNumber(a)+shellNumber(b);
+   else if(node.operator==='-=')value=shellNumber(a)-shellNumber(b);else if(node.operator==='*=')value=shellNumber(a)*shellNumber(b);else if(node.operator==='/=')value=shellNumber(a)/shellNumber(b);else shellUnsupported();
+  }
+  if(target.kind==='identifier')env.set(target.name,value);else shellSet(target.base,target.name,value);
+  return value;
+ }
+ if(node.type==='CallExpression'||node.type==='NewExpression'){
+  const fn=shellEvaluate(node.callee,state,depth+1),args=node.arguments.map(a=>a.type==='SpreadElement'?shellUnsupported():shellEvaluate(a,state,depth+1));
+  return shellCall(fn,args,state,depth,node.type==='NewExpression');
+ }
+ if(node.type==='TemplateLiteral'){
+  let value=node.quasis[0].value.cooked??node.quasis[0].value.raw;
+  for(let i=0;i<node.expressions.length;i++)value+=shellString(shellEvaluate(node.expressions[i],state,depth+1))+(node.quasis[i+1].value.cooked??node.quasis[i+1].value.raw);
+  return value;
+ }
+ shellUnsupported();
+}
+
+function decodeFunctionConstructorLayer(source){
+ if(source.length>shellMaxSource)return null;
+ let tree;try{tree=parse(source,options);}catch{return null;}
+ if(!tree.body.length||tree.body.length>64||tree.body.some(n=>n.type!=='ExpressionStatement'))return null;
+ const state={env:new Map(),steps:0,usedFunction:false};let result;
+ try{for(const statement of tree.body)result=shellEvaluate(statement.expression,state);}
+ catch{return null;}
+ if(!state.usedFunction||result?.kind!=='source-program'||result.code===source||result.code.length>shellMaxSource)return null;
+ const payload=result.code;
+ if(!payload.trim())return null;
+ try{
+  const decoded=parse(payload,options),decodedIndex=index(decoded);
+  if(!decoded.body.length||decodedIndex.nodes.some(n=>n.type==='Identifier'&&decodedIndex.free(n)&&state.env.has(n.name)))return null;
+ }
+ catch{return null;}
+ return source.slice(0,tree.body[0].start)+payload;
+}
+
+export function lowerFunctionConstructorSource(source){
+ let output=source,layers=0;
+ while(layers<8){const next=decodeFunctionConstructorLayer(output);if(next===null||next===output)break;output=next;layers++;}
+ return {source:output,transformations:layers?[{kind:'closed-function-constructor-static-source',layers,
+  reason:'reduced bounded literal expressions and extracted generated function bodies; no input JavaScript was executed'}]:[]};
+}
+
 function rc4(encoded,key){
  const alphabet='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';
  if(typeof encoded!=='string'||typeof key!=='string'||!key.length||encoded.length>65536||key.length>256)stop('字符串或密钥超出有界输入范围');
