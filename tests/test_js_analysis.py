@@ -10,6 +10,27 @@ from tools.egern_hub import js_analysis
 
 
 class BatchAnalysisTests(unittest.TestCase):
+    def test_ast_patch_preserves_lexical_boundaries_without_repeated_prefix_scans(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {parse} from './tools/js-analysis/core/syntax.mjs';
+import {index,patch} from './tools/js-analysis/core/ast.mjs';
+const render=(source,from,to)=>{
+ const tree=parse(source,{ecmaVersion:'latest'}),ix=index(tree);
+ const target=ix.nodes.find(node=>node.start===source.indexOf(from)&&node.end===source.indexOf(from)+from.length);
+ assert.ok(target,`missing replacement target ${from}`);
+ const replacements=new WeakMap([[target,to]]);
+ const emit=node=>replacements.has(node)?replacements.get(node):patch(source,node,emit);
+ return emit(tree);
+};
+assert.equal(render('function f(){return!flag}','!flag','false'),'function f(){return false}');
+assert.equal(render('function f(){return !flag.toString()}','flag','0'),'function f(){return !0 .toString()}');
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
     def test_initializer_order_is_proved_inside_the_same_execution_block(self):
         probe="""
 import assert from 'node:assert/strict';
@@ -43,6 +64,26 @@ const early=fold('function Env(){return new class{constructor(){return;this.valu
 assert.match(early,/getValue\\(\\)\\{return this\\.value\\}/);
 const reachable=fold('function Env(){return new class{constructor(){this.getValue();this.value="set"}isNode(){return false}getValue(){return this.value}}}const runtime=Env();runtime.getValue();');
 assert.match(reachable,/getValue\\(\\)\\{return this\\.value\\}/);
+const separateReceiver=fold('function Env(){return new class{constructor(){this.value="env"}isNode(){return false}getValue(){return this.value}}}class Other{getValue(){return this.value}}const runtime=Env();runtime.getValue();new Other().getValue();');
+assert.match(separateReceiver,/class Other\\{getValue\\(\\)\\{return this\\.value\\}\\}/);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_platform_switch_pruning_keeps_references_to_removed_case_bindings(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {platformFold} from './tools/js-analysis/platform/globals.mjs';
+const fold=source=>platformFold(source,'qx').source;
+const closed=fold('switch(typeof $task){case "object":var kept="yes";break;default:var removed="no";}');
+assert.doesNotMatch(closed,/switch\\s*\\(/);
+assert.match(closed,/kept/);
+assert.doesNotMatch(closed,/removed/);
+const escaped=fold('switch(typeof $task){case "object":var kept="yes";break;default:var removed="no";}use(removed);');
+assert.match(escaped,/switch\\s*\\(/);
+assert.match(escaped,/use\\(removed\\)/);
 console.log(JSON.stringify({ok:true}));
 """
         result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,

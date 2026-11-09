@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,property,key,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
+import {index,patch,property,key,children,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
 
 // Fold proven source-platform probes, preserving unknown device/version data.
 const UNKNOWN=Symbol('not statically known');
@@ -16,8 +16,26 @@ export function platformFold(source,format,options={}){
 }
 function fold(source,format,options,qxHint){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
- const declarationCounts=new Map();
- for(const n of ix.nodes)if(n.type==='VariableDeclarator'||n.type==='FunctionDeclaration'){const b=ix.bindings.get(n.id);if(b)declarationCounts.set(b,(declarationCounts.get(b)??0)+1);}
+ const declarationCounts=new Map(),variableDeclarators=new Map(),thisExpressions=[];
+ for(const n of ix.nodes){
+  if(n.type==='VariableDeclarator'){
+   const b=ix.bindings.get(n.id);
+   if(b){
+    declarationCounts.set(b,(declarationCounts.get(b)??0)+1);
+    if(!variableDeclarators.has(b))variableDeclarators.set(b,[]);
+    variableDeclarators.get(b).push(n);
+   }
+  }else if(n.type==='FunctionDeclaration'){
+   const b=ix.bindings.get(n.id);if(b)declarationCounts.set(b,(declarationCounts.get(b)??0)+1);
+  }
+  if(n.type==='ThisExpression')thisExpressions.push(n);
+ }
+ thisExpressions.sort((a,b)=>a.start-b.start);
+ function containsThis(fn){
+  let low=0,high=thisExpressions.length;
+  while(low<high){const middle=(low+high)>>1;if(thisExpressions[middle].start<fn.start)low=middle+1;else high=middle;}
+  return low<thisExpressions.length&&thisExpressions[low].start>=fn.start&&thisExpressions[low].end<=fn.end;
+ }
  const used=name=>ix.nodes.some(n=>ix.free(n,name)&&!(ix.parents.get(n)?.operator==='typeof'));
  const qx=qxHint??(format==='qx'||(used('$task')&&!used('$httpClient')));
  const records=new WeakSet();
@@ -31,6 +49,7 @@ function fold(source,format,options,qxHint){
   });readonlyRecords.set(b,safe);return safe;
  }
  let parameters=new Map();
+ const rootParameters=parameters,rootValueCache=new WeakMap();
  const assignedInitializers=new Map();
  for(const n of ix.nodes)if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&!n.init){
   const b=ix.bindings.get(n.id),write=b?.writes[0],fn=ix.owners.get(write),parent=ix.parents.get(fn),id=fn?.id??(parent?.type==='VariableDeclarator'?parent.id:null),callee=id?ix.bindings.get(id):null;
@@ -58,6 +77,7 @@ function fold(source,format,options,qxHint){
   // lexical declarations with the same names remain untouched by ix.free.
   module:'undefined',process:'undefined',require:'undefined',global:'undefined',window:'undefined'};
  for(const [name,type] of Object.entries(types))if((type==='object'||type==='function')&&!PRESENT_GLOBALS.has(name))PRESENT_GLOBALS.set(name,Symbol('present:'+name));
+ const presentGlobalNames=new Map([...PRESENT_GLOBALS].map(([name,marker])=>[marker,name]));
  // Some bundled SDKs detect their host through an isolated enumerable-key
  // snapshot. Fold only closed membership probes; never fabricate a complete
  // global object or discard an escaped/mutated array.
@@ -77,7 +97,14 @@ function fold(source,format,options,qxHint){
   if(queries.some(c=>!c)||b.refs.some(r=>!dominates(b,r)))continue;
   keySnapshots.add(call);for(const query of queries)globalMembership.set(query,markers.get(query.arguments[0].value));
  }
- function value(n,seen=new Set()){
+ function value(n,seen){
+  const rootContext=parameters===rootParameters&&(!seen||seen.size===0);
+  if(n&&rootContext&&rootValueCache.has(n))return rootValueCache.get(n);
+  const result=valueImpl(n,seen??new Set());
+  if(n&&rootContext)rootValueCache.set(n,result);
+  return result;
+ }
+ function valueImpl(n,seen){
   if(!n)return UNKNOWN;
   if(globalMembership.has(n))return globalMembership.get(n);
   if(keySnapshots.has(n)){const snapshot=[];records.add(snapshot);return snapshot;}
@@ -107,7 +134,7 @@ function fold(source,format,options,qxHint){
    if(parameters.has(ix.bindings.get(n)))return parameters.get(ix.bindings.get(n));
    const b=ix.bindings.get(n);
    if(b&&!b.init&&!b.writes.length){
-    const declarations=ix.nodes.filter(x=>x.type==='VariableDeclarator'&&ix.bindings.get(x.id)===b);
+    const declarations=variableDeclarators.get(b)??[];
     if(declarations.length===1){const declaration=declarations[0],statement=ix.parents.get(declaration),owner=ix.parents.get(statement);
      if(statement?.type==='VariableDeclaration'&&owner&&(['var'].includes(statement.kind)||initializedAfter(ix,statement,n)))return undefined;
     }
@@ -139,7 +166,7 @@ function fold(source,format,options,qxHint){
    const closedMethod=methodCall&&(!methodBinding||methodBinding.init&&!methodBinding.writes.length&&methodBinding.refs.every(r=>{
     const m=ix.parents.get(r),call=ix.parents.get(m);
     return m?.type==='MemberExpression'&&m.object===r&&property(m)!==undefined&&call?.type==='CallExpression'&&call.callee===m&&!call.optional;
-   }))&&!ix.nodes.some(x=>x.start>=fn.start&&x.end<=fn.end&&x.type==='ThisExpression');
+   }))&&!containsThis(fn);
    if((direct||b&&!b.writes.length&&!seen.has(b)||closedMethod)&&!seen.has(fn)&&functions.has(fn?.type)&&!fn.async&&!fn.generator&&fn.params.every(p=>(p.type==='Identifier'||p.type==='AssignmentPattern'&&p.left.type==='Identifier')&&!ix.bindings.get(p.type==='AssignmentPattern'?p.left:p)?.writes.length)&&
      (direct||closedMethod||((fn.type==='FunctionDeclaration'||dominates(b,n.callee))&&
      declarationCounts.get(b)===1&&
@@ -165,7 +192,7 @@ function fold(source,format,options,qxHint){
   }
   if(n.type==='BinaryExpression'){
    const a=value(n.left,seen),b=value(n.right,seen);if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION)return UNKNOWN;
-   const presentA=[...PRESENT_GLOBALS].find(([,marker])=>marker===a)?.[0],presentB=[...PRESENT_GLOBALS].find(([,marker])=>marker===b)?.[0];
+   const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
    if(presentA||presentB){
     if(['===','!==','==','!='].includes(n.operator)){
      let equal;
@@ -308,11 +335,28 @@ function fold(source,format,options,qxHint){
      let start=n.cases.findIndex(c=>c.test&&value(c.test)===v);if(start<0)start=n.cases.findIndex(c=>!c.test);
      const selected=[];let stopped=false;
      for(const c of n.cases.slice(start<0?n.cases.length:start))for(const s of c.consequent){if(stopped)break;if(s.type==='BreakStatement'&&!s.label){stopped=true;break;}selected.push(s);}
-     const excluded=ix.nodes.filter(x=>x.start>=n.start&&x.end<=n.end&&!selected.some(s=>x.start>=s.start&&x.end<=s.end));
      const patternBindings=n=>!n?[]:n.type==='Identifier'?[ix.bindings.get(n)]:n.type==='RestElement'?patternBindings(n.argument):n.type==='AssignmentPattern'?patternBindings(n.left):n.type==='ArrayPattern'?n.elements.flatMap(patternBindings):n.type==='ObjectPattern'?n.properties.flatMap(p=>patternBindings(p.type==='RestElement'?p.argument:p.value)):[];
-     const excludedBindings=new Set(excluded.filter(x=>x.type==='VariableDeclarator'||x.type==='ClassDeclaration'||x.type==='FunctionDeclaration').flatMap(x=>patternBindings(x.id)).filter(Boolean));
-     const excludedReferences=ix.nodes.some(x=>ix.reference(x)&&excludedBindings.has(ix.bindings.get(x))&&!excluded.includes(x));
-     const nestedBreak=selected.some(s=>ix.nodes.some(x=>x.type==='BreakStatement'&&x.start>=s.start&&x.end<=s.end));
+     const selectedStatements=new Set(selected),excludedBindings=new Set();
+     const collectExcludedBindings=root=>{
+      const pending=[root];
+      while(pending.length){
+       const node=pending.pop();
+       if(['VariableDeclarator','ClassDeclaration','FunctionDeclaration'].includes(node.type))for(const binding of patternBindings(node.id))if(binding)excludedBindings.add(binding);
+       for(const [,child] of children(node))pending.push(child);
+      }
+     };
+     for(const branch of n.cases)for(const statement of branch.consequent)if(!selectedStatements.has(statement))collectExcludedBindings(statement);
+     const insideExcludedCode=ref=>ref.start>=n.start&&ref.end<=n.end&&!selected.some(s=>ref.start>=s.start&&ref.end<=s.end);
+     const excludedReferences=[...excludedBindings].some(binding=>binding.refs.some(ref=>!insideExcludedCode(ref)));
+     const containsBreak=root=>{
+      const pending=[root];
+      while(pending.length){
+       const node=pending.pop();if(node.type==='BreakStatement')return true;
+       for(const [,child] of children(node))pending.push(child);
+      }
+      return false;
+     };
+     const nestedBreak=selected.some(containsBreak);
      if(!excludedReferences&&!nestedBreak)return '{'+sequence.slice(0,-1).map(e=>render(e)+';').join('')+selected.map(render).join('\n')+'}';
     }
    }

@@ -97,16 +97,22 @@ export function patch(source,n,render){
  let cs=children(n).map(([,c])=>c);
  if(!cs.length)return source.slice(n.start,n.end);
  if(cs.length>1){const spans=new Set();cs=cs.filter(c=>{const span=c.start+':'+c.end;if(spans.has(span))return false;spans.add(span);return true;}).sort((a,b)=>a.start-b.start);}
- let out='',pos=n.start;
- const join=(left,right)=>{
+ const chunks=[];let pos=n.start,last='',integerTail=false;
+ const word=/[\p{L}\p{N}_$]/u;
+ const join=right=>{
+  if(!right)return;
   // Replacements can remove the punctuation separating lexical tokens:
   // return!flag -> returnfalse, or !flag.toString -> 0.toString.
-  if(n.type==='TemplateLiteral')return left+right;
-  const a=left.at(-1)||'',b=right[0]||'';
-  return left+((/[\p{L}\p{N}_$]/u.test(a)&&/[\p{L}\p{N}_$]/u.test(b)||b==='.'&&/(?:^|[^\p{L}\p{N}_$])\d+$/u.test(left))?' ':'')+right;
+  const first=right[0]||'';
+  if(n.type!=='TemplateLiteral'&&(word.test(last)&&word.test(first)||first==='.'&&integerTail)){chunks.push(' ');last=' ';integerTail=false;}
+  chunks.push(right);
+  const digits=/\d+$/u.exec(right),before=digits?(digits.index?right[digits.index-1]:last):'';
+  integerTail=!!digits&&(!before||!word.test(before));
+  last=right.at(-1)||last;
  };
- for(const c of cs){if(c.start<pos)continue;out=join(join(out,source.slice(pos,c.start)),render(c));pos=c.end;}
- return join(out,source.slice(pos,n.end));
+ for(const c of cs){if(c.start<pos)continue;join(source.slice(pos,c.start));join(render(c));pos=c.end;}
+ join(source.slice(pos,n.end));
+ return chunks.join('');
 }
 
 // Prove that entering a closed function/reference cannot precede a root

@@ -639,11 +639,29 @@ function plans(ix,source,format){
 
 export function foldTargetEnvironments(source,format){
  const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true})),replace=new WeakMap();
+ const {parents}=ix;
+ const classReceiverThis=(node,cls)=>{
+  let owner=parents.get(node);
+  while(owner&&owner!==cls){
+   if(owner.type==='ArrowFunctionExpression'){owner=parents.get(owner);continue;}
+   if(functions.has(owner.type)){
+    const method=parents.get(owner);
+    return method?.type==='MethodDefinition'&&method.value===owner&&parents.get(parents.get(method))===cls;
+   }
+   owner=parents.get(owner);
+  }
+  return owner===cls;
+ };
  for(const {cls,methods,instances,known,fields,constructorReachable} of plans(ix,source,format)){
-  for(const n of ix.nodes)if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&!n.arguments.length&&known.has(property(n.callee))&&
-    (n.start>=cls.start&&n.end<=cls.end&&n.callee.object.type==='ThisExpression'||instances.has(ix.bindings.get(n.callee.object))))replace.set(n,JSON.stringify(known.get(property(n.callee))));
-  for(const n of ix.nodes)if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&fields?.has(property(n))&&!(ix.parents.get(n)?.type==='AssignmentExpression'&&ix.parents.get(n).left===n)){
-   let method=ix.parents.get(n);while(method&&method.type!=='MethodDefinition'&&method!==cls)method=ix.parents.get(method);
+  const classNodes=index(cls).nodes;
+  for(const n of classNodes)if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&!n.arguments.length&&known.has(property(n.callee))&&
+    n.callee.object.type==='ThisExpression'&&classReceiverThis(n.callee.object,cls))replace.set(n,JSON.stringify(known.get(property(n.callee))));
+  for(const instance of instances)for(const ref of instance.refs){
+   const member=parents.get(ref),call=parents.get(member),name=property(member);
+   if(member?.type==='MemberExpression'&&member.object===ref&&call?.type==='CallExpression'&&call.callee===member&&!call.arguments.length&&known.has(name))replace.set(call,JSON.stringify(known.get(name)));
+  }
+  for(const n of classNodes)if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&classReceiverThis(n.object,cls)&&fields?.has(property(n))&&!(parents.get(n)?.type==='AssignmentExpression'&&parents.get(n).left===n)){
+   let method=parents.get(n);while(method&&method.type!=='MethodDefinition'&&method!==cls)method=parents.get(method);
    if(method?.type==='MethodDefinition'&&method.kind==='method'&&!constructorReachable.has(key(method)))replace.set(n,JSON.stringify(fields.get(property(n))));
   }
  }
