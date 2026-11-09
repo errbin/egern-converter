@@ -457,6 +457,13 @@ const KS_SHELL_CALL='c4c789a203acb298828facda8a77d7a48093e896bf51a3645d67f91615f
 const LIMIT=5000;
 const fail=why=>{throw Error('混淆字符串表静态解析：'+why);};
 
+// 无密钥调用（如轮转校验和里的 aD(0x2da)）只需 Base64 还原：混淆器在不带密钥时跳过 RC4 步骤。
+function decodeBase64Alphabet(encoded,alphabet){
+ if(typeof encoded!=='string'||encoded.length>65536)fail('密文或密钥超出边界');
+ let acc=0,step=0;const bytes=[];
+ for(const ch of encoded){const v=alphabet.indexOf(ch);if(v<0)fail('密文不符合已审查的 Base64 字母表');acc=step%4?acc*64+v:v;if(step++%4)bytes.push(acc>>(-2*step&6)&255);}
+ return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(Uint8Array.from(bytes));
+}
 function decodeRC4(encoded,key,alphabet,atob=false){
  if(typeof encoded!=='string'||typeof key!=='string'||!key||encoded.length>65536||key.length>256)fail('密文或密钥超出边界');
  const bytes=[];
@@ -511,13 +518,13 @@ function cachedRotationShape(call,ix,tableBinding){
  const scan=ix.nodes.filter(n=>n.start>=def.start&&n.end<=def.end);
  return scan.some(n=>n.type==='WhileStatement')&&scan.some(n=>n.type==='TryStatement');
 }
-function collect(source,variant){
+function collect(source,variant,only){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),{nodes,parents,bindings}=ix;
  const decoderHash=variant==='ks'?KS_DECODER:PDD_DECODER;
- const decoders=nodes.filter(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===decoderHash||(variant==='ks'&&cachedDecoderShape(n,ix))));
+ const decoders=nodes.filter(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===decoderHash||(variant==='ks'&&cachedDecoderShape(n,ix)))&&(!only||n.id?.name===only));
  if(decoders.length!==1)fail('已识别标记，但解码器语法数量不唯一');
  const decoder=decoders[0],decoderBinding=bindings.get(decoder.id);
- let tableBinding,tableFactory=null,values,offset=0,rotationCall,rotationFn,rotationStatement,rotationSteps=0;
+ let tableBinding,tableFactory=null,values,offset=0,rotationCall,rotationFn,rotationStatement,rotationSteps=0,alphabet=null,shells=new Set();
  if(variant==='ks'){
   const first=decoder.body.body[0],factory=first?.type==='VariableDeclaration'&&first.declarations.length===1?first.declarations[0].init:null;
   tableFactory=factory?.type==='CallExpression'&&!factory.arguments.length&&functions.has(bindings.get(factory.callee)?.init?.type)?bindings.get(factory.callee).init:null;
@@ -533,7 +540,10 @@ function collect(source,variant){
   rotationCall=matches[0];rotationFn=rotationCall.callee;
   if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
   rotationStatement=topStatement(rotationCall,parents,tree);
-  rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source);
+  alphabet=decoderAlphabet(decoder);
+  // 共用同一表工厂的同形外壳（如 a0d 与 a0e）共享偏移与表，按解码器身份求值
+  shells=new Set(nodes.filter(n=>n!==decoder&&functions.has(n.type)&&!n.async&&!n.generator&&cachedDecoderShape(n,ix)&&tableFactoryName(n,ix)===tableFactory?.id?.name));
+  rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells);
  }else{
   if(!source.includes('jsjiami.com.v6'))fail('缺少 jsjiami v6 哨兵');
   const d=decoder.body.body.find(n=>n.type==='VariableDeclaration'&&n.declarations.some(x=>x.id.name==='_0x20ec07'))?.declarations.find(x=>x.id.name==='_0x20ec07');
@@ -550,7 +560,7 @@ function collect(source,variant){
   rotationSteps=rotatePdd(rotationFn,values,ix,source);
  }
  if(values.length<3||values.length>LIMIT||values.some(v=>typeof v!=='string')||values.reduce((n,v)=>n+v.length,0)>1048576)fail('字符串表为空或超过静态边界');
- return {tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationCall,rotationFn,rotationStatement,rotationSteps,variant};
+ return {tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationCall,rotationFn,rotationStatement,rotationSteps,variant,alphabet,shells};
 }
 
 function literalArray(array,ix,source){
@@ -572,13 +582,15 @@ function number(n,depth=0){
 }
 function topStatement(n,parents,tree){let child=n,p=parents.get(n);while(p&&p!==tree){child=p;p=parents.get(child);}return p===tree?child:null;}
 
-function rotateKS(fn,call,values,decoder,offset,ix,source){
+function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
  const target=number(call.arguments[1]),loop=ix.nodes.find(n=>n.type==='TryStatement'&&n.start>=fn.start&&n.end<=fn.end),checksum=loop?.block.body[0]?.declarations?.[0]?.init;
  if(!Number.isFinite(target)||!checksum||!ix.nodes.some(n=>n.type==='WhileStatement'&&n.start>=fn.start&&n.end<=fn.end))fail('js-obfuscator 校验循环不匹配');
  const wrappers=decoderWrappers(ix,decoder);
+ // 轮转校验和可能经由同族外壳或本地别名调用解码器，先把外壳并入可解析集合
+ if(shells)for(const shell of shells)wrappers.add(shell);
  for(let i=0;i<values.length;i++){
-  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks'});if(checksumValue===target)return i;}
-  catch{}
+  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks',alphabet,shells});if(checksumValue===target)return i;if(process.env.EGERN_DEBUG_ROT&&i<2)console.error('DBG checksum',i,checksumValue,'target',target);}
+  catch(error){if(process.env.EGERN_DEBUG_ROT&&i<2)console.error('DBG eval error',i,String(error.message).slice(0,90),'wrappers',wrappers.size,'shells',shells?.size);}
   values.push(values.shift());
  }
  fail('js-obfuscator 轮转校验在一轮内没有匹配');
@@ -622,6 +634,27 @@ function functionFor(n,ix){
  }
  return null;
 }
+// 从已审查解码器内部读取 base64 字母表：混淆器会打乱字母表顺序，
+// 硬编码会导致解码值与轮转校验和整体错位。字母表必须唯一。
+function decoderAlphabet(decoder){
+ const found=[];
+ (function walk(n){
+  if(!n||typeof n!=='object')return;
+  if(Array.isArray(n)){n.forEach(walk);return;}
+  if(n.type==='Literal'&&typeof n.value==='string'&&n.value.length===65&&/^[A-Za-z0-9+/=]{65}$/.test(n.value))found.push(n.value);
+  for(const k of Object.keys(n)){if(['type','start','end'].includes(k))continue;const v=n[k];if(v&&typeof v==='object')walk(v);}
+ })(decoder);
+ if(!found.length)return null;
+ if(found.some(a=>a!==found[0]))fail('解码器内部字母表不唯一');
+ return found[0];
+}
+// 解析调用目标：允许沿本地别名（var aD=a0e / var aQ=a0d）解析到已确认的解码器或外壳，
+// 别名链最多 4 跳；不在已确认集合内的目标一律返回 null，交由调用方拒绝。
+function resolveCallable(callee,ix,wrappers){
+ let fn=functionFor(callee,ix);
+ for(let hop=0;hop<4&&fn&&fn.type==='Identifier';hop++){const next=functionFor(fn,ix);if(!next||next===fn)break;fn=next;}
+ return fn&&wrappers.has(fn)?fn:null;
+}
 function decoderWrappers(ix,decoder){
  const known=new Set([decoder]);let changed=true;
  while(changed){changed=false;for(const fn of ix.nodes.filter(n=>functions.has(n.type))){
@@ -651,6 +684,8 @@ function evaluate(n,env,ctx,depth=0){
   const b=ix.bindings.get(n);if(env.has(b))return env.get(b);
   if(ix.free(n,'undefined'))return undefined;
   const fn=b?.fn??b?.init;if(fn&&wrappers.has(fn))return fn;
+  // 轮转语句内常见 var aD=a0e 形式的本地别名：沿一层别名解析到已确认的解码器/包装器
+  if(fn?.type==='Identifier'){const target=functionFor(fn,ix);if(target&&wrappers.has(target))return target;}
   if(b?.init?.type==='Literal')return b.init.value;
   throw Error('unknown identifier '+n.name);
  }
@@ -665,14 +700,17 @@ function evaluate(n,env,ctx,depth=0){
  }
  if(n.type==='CallExpression'){
   if(n.callee.type==='Identifier'&&ix.free(n.callee,'parseInt'))return Number.parseInt(evaluate(n.arguments[0],env,ctx,depth+1),n.arguments[1]?evaluate(n.arguments[1],env,ctx,depth+1):undefined);
-  const fn=functionFor(n.callee,ix);if(!fn||!wrappers.has(fn))throw Error('unreviewed call');
+  const fn=resolveCallable(n.callee,ix,wrappers);if(!fn)throw Error('unreviewed call');
   const callArgs=n.arguments.map(a=>evaluate(a,env,ctx,depth+1));
-  if(fn===decoder){
+  if(fn===decoder||(ctx.shells&&ctx.shells.has(fn))){
    let index;
    if(variant==='ks')index=Number(callArgs[0])-offset;
   else{const raw=callArgs[0],marker=typeof raw==='string'?raw.charCodeAt(0):0;if(typeof raw!=='string'||marker<0x202a||marker>0x202e||!/^[0-9a-f]+$/i.test(raw.slice(1)))throw Error('v6 lookup index is not a bidi-prefixed hex literal');index=Number.parseInt('0x'+raw.slice(1));}
    if(!Number.isInteger(index)||index<0||index>=values.length)throw Error('lookup outside rotated table');
-   return decodeRC4(values[index],callArgs[1],variant==='ks'?'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=':'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=',variant==='pdd');
+   const ksAlphabet=variant==='ks'?(ctx.alphabet||'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='):'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+   // 无密钥调用走 Base64 还原；有密钥时按既有 RC4 路径
+   if(variant==='ks'&&(callArgs[1]===undefined||callArgs[1]===null))return decodeBase64Alphabet(values[index],ksAlphabet);
+   return decodeRC4(values[index],callArgs[1],ksAlphabet,variant==='pdd');
   }
   const returned=fn.body.type==='BlockStatement'?fn.body.body[0]?.argument:fn.body;
   if(fn.params.length!==callArgs.length)throw Error('wrapper arity differs');
@@ -682,17 +720,64 @@ function evaluate(n,env,ctx,depth=0){
  throw Error('unreviewed expression '+n.type);
 }
 
+// 收集可识别的解码器候选：哈希契约与结构识别并列，仅用于收敛，不产生信任。
+function decoderCandidates(source){
+ const scan=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
+ const seen=new Set(),out=[];
+ for(const n of scan.nodes){
+  if(n.type!=='FunctionDeclaration')continue;
+  if(methodContract(n)!==KS_DECODER&&!cachedDecoderShape(n,scan))continue;
+  // 共用同一张表工厂的外壳属于同一个解码器族，只取首个作为族代表，避免重复折叠
+  const factory=tableFactoryName(n,scan),id=factory??n.id?.name;
+  if(!id||seen.has(id))continue;
+  seen.add(id);
+  out.push({name:n.id?.name,key:id});
+ }
+ return out;
+}
+function tableFactoryName(fn,ix){
+ const first=fn.body?.body?.[0];
+ if(first?.type!=='VariableDeclaration'||first.declarations.length!==1)return null;
+ const init=first.declarations[0].init;
+ return init?.type==='CallExpression'&&init.callee.type==='Identifier'?init.callee.name:null;
+}
+const MAX_DECODERS=8;
+// 多解码器族：逐族折叠，每次重新解析；任一族校验失败即整体拒绝，不做部分折叠。
 export function lowerObfuscatedTables(source){
+ let current=source,transformations=[];
+ const done=new Set();
+ for(let guard=0;guard<=MAX_DECODERS;guard++){
+  // 已处理的解码器族（按表工厂去重）不再重复折叠，避免同表外壳被二次当成新族
+  const candidates=decoderCandidates(current).filter(c=>!done.has(c.key));
+  if(!candidates.length)break;
+  if(guard===MAX_DECODERS)fail('解码器族数量超过静态上限');
+  done.add(candidates[0].key);
+  const result=foldObfuscatedTables(current,candidates[0].name);
+  transformations.push(...result.transformations);
+  if(!result.transformations.length)break;
+  current=result.source;
+ }
+ return {source:current,transformations};
+}
+function foldObfuscatedTables(source,only){
  const initial=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),scan=index(initial);
  const ks=scan.nodes.some(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===KS_DECODER||cachedDecoderShape(n,scan))),pdd=source.includes('jsjiami.com.v6');
  if(!ks&&!pdd)return {source,transformations:[]};
  if(ks&&pdd)fail('一个文件包含多个不兼容的表格式');
- const data=collect(source,ks?'ks':'pdd'),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant}=data;
+ const data=collect(source,ks?'ks':'pdd',only),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant}=data;
  const wrappers=decoderWrappers(ix,decoder),replace=new Map(),removed=new WeakSet(),removedRanges=[];
+ const alphabet=data.alphabet,shells=data.shells;
+ // 共用同一表工厂的同形外壳共享解码器身份：并入 wrapper 集合，保证轮转校验和经由任一外壳都能静态求值
+ const factoryName=tableFactoryName(decoder,ix);
+ for(const fn of nodes){
+  if(fn===decoder||!functions.has(fn.type)||fn.async||fn.generator)continue;
+  if(!cachedDecoderShape(fn,ix)||tableFactoryName(fn,ix)!==factoryName)continue;
+  wrappers.add(fn);
+ }
  const isRemoved=n=>removedRanges.some(r=>n.start>=r.start&&n.end<=r.end);
  for(const n of nodes){
-  if(n.type!=='CallExpression')continue;const fn=functionFor(n.callee,ix);if(!fn||!wrappers.has(fn))continue;
-  try{const value=evaluate(n,new Map(),{ix,values,offset,decoder,wrappers,variant});if(typeof value==='string')replace.set(n,JSON.stringify(value));}
+  if(n.type!=='CallExpression')continue;const fn=resolveCallable(n.callee,ix,wrappers);if(!fn)continue;
+  try{const value=evaluate(n,new Map(),{ix,values,offset,decoder,wrappers,variant,alphabet,shells});if(typeof value==='string')replace.set(n,JSON.stringify(value));}
   catch(error){if(fn===decoder||wrappers.has(fn)){
     const inShell=rotationStatement&&n.start>=rotationStatement.start&&n.end<=rotationStatement.end;
     if(!inShell&&variant==='pdd'&&n.start<decoder.start)continue;
