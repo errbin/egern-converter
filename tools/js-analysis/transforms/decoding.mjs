@@ -475,10 +475,46 @@ function decodeRC4(encoded,key,alphabet,atob=false){
  return out;
 }
 
+// 结构识别：未列入哈希契约、但与已审查的"缓存式 RC4 解码器"同形。
+// 只负责把候选收敛掉；真正的证明仍由 collect 的后续严格检查（表工厂三段式、静态字符串表、
+// 常量偏移、唯一轮转且校验和数值可复算）完成，因此不构成放宽。
+function cachedDecoderShape(fn,ix){
+ if(fn?.type!=='FunctionDeclaration'||fn.params.length!==2||fn.params.some(p=>p.type!=='Identifier'))return false;
+ const body=fn.body?.body;if(body?.length!==2)return false;
+ const [decl,ret]=body;
+ if(decl.type!=='VariableDeclaration'||decl.declarations.length!==1)return false;
+ const init=decl.declarations[0].init;
+ if(init?.type!=='CallExpression'||init.arguments.length||init.callee.type!=='Identifier')return false;
+ const factory=ix.bindings.get(init.callee)?.init;
+ if(factory?.type!=='FunctionDeclaration'||factory.body.body.length!==3)return false;
+ if(ret.type!=='ReturnStatement'||ret.argument?.type!=='SequenceExpression')return false;
+ const assign=ret.argument.expressions?.[0];
+ if(assign?.type!=='AssignmentExpression'||assign.operator!=='='||assign.left.type!=='Identifier'||assign.left.name!==fn.id?.name)return false;
+ const inner=assign.right;
+ if(inner?.type!=='FunctionExpression'||inner.params.length!==2)return false;
+ const first=inner.body?.body?.[0]?.expression;
+ if(first?.type!=='AssignmentExpression'||first.operator!=='=')return false;
+ if(first.left.type!=='Identifier'||first.right?.type!=='BinaryExpression'||first.right.operator!=='-')return false;
+ if(first.right.right.type!=='Literal'||!Number.isInteger(first.right.right.value))return false;
+ // 内层第二步必须是本地表的成员读取，保证后续 evaluate 的表来源唯一
+ const second=inner.body.body[1];
+ return second?.type==='VariableDeclaration'&&second.declarations.length===1;
+}
+// 轮转调用的结构识别：两参、首参绑定到本地表工厂、被调函数体含 while 与 try。
+// 轮转步数仍由 rotateKS 用校验和数值复算确认，结构匹配本身不产生信任。
+function cachedRotationShape(call,ix,tableBinding){
+ if(call.type!=='CallExpression'||call.arguments.length!==2)return false;
+ const arg=call.arguments[0];
+ if(arg.type!=='Identifier'||ix.bindings.get(arg)!==tableBinding)return false;
+ const fn=call.callee,def=fn.type==='FunctionExpression'||fn.type==='FunctionDeclaration'?fn:ix.bindings.get(fn)?.init;
+ if(!def||!['FunctionExpression','FunctionDeclaration'].includes(def.type))return false;
+ const scan=ix.nodes.filter(n=>n.start>=def.start&&n.end<=def.end);
+ return scan.some(n=>n.type==='WhileStatement')&&scan.some(n=>n.type==='TryStatement');
+}
 function collect(source,variant){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),{nodes,parents,bindings}=ix;
  const decoderHash=variant==='ks'?KS_DECODER:PDD_DECODER;
- const decoders=nodes.filter(n=>n.type==='FunctionDeclaration'&&methodContract(n)===decoderHash);
+ const decoders=nodes.filter(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===decoderHash||(variant==='ks'&&cachedDecoderShape(n,ix))));
  if(decoders.length!==1)fail('已识别标记，但解码器语法数量不唯一');
  const decoder=decoders[0],decoderBinding=bindings.get(decoder.id);
  let tableBinding,tableFactory=null,values,offset=0,rotationCall,rotationFn,rotationStatement,rotationSteps=0;
@@ -492,7 +528,7 @@ function collect(source,variant){
   const inner=assignment?.type==='AssignmentExpression'?assignment.right:null,sub=inner?.type==='FunctionExpression'?inner.body.body[0]?.expression:null;
   if(sub?.type!=='AssignmentExpression'||sub.operator!=='='||sub.right.type!=='BinaryExpression'||sub.right.operator!=='-'||sub.right.left.type!=='Identifier')fail('解码器索引没有固定偏移');
   offset=number(sub.right.right);if(!Number.isInteger(offset))fail('解码器偏移不是常量');
-  const matches=nodes.filter(n=>n.type==='CallExpression'&&functions.has(n.callee.type)&&methodContract(n.callee,new Set([decoder.id.name,tableFactory.id.name]))===KS_ROTATION);
+  const matches=nodes.filter(n=>n.type==='CallExpression'&&functions.has(n.callee.type)&&(methodContract(n.callee,new Set([decoder.id.name,tableFactory.id.name]))===KS_ROTATION||cachedRotationShape(n,ix,tableBinding)));
   if(matches.length!==1)fail('字符串表轮转语法数量不唯一');
   rotationCall=matches[0];rotationFn=rotationCall.callee;
   if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
@@ -648,7 +684,7 @@ function evaluate(n,env,ctx,depth=0){
 
 export function lowerObfuscatedTables(source){
  const initial=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),scan=index(initial);
- const ks=scan.nodes.some(n=>n.type==='FunctionDeclaration'&&methodContract(n)===KS_DECODER),pdd=source.includes('jsjiami.com.v6');
+ const ks=scan.nodes.some(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===KS_DECODER||cachedDecoderShape(n,scan))),pdd=source.includes('jsjiami.com.v6');
  if(!ks&&!pdd)return {source,transformations:[]};
  if(ks&&pdd)fail('一个文件包含多个不兼容的表格式');
  const data=collect(source,ks?'ks':'pdd'),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant}=data;
