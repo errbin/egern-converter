@@ -26,29 +26,44 @@ export function index(tree){
   if(n.type==='ArrayPattern')return n.elements.forEach(c=>bind(c,s));
   if(n.type==='ObjectPattern')return n.properties.forEach(c=>bind(c.type==='RestElement'?c.argument:c.value,s));
  }
- function visit(n,s,owner=tree,p=null,k=''){
-  parents.set(n,p);nodes.push(n);
-  const switchParent=n.type==='SwitchStatement'?s:null;
-  if(n.type==='FunctionDeclaration')bind(n.id,s,n,n);
-  if(n.type==='ClassDeclaration')bind(n.id,s,n);
-  if(n.type==='ClassExpression'){s={parent:s,names:new Map(),fn:false};bind(n.id,s,n);}
-  if(functions.has(n.type)){owner=n;s={parent:s,names:new Map(),fn:true};if(n.type!=='FunctionDeclaration')bind(n.id,s,n,n);n.params.forEach(x=>bind(x,s));}
-  else if(['BlockStatement','CatchClause','ForStatement','ForInStatement','ForOfStatement','SwitchStatement'].includes(n.type))s={parent:s,names:new Map(),fn:false};
-  scopes.set(n,s);owners.set(n,owner);
-  if(n.type==='CatchClause')bind(n.param,s);
-  if(n.type==='VariableDeclaration'){let target=s;if(n.kind==='var')while(!target.fn)target=target.parent;for(const d of n.declarations)bind(d.id,target,d.init,functions.has(d.init?.type)?d.init:null);}
-  if(n.type==='SwitchStatement'){
-   // The discriminant and case tests run outside the switch's lexical case
-   // scope; only case consequents see lexical declarations from the switch.
-   for(const [ck,c]of children(n)){
-    if(ck==='discriminant')visit(c,switchParent,owner,n,ck);
-    else if(ck==='cases'){
-     parents.set(c,n);nodes.push(c);scopes.set(c,s);owners.set(c,owner);
-     if(c.test)visit(c.test,switchParent,owner,c,'test');
-     for(const statement of c.consequent)visit(statement,s,owner,c,'consequent');
-    }
+ function visit(rootNode,rootScope,rootOwner=tree,p=null,k=''){
+  // Real-world bundled scripts can contain very deep expression and block
+  // trees. Keep the pre-order indexing and switch-scope rules while avoiding
+  // a JavaScript call frame for every AST level.
+  const pending=[{kind:'node',n:rootNode,s:rootScope,owner:rootOwner,p,k}];
+  while(pending.length){
+   const frame=pending.pop();
+   if(frame.kind==='case'){
+    const {n,c,s,owner,switchParent}=frame;
+    parents.set(c,n);nodes.push(c);scopes.set(c,s);owners.set(c,owner);
+    const next=[];
+    if(c.test)next.push({kind:'node',n:c.test,s:switchParent,owner,p:c,k:'test'});
+    for(const statement of c.consequent)next.push({kind:'node',n:statement,s,owner,p:c,k:'consequent'});
+    for(let i=next.length-1;i>=0;i--)pending.push(next[i]);
+    continue;
    }
-  }else for(const [ck,c]of children(n))visit(c,s,owner,n,ck);
+   const {n,p:parent,k:key}=frame;let {s,owner}=frame;
+   parents.set(n,parent);nodes.push(n);
+   const switchParent=n.type==='SwitchStatement'?s:null;
+   if(n.type==='FunctionDeclaration')bind(n.id,s,n,n);
+   if(n.type==='ClassDeclaration')bind(n.id,s,n);
+   if(n.type==='ClassExpression'){s={parent:s,names:new Map(),fn:false};bind(n.id,s,n);}
+   if(functions.has(n.type)){owner=n;s={parent:s,names:new Map(),fn:true};if(n.type!=='FunctionDeclaration')bind(n.id,s,n,n);n.params.forEach(x=>bind(x,s));}
+   else if(['BlockStatement','CatchClause','ForStatement','ForInStatement','ForOfStatement','SwitchStatement'].includes(n.type))s={parent:s,names:new Map(),fn:false};
+   scopes.set(n,s);owners.set(n,owner);
+   if(n.type==='CatchClause')bind(n.param,s);
+   if(n.type==='VariableDeclaration'){let target=s;if(n.kind==='var')while(!target.fn)target=target.parent;for(const d of n.declarations)bind(d.id,target,d.init,functions.has(d.init?.type)?d.init:null);}
+   const next=[];
+   if(n.type==='SwitchStatement'){
+    // The discriminant and case tests run outside the switch's lexical case
+    // scope; only case consequents see declarations from the switch.
+    for(const [ck,c]of children(n)){
+     if(ck==='discriminant')next.push({kind:'node',n:c,s:switchParent,owner,p:n,k:ck});
+     else if(ck==='cases')next.push({kind:'case',n,c,s,owner,switchParent});
+    }
+   }else for(const [ck,c]of children(n))next.push({kind:'node',n:c,s,owner,p:n,k:ck});
+   for(let i=next.length-1;i>=0;i--)pending.push(next[i]);
+  }
  }
  visit(tree,root);
  function reference(n){
@@ -114,6 +129,22 @@ export function patch(source,n,render){
  join(source.slice(pos,n.end));
  return chunks.join('');
 }
+export function renderTree(source,root,resolve=()=>null){
+ const values=new WeakMap(),stack=[{node:root,state:0}];
+ while(stack.length){
+  const frame=stack.at(-1),n=frame.node;
+  if(!frame.state){
+   const rule=resolve(n);
+   if(rule?.direct){values.set(n,rule.value);stack.pop();continue;}
+   frame.rule=rule;frame.children=rule?.children??children(n).map(([,child])=>child);frame.state=1;
+   for(let i=frame.children.length-1;i>=0;i--)stack.push({node:frame.children[i],state:0});
+   continue;
+  }
+  stack.pop();const rendered=child=>values.get(child);
+  values.set(n,frame.rule?.render?frame.rule.render(rendered):patch(source,n,rendered));
+ }
+ return values.get(root);
+}
 
 // Prove that entering a closed function/reference cannot precede a root
 // initializer. Function expressions exist only after their creation point;
@@ -127,33 +158,76 @@ export function initializedAfter(ix,statement,ref){
   while(child&&parents.get(child)!==block)child=parents.get(child);
   return !!child&&child!==statement&&child.start>=statement.end;
  }
- function after(n,seen){
-  const owner=owners.get(n);if(owner!==tree)return entered(owner,seen);
-  if(followsInContainingBlock(n))return true;
-  while(parents.get(n)&&parents.get(n)!==tree)n=parents.get(n);
-  return parents.get(n)===tree&&n.start>=statement.end;
+ function functionReferences(fn,parent){
+  const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),b=bindings.get(id);
+  if(!b||b.writes.length)return null;
+  const refs=[...b.refs,...(ix.evaluationReferences?.get(b)??[])];
+  if(!refs.length||ix.functionAndVariableDeclarations.get(b)!==1)return null;
+  return refs;
  }
- function entered(fn,seen){
-  if(!functions.has(fn?.type))return false;
-  // A recursion edge adds no earlier entry. Every incoming edge outside the
-  // current component must still be dominated by the initializer.
-  if(seen.has(fn))return true;
-  const next=new Set(seen);next.add(fn);const p=parents.get(fn);
-  // A method of a closed root class cannot run before any reference creating
-  // its receiver. Prototype/static escapes are deliberately not admitted.
-  if(p?.type==='MethodDefinition'){
-   if(p.static)return false;
-   const cls=parents.get(parents.get(p)),b=cls?.type==='ClassDeclaration'?bindings.get(cls.id):null;
-   if(!b||b.writes.length||!b.refs.length||ix.classDeclarations.get(b)!==1)return false;
-   return b.refs.every(r=>{const use=parents.get(r);return use?.type==='NewExpression'&&use.callee===r&&after(r,next);});
+ // Follow the closed call graph with explicit frames. Large bundled scripts
+ // can contain thousands of chained helpers; recursive proof traversal must
+ // not turn a valid dominance check into a JavaScript call-stack failure.
+ const active=new Set(),stack=[{kind:'after',node:ref,state:'start'}];let answer=false;
+ function complete(value){
+  const done=stack.pop();if(done.kind==='entered'&&done.active)active.delete(done.fn);
+  const parent=stack.at(-1);if(parent){parent.childValue=value;parent.hasChildValue=true;}else answer=value;
+ }
+ while(stack.length){
+  const frame=stack.at(-1);
+  if(frame.kind==='after'){
+   if(frame.state==='waiting'){
+    const value=frame.childValue;complete(value);continue;
+   }
+   const owner=owners.get(frame.node);
+   if(owner!==tree){frame.state='waiting';stack.push({kind:'entered',fn:owner,state:'start'});continue;}
+   let n=frame.node;
+   if(followsInContainingBlock(n)){complete(true);continue;}
+   while(parents.get(n)&&parents.get(n)!==tree)n=parents.get(n);
+   complete(parents.get(n)===tree&&n.start>=statement.end);continue;
   }
-  if(fn.type!=='FunctionDeclaration'&&after(p,next))return true;
-  const id=fn.id??(p?.type==='VariableDeclarator'?p.id:null),b=bindings.get(id);if(!b||b.writes.length)return false;
-  const refs=[...b.refs,...(ix.evaluationReferences?.get(b)??[])];if(!refs.length)return false;
-  if(ix.functionAndVariableDeclarations.get(b)!==1)return false;
-  return refs.every(r=>after(r,next));
+  if(frame.state==='start'){
+   const fn=frame.fn;
+   if(!functions.has(fn?.type)){complete(false);continue;}
+   // A recursion edge adds no earlier entry. Incoming edges outside the
+   // active component still have to be dominated by the initializer.
+   if(active.has(fn)){complete(true);continue;}
+   active.add(fn);frame.active=true;
+   const parent=parents.get(fn);
+   // A method of a closed root class cannot run before a reference creating
+   // its receiver. Prototype/static escapes are deliberately not admitted.
+   if(parent?.type==='MethodDefinition'){
+    if(parent.static){complete(false);continue;}
+    const cls=parents.get(parents.get(parent)),b=cls?.type==='ClassDeclaration'?bindings.get(cls.id):null;
+    if(!b||b.writes.length||!b.refs.length||ix.classDeclarations.get(b)!==1||
+       !b.refs.every(r=>{const use=parents.get(r);return use?.type==='NewExpression'&&use.callee===r;})){
+     complete(false);continue;
+    }
+    frame.children=b.refs;frame.next=0;frame.state='all';continue;
+   }
+   if(fn.type!=='FunctionDeclaration'){
+    frame.state='expression';stack.push({kind:'after',node:parent,state:'start'});continue;
+   }
+   const refs=functionReferences(fn,parent);
+   if(!refs){complete(false);continue;}
+   frame.children=refs;frame.next=0;frame.state='all';continue;
+  }
+  if(frame.state==='expression'){
+   const afterCreation=frame.childValue;delete frame.childValue;frame.hasChildValue=false;
+   if(afterCreation){complete(true);continue;}
+   const refs=functionReferences(frame.fn,parents.get(frame.fn));
+   if(!refs){complete(false);continue;}
+   frame.children=refs;frame.next=0;frame.state='all';continue;
+  }
+  if(frame.state==='all'){
+   if(frame.hasChildValue){const value=frame.childValue;delete frame.childValue;frame.hasChildValue=false;
+    if(!value){complete(false);continue;}frame.next++;
+   }
+   if(frame.next>=frame.children.length){complete(true);continue;}
+   stack.push({kind:'after',node:frame.children[frame.next],state:'start'});continue;
+  }
  }
- return after(ref,new Set());
+ return answer;
 }
 // A case label only constrains its body when earlier cases cannot fall through.
 export function isolatedSwitchCase(ix,clause){

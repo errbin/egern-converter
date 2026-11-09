@@ -1,4 +1,4 @@
-import {children,patch,property,key,functions,initializedAfter,standardGlobals as builtin,index} from '../core/ast.mjs';
+import {children,patch,renderTree,property,key,functions,initializedAfter,standardGlobals as builtin,index} from '../core/ast.mjs';
 import {parse} from '../core/syntax.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 
@@ -407,29 +407,73 @@ export function completionStatements(source){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree);
  const done=n=>n?.type==='CallExpression'&&ix.free(n.callee,'$done');
  const http=n=>n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&ix.free(n.callee.object,'$httpClient')&&['get','post','put','delete','head','options','patch'].includes(property(n.callee));
- function contains(n){
-  if(done(n)||http(n))return true;
-  if(n.type==='SequenceExpression')return n.expressions.some(contains);
-  if(n.type==='ConditionalExpression')return !contains(n.test)&&(contains(n.consequent)||contains(n.alternate));
-  if(n.type==='LogicalExpression'&&['&&','||'].includes(n.operator))return !contains(n.left)&&contains(n.right);
-  return false;
- }
- function statements(n){
-  if(n.type==='SequenceExpression')return n.expressions.map(statements).join('\n');
-  if(n.type==='ConditionalExpression'&&contains(n))return `if (${render(n.test)}) {${statements(n.consequent)}} else {${statements(n.alternate)}}`;
-  if(n.type==='LogicalExpression'&&contains(n))return `if (${n.operator==='||'?'!('+render(n.left)+')':render(n.left)}) {${statements(n.right)}}`;
-  return render(n)+';';
- }
- function render(n){
-  if(n.type==='ReturnStatement'&&n.argument?.type==='ConditionalExpression'&&contains(n.argument)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end)){
-   const returned=e=>e.type==='ConditionalExpression'?`if (${render(e.test)}) {${returned(e.consequent)}} else {${returned(e.alternate)}}`:'return '+render(e)+';';
-   return '{'+returned(n.argument)+'}';
+ const containment=new WeakMap();
+ function contains(root){
+  if(!root)return false;
+  const stack=[{node:root,state:0}];
+  while(stack.length){
+   const frame=stack.at(-1),n=frame.node;
+   if(containment.has(n)){stack.pop();continue;}
+   if(!frame.state){
+    if(done(n)||http(n)){containment.set(n,true);stack.pop();continue;}
+    frame.children=n.type==='SequenceExpression'?n.expressions:n.type==='ConditionalExpression'?[n.test,n.consequent,n.alternate]:n.type==='LogicalExpression'&&['&&','||'].includes(n.operator)?[n.left,n.right]:[];
+    frame.state=1;
+    for(let i=frame.children.length-1;i>=0;i--){const child=frame.children[i];if(child&&!containment.has(child))stack.push({node:child,state:0});}
+    continue;
+   }
+   const has=node=>!!node&&containment.get(node)===true;
+   const result=n.type==='SequenceExpression'?n.expressions.some(has):n.type==='ConditionalExpression'?!has(n.test)&&(has(n.consequent)||has(n.alternate)):n.type==='LogicalExpression'&&['&&','||'].includes(n.operator)?!has(n.left)&&has(n.right):false;
+   containment.set(n,result);stack.pop();
   }
-  if(n.type==='ExpressionStatement'&&n.expression.type==='UnaryExpression'&&['!','void'].includes(n.expression.operator)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end&&(c.start<n.expression.argument.start||c.end>n.expression.argument.end)))return '{('+render(n.expression.argument)+');}';
-  if(n.type==='ExpressionStatement'&&contains(n.expression)&&!done(n.expression)&&!http(n.expression)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end))return '{'+statements(n.expression)+'}';
-  return patch(source,n,render);
+  return containment.get(root)===true;
  }
- return render(tree);
+ function flowNodes(root,mode){
+  const result=[],pending=[root];
+  while(pending.length){
+   const n=pending.pop();
+   if(mode==='statement'&&n.type==='SequenceExpression'){for(let i=n.expressions.length-1;i>=0;i--)pending.push(n.expressions[i]);continue;}
+   if(mode==='return'&&n.type==='ConditionalExpression'&&contains(n)||mode==='statement'&&n.type==='ConditionalExpression'&&contains(n)){
+    result.push(n.test);pending.push(n.alternate,n.consequent);continue;
+   }
+   if(mode==='statement'&&n.type==='LogicalExpression'&&contains(n)){result.push(n.left);pending.push(n.right);continue;}
+   result.push(n);
+  }
+  return result;
+ }
+ function flowText(root,child,mode){
+  const output=[],pending=[{kind:'node',node:root}];
+  while(pending.length){
+   const task=pending.pop();if(task.kind==='text'){output.push(task.value);continue;}
+   const n=task.node;
+   if(mode==='return'&&n.type==='ConditionalExpression'&&contains(n)){
+    pending.push({kind:'text',value:'}'},{kind:'node',node:n.alternate},{kind:'text',value:'} else {'},{kind:'node',node:n.consequent},{kind:'text',value:`if (${child(n.test)}) {`});continue;
+   }
+   if(mode==='return'){output.push('return '+child(n)+';');continue;}
+   if(n.type==='SequenceExpression'){
+    for(let i=n.expressions.length-1;i>=0;i--){pending.push({kind:'node',node:n.expressions[i]});if(i)pending.push({kind:'text',value:'\n'});}continue;
+   }
+   if(n.type==='ConditionalExpression'&&contains(n)){
+    pending.push({kind:'text',value:'}'},{kind:'node',node:n.alternate},{kind:'text',value:'} else {'},{kind:'node',node:n.consequent},{kind:'text',value:`if (${child(n.test)}) {`});continue;
+   }
+   if(n.type==='LogicalExpression'&&contains(n)){
+    pending.push({kind:'text',value:'}'},{kind:'node',node:n.right},{kind:'text',value:`if (${n.operator==='||'?'!('+child(n.left)+')':child(n.left)}) {`});continue;
+   }
+   output.push(child(n)+';');
+  }
+  return output.join('');
+ }
+ return renderTree(source,tree,n=>{
+  if(n.type==='ReturnStatement'&&n.argument?.type==='ConditionalExpression'&&contains(n.argument)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end)){
+   const argument=n.argument;return {children:flowNodes(argument,'return'),render:child=>'{'+flowText(argument,child,'return')+'}'};
+  }
+  if(n.type==='ExpressionStatement'&&n.expression.type==='UnaryExpression'&&['!','void'].includes(n.expression.operator)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end&&(c.start<n.expression.argument.start||c.end>n.expression.argument.end))){
+   const argument=n.expression.argument;return {children:[argument],render:child=>'{('+child(argument)+');}'};
+  }
+  if(n.type==='ExpressionStatement'&&contains(n.expression)&&!done(n.expression)&&!http(n.expression)&&!comments.some(c=>c.start>=n.start&&c.end<=n.end)){
+   const expression=n.expression;return {children:flowNodes(expression,'statement'),render:child=>'{'+flowText(expression,child,'statement')+'}'};
+  }
+  return null;
+ });
 }
 
 // A single root task may start before trailing scalar initializers. Awaiting

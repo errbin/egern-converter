@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,property,functions,key,children} from '../core/ast.mjs';
+import {index,patch,renderTree,property,functions,key,children} from '../core/ast.mjs';
 import {methodContract} from '../platform/clients.mjs';
 import {evaluationBindings} from './evaluation.mjs';
 
@@ -164,15 +164,15 @@ export function lowerLiteralStringTables(source){
   for(const decl of removable.values())removed.add(decl);
   if(count)transformations.push({kind:'literal-string-table',lookups:count,rotation_contract:methodContract(rotation.callee,roles),reason:'有界常量运算解析字符串；保留原始解码函数与初始化语句'});
  }
- const render=n=>{
-  if(removed.has(n))return '';
-  if(replace.has(n))return replace.get(n);
+ const render=n=>renderTree(source,n,node=>{
+  if(removed.has(node))return {direct:true,value:''};
+  if(replace.has(node))return {direct:true,value:replace.get(node)};
   // A literal computed method key has no effects. Exclude constructor: the
   // computed spelling denotes an ordinary method rather than a constructor.
-  const name=n.type==='MethodDefinition'&&n.computed?(replace.has(n.key)?JSON.parse(replace.get(n.key)):n.key.type==='Literal'?n.key.value:null):null;
-  if(typeof name==='string'&&name!=='constructor')return source.slice(n.start,n.key.start).replace(/\[\s*$/,'')+JSON.stringify(name)+source.slice(n.key.end,n.value.start).replace(/^\s*\]/,'')+render(n.value);
-  return patch(source,n,render);
- };
+  const name=node.type==='MethodDefinition'&&node.computed?(replace.has(node.key)?JSON.parse(replace.get(node.key)):node.key.type==='Literal'?node.key.value:null):null;
+  if(typeof name==='string'&&name!=='constructor')return {children:[node.value],render:child=>source.slice(node.start,node.key.start).replace(/\[\s*$/,'')+JSON.stringify(name)+source.slice(node.key.end,node.value.start).replace(/^\s*\]/,'')+child(node.value)};
+  return null;
+ });
  return {source:render(nodes[0]),transformations};
 }
 
@@ -441,12 +441,12 @@ export function lowerObfuscatedTables(source){
   if(!reads?.length)mark(d);
  }
  let count=0;for(const _ of replace.keys())count++;
- const render=n=>{
-  if(removed.has(n))return '';
-  if(replace.has(n))return replace.get(n);
-  if(n.type==='VariableDeclaration'&&n.declarations.some(removed.has.bind(removed))){const ds=n.declarations.filter(d=>!removed.has(d));return ds.length?`${n.kind} ${ds.map(render).join(', ')};`:'';}
-  if(n.type==='ObjectExpression'&&n.properties.some(removed.has.bind(removed)))return `{${n.properties.filter(p=>!removed.has(p)).map(render).join(', ')}}`;
-  return patch(source,n,render);
- };
+ const render=n=>renderTree(source,n,node=>{
+  if(removed.has(node))return {direct:true,value:''};
+  if(replace.has(node))return {direct:true,value:replace.get(node)};
+  if(node.type==='VariableDeclaration'&&node.declarations.some(removed.has.bind(removed))){const ds=node.declarations.filter(d=>!removed.has(d));return ds.length?{children:ds,render:child=>`${node.kind} ${ds.map(child).join(', ')};`}:{direct:true,value:''};}
+  if(node.type==='ObjectExpression'&&node.properties.some(removed.has.bind(removed))){const ps=node.properties.filter(p=>!removed.has(p));return {children:ps,render:child=>`{${ps.map(child).join(', ')}}`};}
+  return null;
+ });
  return {source:render(tree),transformations:[{kind:'obfuscator-literal-string-table',format:variant==='ks'?'javascript-obfuscator':'jsjiami-v6',lookups:count,rotation_steps:rotationSteps,reason:'仅用闭合 AST 常量计算解码字符串；业务语句保留自原始 AST'}]};
 }

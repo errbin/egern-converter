@@ -1,6 +1,6 @@
 import {parse} from '../core/syntax.mjs';
 import {createHash} from 'node:crypto';
-import {index,children,patch,property,key,functions} from '../core/ast.mjs';
+import {index,children,patch,renderTree,property,key,functions} from '../core/ast.mjs';
 
 // Reviewed, alpha-normalized method contracts; no file/author matching.
 export const contracts = {
@@ -581,7 +581,10 @@ export function lowerMagic(source){
   if(!valid||!planned.length)continue;
   removed.add(fn);for(const {decl,changes} of planned){removed.add(decl);for(const [n,value]of changes)replacements.set(n,value);}
  }
- function render(n){if(removed.has(n))return '';const r=replacements.get(n);return r?r():patch(source,n,render);}
+ function render(root){return renderTree(source,root,n=>{
+  if(removed.has(n))return {direct:true,value:''};
+  const r=replacements.get(n);return r?{direct:true,value:r()}:null;
+  });}
  return render(tree);
 }
 

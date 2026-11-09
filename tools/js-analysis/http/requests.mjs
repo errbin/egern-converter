@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,property,patch,key,functions,initializedAfter} from '../core/ast.mjs';
+import {index,property,patch,renderTree,key,functions,initializedAfter} from '../core/ast.mjs';
 import {methodContract} from '../platform/clients.mjs';
 
 // Inline only identity callback forwarders; retain all request/callback code.
@@ -41,8 +41,7 @@ export function lowerHTTPHelpers(source){
    replacements.set(id,'');replacements.set(value,'void 0');
   }
  }
- const render=n=>replacements.has(n)?replacements.get(n):patch(source,n,render);
- return render(tree);
+ return renderTree(source,tree,n=>replacements.has(n)?{direct:true,value:replacements.get(n)}:null);
 }
 
 // Reviewed allocation-only Request facade: its GET method borrows the owning
@@ -103,7 +102,8 @@ export function lowerHTTPDelegates(source){
    replace.set(n,`((${options}) => new Promise((resolve, reject) => this.get(${options}, (${error}, ${response}, ${body}) => ${error} ? reject({error: ${error}, resp: ${response}, data: ${body}}) : resolve({error: ${error}, resp: ${response}, data: ${body}}))))(${source.slice(input.start,input.end)})`);
   }
  }
- const render=n=>replace.has(n)?typeof replace.get(n)==='function'?replace.get(n)():replace.get(n):patch(source,n,render);return render(tree);
+ function render(root){return renderTree(source,root,n=>{if(!replace.has(n))return null;const value=replace.get(n);return {direct:true,value:typeof value==='function'?value():value};});}
+ return render(tree);
 }
 
 // Expose request fields of reviewed OpenAPI factories without replacing their
@@ -324,7 +324,7 @@ export function lowerHTTPFactoryFields(source,format){
    source_line:source.slice(0,fn.start).split('\n').length,call_sites:sites.length,fields:[...keys],ignored_request_fields:ignored,
    reason:'封闭调用点证明请求字段；保留原有合并、URL 处理、回调钩子与超时竞争'});
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
+ const render=n=>renderTree(source,n,node=>replace.has(node)?{direct:true,value:replace.get(node)}:null);
  const signatures=new Set(factories.map(fn=>methodContract(parse(render(fn),{ecmaVersion:'latest'}).body[0])));
  return {source:render(ix.nodes[0]),signatures,transformations};
 }
@@ -394,7 +394,7 @@ export function lowerSelectedHTTP(source){
    replace.set(parents.get(call),names.length===1?`${returned}$httpClient.${names[0]}(${args});`:names.map((method,i)=>`${i?i===names.length-1?'else ':'else if ':'if '}${i===names.length-1&&i?'':`(${d.id.name} === ${JSON.stringify(method)}) `}{ ${returned}$httpClient.${method}(${args}); }`).join(' '));
   }
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(ix.nodes[0]);
+ return renderTree(source,ix.nodes[0],n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 function lowerOne(source){
  const ix=index(parse(source,{ecmaVersion:'latest',allowAwaitOutsideFunction:true,allowReturnOutsideFunction:true})),replace=new WeakMap();
@@ -460,7 +460,10 @@ function lowerOne(source){
   // from hiding a nested replacement whose declaration was already removed.
   break;
  }
- const render=n=>{if(n.type==='ExpressionStatement'&&replace.has(n.expression))return ';'+render(n.expression)+';';return replace.has(n)?replace.get(n):patch(source,n,render);};return render(ix.nodes[0]);
+ return renderTree(source,ix.nodes[0],n=>{
+  if(n.type==='ExpressionStatement'&&replace.has(n.expression))return {children:[n.expression],render:child=>';'+child(n.expression)+';'};
+  return replace.has(n)?{direct:true,value:replace.get(n)}:null;
+ });
 }
 
 // Translate only the callback surface of an external Node `request` package

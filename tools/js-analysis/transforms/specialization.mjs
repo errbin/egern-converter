@@ -1,7 +1,7 @@
 import {pathSetterField} from '../http/requests.mjs';
 import {finiteLiteralMember} from '../analysis/values.mjs';
 import {parse} from '../core/syntax.mjs';
-import {index,patch,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
+import {index,patch,renderTree,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
 
 // Specialize immutable primitive parameters only when every call is closed and
@@ -173,7 +173,11 @@ export function specializeParameters(source){
  for(const n of nodes)if(n.type==='UnaryExpression'&&n.operator==='typeof'){const type=knownType(n.argument);if(type)replace.set(n,JSON.stringify(type));}
  else if(n.type==='UnaryExpression'&&n.operator==='!'&&n.argument.type==='Identifier'){const truth=knownTruth(n.argument);if(truth!==UNKNOWN)replace.set(n,JSON.stringify(!truth));}
  else if(n.type==='MemberExpression'&&property(n)==='length'&&n.object.type==='CallExpression'&&n.object.arguments.length===1&&n.object.callee.type==='MemberExpression'&&free(n.object.callee.object,'Object')&&property(n.object.callee)==='keys'&&emptyRecord(n.object.arguments[0]))replace.set(n,'0');
- const render=n=>replace.has(n)?replace.get(n):n.type==='Property'&&n.shorthand&&replace.has(n.value)?`${source.slice(n.key.start,n.key.end)}: ${render(n.value)}`:patch(source,n,render);return render(tree);
+ return renderTree(source,tree,n=>{
+  if(replace.has(n))return {direct:true,value:replace.get(n)};
+  if(n.type==='Property'&&n.shorthand&&replace.has(n.value))return {children:[n.value],render:child=>`${source.slice(n.key.start,n.key.end)}: ${child(n.value)}`};
+  return null;
+ });
 }
 
 // Give an unconditional input-normalization assignment its own binding. This
@@ -201,7 +205,8 @@ export function normalizeRecordParameters(source){
   changes.set(d.id,name);for(const r of b.refs)if(r.start>=write.right.start&&r.end<=write.right.end)changes.set(r,name);
   changes.set(stmt,()=>`const ${d.id.name} = ${render(write.right)};`);
  }
- const render=n=>changes.has(n)?typeof changes.get(n)==='function'?changes.get(n)():changes.get(n):patch(source,n,render);return render(tree);
+ function render(root){return renderTree(source,root,n=>{if(!changes.has(n))return null;const value=changes.get(n);return {direct:true,value:typeof value==='function'?value():value};});}
+ return render(tree);
 }
 
 // Project a single closed message consumer onto the fields it actually uses.
@@ -220,7 +225,7 @@ export function lowerMessageParameters(source){
   for(const r of parameter.refs){const member=parents.get(r),key=property(member);if(member?.type!=='MemberExpression'||member.object!==r||!['url','method','headers','body','bodyBytes','status','statusCode'].includes(key)){valid=false;break;}fields.add(key);}
   if(valid)replace.set(ref,'{'+[...fields].map(key=>JSON.stringify(key)+':'+kind+'['+JSON.stringify(key)+']').join(', ')+'}');
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // A closed callback helper can have different completion contracts at different
@@ -252,7 +257,7 @@ export function specializeCallbacks(source,generated){
   }
   replace.set(statement,copies.join('\n'));
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // Specialize closed receiver arguments and finite method selectors. No SDK
@@ -466,7 +471,8 @@ export function lowerFiniteMethodCalls(source){
   const selector=fresh('selectedMethod'),args=call.arguments.map(()=>fresh('selectedArgument'));
   replace.set(call,()=>`((${[selector,...args].join(', ')}) => {${methods.map(method=>`if (${selector} === ${JSON.stringify(method)}) return ${render(m.object)}.${method}(${args.join(', ')});`).join('')}throw new TypeError('Unknown HTTP method');})(${[m.property,...call.arguments].map(n=>'('+render(n)+')').join(', ')})`);
  }
- const render=n=>replace.has(n)?replace.get(n)():patch(source,n,render);return render(tree);
+ function render(root){return renderTree(source,root,n=>replace.has(n)?{direct:true,value:replace.get(n)()}:null);}
+ return render(tree);
 }
 
 // Resolve a closed table of function names without evaluating input JavaScript.
@@ -586,5 +592,6 @@ export function lowerClosedAccessors(source){
   for(const pair of accessors.values())for(const kind of ['get','set'])if(pair[kind]&&!dead(pair[kind])){const m=pair[kind];replace.set(m,()=>`${pair[kind+'Name']}(${m.value.params.map(render).join(', ')}) ${render(m.value.body)}`);}
   for(const {m,fn,args}of argumentMethods)replace.set(m,()=>`${fn.async?'async ':''}${fn.generator?'*':''}${source.slice(m.key.start,m.key.end)}(...${args}) {let [${fn.params.map(render).join(', ')}] = ${args};${render(fn.body).slice(1,-1)}}`);
  }
- const render=n=>replace.has(n)?replace.get(n)():patch(source,n,render);return render(tree);
+ function render(root){return renderTree(source,root,n=>replace.has(n)?{direct:true,value:replace.get(n)()}:null);}
+ return render(tree);
 }

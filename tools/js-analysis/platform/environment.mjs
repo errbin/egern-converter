@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,property,key,children,functions,initializedAfter,factoryArgument} from '../core/ast.mjs';
+import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument} from '../core/ast.mjs';
 import {methodContract} from './clients.mjs';
 import {platformFold} from './globals.mjs';
 import {simplify} from '../transforms/simplify.mjs';
@@ -96,7 +96,7 @@ export function lowerEnv(source,format){
    }
   }
  }
- function render(n){if(removed.has(n))return '';const value=replace.get(n);return value===undefined?patch(source,n,render):typeof value==='function'?value():value;}
+ function render(root){return renderTree(source,root,n=>{if(removed.has(n))return {direct:true,value:''};const value=replace.get(n);return value===undefined?null:{direct:true,value:typeof value==='function'?value():value};});}
  return render(tree);
 }
 
@@ -164,15 +164,15 @@ export function lowerClosedEnv(source){
    return `${fn.async?'async ':''}function ${identifiers.get(name)}(${params}) ${body}`;
   }).join('\n'));
  }
- function render(n){
-  if(removed.has(n))return '';
-  const r=replacements.get(n);if(r)return r();
+ function render(root){return renderTree(source,root,n=>{
+  if(removed.has(n))return {direct:true,value:''};
+  const r=replacements.get(n);if(r)return {direct:true,value:r()};
   if(n.type==='VariableDeclaration'){
    const keep=n.declarations.filter(d=>!removed.has(d));
-   if(keep.length!==n.declarations.length)return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';
+   if(keep.length!==n.declarations.length)return keep.length?{children:keep,render:child=>n.kind+' '+keep.map(child).join(', ')+';'}:{direct:true,value:''};
   }
-  return patch(source,n,render);
- }
+  return null;
+ });}
  return render(tree);
 }
 
@@ -304,14 +304,14 @@ export function lowerExtendedClosedEnv(source){
   for(const {d,declaration}of instances)replacements.set(declaration,()=>definitions.join('\n')+'\nconst '+d.id.name+' = {};');
   removed.add(factory);
  }
- function render(n){
-  if(removed.has(n))return '';
-  const r=replacements.get(n);if(r)return typeof r==='function'?r():r;
+ function render(root){return renderTree(source,root,n=>{
+  if(removed.has(n))return {direct:true,value:''};
+  const r=replacements.get(n);if(r)return {direct:true,value:typeof r==='function'?r():r};
   if(n.type==='VariableDeclaration'){
-   const keep=n.declarations.filter(d=>!removed.has(d));if(keep.length!==n.declarations.length)return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';
+   const keep=n.declarations.filter(d=>!removed.has(d));if(keep.length!==n.declarations.length)return keep.length?{children:keep,render:child=>n.kind+' '+keep.map(child).join(', ')+';'}:{direct:true,value:''};
   }
-  return patch(source,n,render);
- }
+  return null;
+ });}
  return render(tree);
 }
 
@@ -322,11 +322,8 @@ function targetMethodValues(source,cls,methods,format){
  const known=new Map();
  for(let pass=0;pass<3;pass++)for(const [name,method] of methods){
   if(method.value.params.length||method.value.async||method.value.generator||method.value.body.type!=='BlockStatement')continue;
-  const render=n=>{
-   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.callee.object.type==='ThisExpression'&&!n.arguments.length&&known.has(property(n.callee)))return JSON.stringify(known.get(property(n.callee)));
-   return patch(source,n,render);
-  };
-  const text=platformFold(simplify('(function()'+render(method.value.body)+')'),format).source;
+  const body=renderTree(source,method.value.body,n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.callee.object.type==='ThisExpression'&&!n.arguments.length&&known.has(property(n.callee))?{direct:true,value:JSON.stringify(known.get(property(n.callee)))}:null);
+  const text=platformFold(simplify('(function()'+body+')'),format).source;
   const result=parse(text,{ecmaVersion:'latest'}).body[0]?.expression.body.body;
   if(result?.length===1&&result[0].type==='ReturnStatement'&&result[0].argument?.type==='Literal'&&['string','boolean'].includes(typeof result[0].argument.value))known.set(name,result[0].argument.value);
  }
@@ -665,7 +662,7 @@ export function foldTargetEnvironments(source,format){
    if(method?.type==='MethodDefinition'&&method.kind==='method'&&!constructorReachable.has(key(method)))replace.set(n,JSON.stringify(fields.get(property(n))));
   }
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(ix.nodes[0]);
+ return renderTree(source,ix.nodes[0],n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 export function pruneTargetEnvironments(source,format){
@@ -681,8 +678,8 @@ export function pruneTargetEnvironments(source,format){
   }
   if(valid)for(const [name,method]of methods)if(!reachable.has(name))remove.add(method);
  }
- const render=n=>remove.has(n)?'':patch(source,n,render);
- return pruneUnusedClosedClassMethods(render(ix.nodes[0]));
+ const rendered=renderTree(source,ix.nodes[0],n=>remove.has(n)?{direct:true,value:''}:null);
+ return pruneUnusedClosedClassMethods(rendered);
 }
 
 // A closed environment can contain platform-only methods whose only callers
@@ -750,6 +747,5 @@ function pruneUnusedClosedClassMethods(source){
   }
   for(const method of methods)if(!reachable.has(key(method)))remove.add(method);
  }
- const emit=node=>remove.has(node)?'':patch(source,node,emit);
- return emit(tree);
+ return renderTree(source,tree,node=>remove.has(node)?{direct:true,value:''}:null);
 }

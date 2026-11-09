@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,key,patch} from '../core/ast.mjs';
+import {index,key,renderTree} from '../core/ast.mjs';
 import {methodContract} from '../platform/clients.mjs';
 
 // Preserve reviewed embedded public libraries. Only the business/platform code
@@ -166,7 +166,7 @@ export function protectLibraries(source,{sourceType='script'}={}){
   replace.set(body[0],'var '+marker+(dependencies.size?' = ['+[...dependencies].join(', ')+']':'')+(exports.length?', '+[...new Set(exports)].join(', '):'')+';');
   for(const n of body.slice(1))replace.set(n,'');
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
+ const render=n=>renderTree(source,n,node=>replace.has(node)?{direct:true,value:replace.get(node)}:null);
  const restore=(code,{globalReceiver=true}={})=>{
   const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set();
   for(const n of i.nodes)if(n.type==='VariableDeclaration'){
@@ -175,15 +175,14 @@ export function protectLibraries(source,{sourceType='script'}={}){
    found.add(n.declarations[0].id.name);for(const name of b.placeholderBindings)placeholderBindings.add(name);replacements.set(n,globalReceiver?b.code:b.raw);
   }
   if(found.size!==blocks.size)throw Error('Public library placeholder lost during compilation');
-  const emit=n=>{
-   if(replacements.has(n))return replacements.get(n);
+  return renderTree(code,t,n=>{
+   if(replacements.has(n))return {direct:true,value:replacements.get(n)};
    if(n.type==='VariableDeclaration'){
     const declarations=n.declarations.filter(d=>!placeholderBindings.has(d.id.type==='Identifier'?d.id.name:null));
-    if(declarations.length!==n.declarations.length)return declarations.length?n.kind+' '+declarations.map(d=>patch(code,d,emit)).join(', ')+';':'';
+    if(declarations.length!==n.declarations.length)return declarations.length?{children:declarations,render:child=>n.kind+' '+declarations.map(child).join(', ')+';'}:{direct:true,value:''};
    }
-   return patch(code,n,emit);
-  };
-  return emit(t);
+   return null;
+  });
  };
  return {source:render(tree),restore,valueContracts:[...blocks.values()].flatMap(b=>b.valueContracts??[]),blocks:[...blocks.values()].map(({name,source,start,end,contract})=>({name,source,start,end,contract}))};
 }

@@ -1,4 +1,4 @@
-import {functions,property,key,index,patch,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
+import {functions,property,key,index,patch,renderTree,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
 import {parse} from '../core/syntax.mjs';
 import {evaluationBindings} from './evaluation.mjs';
 
@@ -164,7 +164,7 @@ export function lowerLegacyFactories(source,generated=new Set()){
    return `${kind==='implicit'?'const':kind} ${ids.get(name)} = (${render(value)});`;
   }).join('\n'));
  }
- function render(n){if(removed.has(n))return '';const r=replace.get(n);return r===undefined?patch(source,n,render):typeof r==='function'?r():r;}
+ function render(root){return renderTree(source,root,n=>{if(removed.has(n))return {direct:true,value:''};const r=replace.get(n);return r===undefined?null:{direct:true,value:typeof r==='function'?r():r};});}
  return render(tree);
 }
 
@@ -186,7 +186,7 @@ function nameClosedFactoryExpressions(source){
   const name=fresh(),start=source.slice(declaration.start,d.init.start),end=source.slice(d.init.end,declaration.end);
   replace.set(declaration,`function ${name}() ${source.slice(fn.body.start,fn.body.end)}\n${start}${name}()${end}`);
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // Classic script top-level/arrow this is the host global. Only explicit message
@@ -202,8 +202,7 @@ export function lowerGlobalMessages(source){
   if(ix.nodes.some(x=>ix.free(x,name)&&ix.parents.get(x)?.type==='AssignmentExpression'&&ix.parents.get(x).left===x))continue;
   replace.set(m,name);
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
- return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // Localize an authored singleton installed by one sloppy root assignment. This
@@ -220,7 +219,7 @@ export function lowerImplicitInstances(source){
   if(refs.some(r=>{const p=ix.parents.get(r);return p?.type!=='MemberExpression'||p.object!==r||!initializedAfter(ix,statement,r);}))continue;
   replace.set(statement,'const '+name+' = '+source.slice(a.right.start,a.right.end)+';');
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // Scalar replacement of a closed SDK instance. Ordinary captured state stays
@@ -230,8 +229,7 @@ export function lowerStatefulFactories(source,generated=new Set()){
  // in a multi-declarator statement to the existing closed-instance proof.
  {
   const initial=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
-  const split=n=>n.type==='VariableDeclaration'&&n.declarations.length>1&&n.declarations.some(d=>d.init?.type==='NewExpression')&&['Program','BlockStatement'].includes(initial.parents.get(n)?.type)?n.declarations.map(d=>n.kind+' '+patch(source,d,split)+';').join('\n'):patch(source,n,split);
-  source=split(initial.nodes[0]);
+  source=renderTree(source,initial.nodes[0],n=>n.type==='VariableDeclaration'&&n.declarations.length>1&&n.declarations.some(d=>d.init?.type==='NewExpression')&&['Program','BlockStatement'].includes(initial.parents.get(n)?.type)?{children:n.declarations,render:child=>n.declarations.map(d=>n.kind+' '+child(d)+';').join('\n')}:null);
  }
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap(),removed=new WeakSet();
  const {nodes,parents,bindings,owners}=ix,names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
@@ -353,7 +351,7 @@ export function lowerStatefulFactories(source,generated=new Set()){
   });
 
  }
- const render=n=>removed.has(n)?'':replace.has(n)?typeof replace.get(n)==='function'?replace.get(n)():replace.get(n):patch(source,n,render);
+ function render(root){return renderTree(source,root,n=>{if(removed.has(n))return {direct:true,value:''};if(!replace.has(n))return null;const value=replace.get(n);return {direct:true,value:typeof value==='function'?value():value};});}
  return render(tree);
 }
 
@@ -387,11 +385,11 @@ export function pruneGeneratedFunctions(source,names,entrySpecialized=false){
   if(!discarded&&ix.parents.get(parent)?.type!=='ExpressionStatement')continue;
   inertWrites.add(w);removed.add(n);
  }
- function render(n){
-  if(removed.has(n))return '';
-  if(inertWrites.has(n))return 'void 0';
-  if(n.type==='VariableDeclaration'&&n.declarations.some(d=>removed.has(d))){const keep=n.declarations.filter(d=>!removed.has(d));return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';}
-  return patch(source,n,render);
- }
+ function render(root){return renderTree(source,root,n=>{
+  if(removed.has(n))return {direct:true,value:''};
+  if(inertWrites.has(n))return {direct:true,value:'void 0'};
+  if(n.type==='VariableDeclaration'&&n.declarations.some(d=>removed.has(d))){const keep=n.declarations.filter(d=>!removed.has(d));return keep.length?{children:keep,render:child=>n.kind+' '+keep.map(child).join(', ')+';'}:{direct:true,value:''};}
+  return null;
+ });}
  return render(tree);
 }

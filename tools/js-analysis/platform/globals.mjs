@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,property,key,children,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
+import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
 
 // Fold proven source-platform probes, preserving unknown device/version data.
 const UNKNOWN=Symbol('not statically known');
@@ -97,10 +97,71 @@ function fold(source,format,options,qxHint){
   if(queries.some(c=>!c)||b.refs.some(r=>!dominates(b,r)))continue;
   keySnapshots.add(call);for(const query of queries)globalMembership.set(query,markers.get(query.arguments[0].value));
  }
+ function valueExpression(root,seen){
+  const stack=[{node:root,state:'start'}];let result=UNKNOWN;
+  function complete(value){const frame=stack.pop(),parent=stack.at(-1);if(parent){parent.child=value;parent.hasChild=true;}else result=value;}
+  while(stack.length){
+   const frame=stack.at(-1),n=frame.node;
+   if(frame.state==='start'){
+    if(n.type==='UnaryExpression'){
+     if(n.operator==='typeof'&&['global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete('undefined');continue;}
+     if(n.operator==='typeof'&&ix.free(n.argument,'globalThis')){complete('object');continue;}
+     if(n.operator==='typeof'&&n.argument.type==='ChainExpression'){frame.argument=n.argument.expression;}
+     else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip'){complete('function');continue;}
+     else if(n.operator==='typeof'&&ix.free(n.argument)&&n.argument.name.startsWith('$')){complete(Object.hasOwn(types,n.argument.name)?types[n.argument.name]:UNKNOWN);continue;}
+     frame.state='unary';stack.push({node:frame.argument??n.argument,state:'start'});continue;
+    }
+    if(n.type==='BinaryExpression'){frame.state='binary-left';stack.push({node:n.left,state:'start'});continue;}
+    if(n.type==='LogicalExpression'){frame.state='logical-left';stack.push({node:n.left,state:'start'});continue;}
+    if(n.type==='ConditionalExpression'){frame.state='conditional-test';stack.push({node:n.test,state:'start'});continue;}
+    complete(valueImpl(n,seen));continue;
+   }
+   if(frame.state==='unary'){
+    const v=frame.child;if(v===UNKNOWN){complete(UNKNOWN);continue;}
+    if(v&&records.has(v)&&!['typeof','!','void'].includes(n.operator)){complete(UNKNOWN);continue;}
+    if(v===PRESENT_VERSION){complete(n.operator==='!'?false:UNKNOWN);continue;}
+    if(n.operator==='!'){complete(!v);continue;}if(n.operator==='typeof'){complete(typeof v);continue;}
+    if(n.operator==='+'){complete(+v);continue;}if(n.operator==='-'){complete(-v);continue;}if(n.operator==='void'){complete(undefined);continue;}
+    complete(UNKNOWN);continue;
+   }
+   if(frame.state==='binary-left'){
+    frame.left=frame.child;frame.state='binary-right';stack.push({node:n.right,state:'start'});continue;
+   }
+   if(frame.state==='binary-right'){
+    const a=frame.left,b=frame.child;if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION){complete(UNKNOWN);continue;}
+    const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
+    if(presentA||presentB){
+     if(['===','!==','==','!='].includes(n.operator)){
+      let equal;
+      if(presentA&&presentB)equal=presentA===presentB?true:undefined;
+      else{const other=presentA?b:a;if(other===undefined||other===null||['string','number','boolean','bigint'].includes(typeof other))equal=false;}
+      if(equal!==undefined){complete(['===','=='].includes(n.operator)?equal:!equal);continue;}
+     }
+     complete(UNKNOWN);continue;
+    }
+    if(a&&records.has(a)||b&&records.has(b)){complete(UNKNOWN);continue;}
+    switch(n.operator){case '===':complete(a===b);break;case '!==':complete(a!==b);break;case '==':complete(a==b);break;case '!=':complete(a!=b);break;case '+':complete(a+b);break;case '*':complete(a*b);break;case '/':complete(a/b);break;case '<':complete(a<b);break;case '>':complete(a>b);break;default:complete(UNKNOWN);}
+    continue;
+   }
+   if(frame.state==='logical-left'){
+    const a=frame.child;if(a===UNKNOWN){complete(UNKNOWN);continue;}
+    if(n.operator==='&&'&&!a||n.operator==='||'&&a||n.operator==='??'&&a!==null&&a!==undefined){complete(a);continue;}
+    frame.state='logical-right';stack.push({node:n.right,state:'start'});continue;
+   }
+   if(frame.state==='logical-right'){complete(frame.child);continue;}
+   if(frame.state==='conditional-test'){
+    const test=frame.child;if(test===UNKNOWN){complete(UNKNOWN);continue;}
+    frame.state='conditional-branch';stack.push({node:test?n.consequent:n.alternate,state:'start'});continue;
+   }
+   if(frame.state==='conditional-branch'){complete(frame.child);continue;}
+  }
+  return result;
+ }
  function value(n,seen){
   const rootContext=parameters===rootParameters&&(!seen||seen.size===0);
   if(n&&rootContext&&rootValueCache.has(n))return rootValueCache.get(n);
-  const result=valueImpl(n,seen??new Set());
+  const expression=['UnaryExpression','BinaryExpression','LogicalExpression','ConditionalExpression'].includes(n?.type);
+  const result=expression?valueExpression(n,seen??new Set()):valueImpl(n,seen??new Set());
   if(n&&rootContext)rootValueCache.set(n,result);
   return result;
  }
@@ -287,14 +348,8 @@ function fold(source,format,options,qxHint){
   let enclosing=call;while(ix.parents.get(enclosing)&&ix.parents.get(enclosing)!==block)enclosing=ix.parents.get(enclosing);
   return ix.parents.get(enclosing)===block&&enclosing.start>=statement.end;
  }
- const rendered=new WeakMap();
- function render(n){
-  if(keySnapshots.has(n))return "[]";
-  if(!n)return '';
-  if(rendered.has(n))return rendered.get(n);
-  const text=emit(n);rendered.set(n,text);return text;
- }
- function emit(n){
+ const render=root=>renderTree(source,root,n=>{
+  if(keySnapshots.has(n))return {direct:true,value:'[]'};
   if(n.type==='FunctionDeclaration'&&!n.params.length&&!n.async&&!n.generator){
    const b=ix.bindings.get(n.id),block=ix.parents.get(n),owner=ix.parents.get(block),body=n.body.body;
    // Only statically pure, unused predicates can disappear here. Preserve
@@ -302,31 +357,33 @@ function fold(source,format,options,qxHint){
    // and missing completion paths rather than suppressing those diagnostics.
    if(b&&!b.refs.length&&!b.writes.length&&declarationCounts.get(b)===1&&
      (block?.type==='Program'||block?.type==='BlockStatement'&&functions.has(owner?.type)&&owner.body===block)&&
-     body.length===1&&body[0].type==='ReturnStatement'&&[true,false,undefined,PRESENT_VERSION].includes(value(body[0].argument)))return '';
+     body.length===1&&body[0].type==='ReturnStatement'&&[true,false,undefined,PRESENT_VERSION].includes(value(body[0].argument)))return {direct:true,value:''};
   }
-  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init){const v=value(n.init);if(typeof v==='boolean'||v===undefined)return render(n.id)+' = '+(v===undefined?'void 0':String(v));}
+  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init){const v=value(n.init);if(typeof v==='boolean'||v===undefined)return {children:[n.id],render:child=>child(n.id)+' = '+(v===undefined?'void 0':String(v))};}
   if(n.type==='VariableDeclaration'&&n.declarations.some(d=>d.id.type==='ObjectPattern'&&d.init)){
    const values=n.declarations.map(d=>value(d.init));
    const valid=(d,i)=>d.id.type==='ObjectPattern'&&values[i]&&records.has(values[i])&&d.id.properties.every(p=>p.type==='Property'&&!p.computed&&p.value.type==='Identifier'&&Object.hasOwn(values[i],key(p))&&values[i][key(p)]!==UNKNOWN);
-   if(n.declarations.some(valid))return n.kind+' '+n.declarations.flatMap((d,i)=>valid(d,i)?d.id.properties.map(p=>render(p.value)+' = '+(values[i][key(p)]===undefined?'void 0':JSON.stringify(values[i][key(p)]))):[render(d)]).join(', ')+';';
+   if(n.declarations.some(valid)){
+    const items=n.declarations.flatMap((d,i)=>valid(d,i)?d.id.properties.map(p=>({node:p.value,value:values[i][key(p)],assignment:true})): [{node:d,assignment:false}]);
+    return {children:items.map(item=>item.node),render:child=>n.kind+' '+items.map(item=>item.assignment?child(item.node)+' = '+(item.value===undefined?'void 0':JSON.stringify(item.value)):child(item.node)).join(', ')+';'};
+   }
   }
   if(n.type==='CallExpression'){
    const v=value(n);
-   if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)||typeof v==='number'&&Number.isFinite(v)))return v===undefined?'(void 0)':JSON.stringify(v);
+   if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)||typeof v==='number'&&Number.isFinite(v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};
   }
-  if(n.type==='MemberExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)))return v===undefined?'(void 0)':JSON.stringify(v);}
-  if(n.type==='BinaryExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string','number'].includes(typeof v)))return v===undefined?'(void 0)':JSON.stringify(v);}
+  if(n.type==='MemberExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
+  if(n.type==='BinaryExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string','number'].includes(typeof v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
   if(n.type==='LogicalExpression'){
    const a=value(n.left);
-   if(a===PRESENT_VERSION&&n.operator==='&&')return '('+render(n.right)+')';
+   if(a===PRESENT_VERSION&&n.operator==='&&')return {children:[n.right],render:child=>'('+child(n.right)+')'};
    if(a!==UNKNOWN&&a!==PRESENT_VERSION){
-    if(n.operator==='&&')return '('+render(a?n.right:n.left)+')';
-    if(n.operator==='||')return '('+render(a?n.left:n.right)+')';
-    if(n.operator==='??')return '('+render(a==null?n.right:n.left)+')';
+    const branch=n.operator==='&&'?a?n.right:n.left:n.operator==='||'?a?n.left:n.right:n.operator==='??'?a==null?n.right:n.left:null;
+    if(branch)return {children:[branch],render:child=>'('+child(branch)+')'};
    }
   }
-  if(n.type==='UnaryExpression'&&n.operator==='typeof'){const v=value(n);if(v!==UNKNOWN)return JSON.stringify(v);}
-  if(n.type==='ConditionalExpression'){const v=value(n.test);if(v!==UNKNOWN)return '('+render(v?n.consequent:n.alternate)+')';}
+  if(n.type==='UnaryExpression'&&n.operator==='typeof'){const v=value(n);if(v!==UNKNOWN)return {direct:true,value:JSON.stringify(v)};}
+  if(n.type==='ConditionalExpression'){const v=value(n.test);if(v!==UNKNOWN){const branch=v?n.consequent:n.alternate;return {children:[branch],render:child=>'('+child(branch)+')'};}}
   if(n.type==='SwitchStatement'){
    const sequence=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions:[n.discriminant],v=value(sequence.at(-1));
    if(v!==UNKNOWN&&v!==PRESENT_VERSION){
@@ -357,17 +414,17 @@ function fold(source,format,options,qxHint){
       return false;
      };
      const nestedBreak=selected.some(containsBreak);
-     if(!excludedReferences&&!nestedBreak)return '{'+sequence.slice(0,-1).map(e=>render(e)+';').join('')+selected.map(render).join('\n')+'}';
+     if(!excludedReferences&&!nestedBreak){const prefix=sequence.slice(0,-1),selectedNodes=selected;return {children:[...prefix,...selectedNodes],render:child=>'{'+prefix.map(e=>child(e)+';').join('')+selectedNodes.map(child).join('\n')+'}'};}
     }
    }
   }
   if(n.type==='IfStatement'){
-   if(n.test.type==='SequenceExpression'){const v=value(n.test.expressions.at(-1));if(v!==UNKNOWN&&v!==PRESENT_VERSION)return '{'+render(n.test)+';'+(v?render(n.consequent):n.alternate?render(n.alternate):'')+'}';}
-   if(n.test.type==='AssignmentExpression'&&n.test.operator==='='&&n.test.left.type==='Identifier'){const v=value(n.test.right);if(v!==UNKNOWN&&v!==PRESENT_VERSION)return '{'+render(n.test)+';'+(v?render(n.consequent):n.alternate?render(n.alternate):'')+'}';}
-   const v=value(n.test);if(v!==UNKNOWN)return v?'{'+render(n.consequent)+'}':n.alternate?'{'+render(n.alternate)+'}':'{}';
+   if(n.test.type==='SequenceExpression'){const v=value(n.test.expressions.at(-1));if(v!==UNKNOWN&&v!==PRESENT_VERSION){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
+   if(n.test.type==='AssignmentExpression'&&n.test.operator==='='&&n.test.left.type==='Identifier'){const v=value(n.test.right);if(v!==UNKNOWN&&v!==PRESENT_VERSION){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
+   const v=value(n.test);if(v!==UNKNOWN){const branch=v?n.consequent:n.alternate;return branch?{children:[branch],render:child=>'{'+child(branch)+'}'}:{direct:true,value:'{}'};}
   }
-  return patch(source,n,render);
- }
+  return null;
+ });
  return {source:render(tree),qx};
 }
 
@@ -427,8 +484,7 @@ export function lowerQualifiedPlatformGlobals(source,format){
   if(shadowed||nodes.some(n=>n.type==='Identifier'&&n.name===name&&bindings.has(n)))continue;
   replace.set(member,name==='$intent'?'(void 0)':name);
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
- return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // In a classic non-strict script, a plain call to a function gives it the
@@ -462,8 +518,7 @@ export function lowerDirectGlobalPlatformReceivers(source,format){
   if(owner&&(!plainCall(owner)||parents.get(owner)?.type==='MethodDefinition'))continue;
   replace.set(member,api);
  }
- const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
- return render(tree);
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
 // Resolve only side-effect-free platform predicates on a closed SDK receiver.

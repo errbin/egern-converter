@@ -31,6 +31,56 @@ console.log(JSON.stringify({ok:true}));
                               cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(json.loads(result.stdout),{'ok':True})
 
+    def test_dominance_proof_handles_long_closed_function_chains(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {parse} from './tools/js-analysis/core/syntax.mjs';
+import {index,initializedAfter} from './tools/js-analysis/core/ast.mjs';
+const count=6000,rows=['const ready=1;'];
+for(let i=0;i<count;i++)rows.push(`function f${i}(){${i+1<count?`f${i+1}()`:'return 1'}}`);
+rows.push('f0();');
+const tree=parse(rows.join('\\n'),{ecmaVersion:'latest'}),ix=index(tree);
+const reference=ix.nodes.find(node=>node.type==='Identifier'&&node.name===`f${count-1}`&&ix.reference(node));
+assert.ok(reference);
+assert.equal(initializedAfter(ix,tree.body[0],reference),true);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_ast_index_handles_deeply_nested_syntax(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {index,renderTree} from './tools/js-analysis/core/ast.mjs';
+let leaf={type:'ExpressionStatement',start:0,end:1,expression:{type:'Identifier',name:'value',start:0,end:1}};
+for(let i=0;i<12000;i++)leaf={type:'BlockStatement',start:0,end:1,body:[leaf]};
+const tree={type:'Program',start:0,end:1,body:[leaf]},ix=index(tree);
+assert.equal(ix.nodes.length,12003);
+assert.equal(ix.free(ix.nodes.at(-1)),true);
+assert.equal(renderTree('0',tree),'0');
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_constant_folding_handles_long_alias_chains(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {simplify} from './tools/js-analysis/transforms/simplify.mjs';
+const count=5000,rows=['const v'+(count-1)+'=true;'];
+for(let i=count-2;i>=0;i--)rows.push(`const v${i}=v${i+1};`);
+rows.push('if(v0){hit()}else{miss()}');
+const output=simplify(rows.join('\\n'));
+assert.match(output,/hit\\(\\)/);
+assert.doesNotMatch(output,/miss\\(\\)/);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+
     def test_initializer_order_is_proved_inside_the_same_execution_block(self):
         probe="""
 import assert from 'node:assert/strict';

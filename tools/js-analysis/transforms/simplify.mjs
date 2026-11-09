@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,initializedAfter} from '../core/ast.mjs';
+import {index,patch,renderTree,initializedAfter} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
 
 // Scope-aware static simplification. Input code is never executed.
@@ -120,120 +120,158 @@ export function simplify(source){
    if(v&&typeof v.value!=='bigint'&&!v.regex&&!(typeof v.value==='number'&&!Number.isFinite(v.value)))replace.set(n,JSON.stringify(v.value));
   }
   const pure=n=>n&&(n.type==='Literal'||n.type==='ArrayExpression'&&n.elements.every(pure));
-  function constant(n){
-   if(!n)return UNKNOWN;
-   if(n.type==='Literal')return n.value;
-   if(n.type==='Identifier'&&n.name==='undefined'&&ix.free(n))return undefined;
-   if(n.type==='Identifier'){
-    const binding=ix.bindings.get(n),initializer=binding?.init,declarator=initializer&&ix.parents.get(initializer),statement=declarator&&ix.parents.get(declarator);
-    if(binding&&!evaluated.has(binding)&&!binding.writes.length&&initializer&&statement?.type==='VariableDeclaration'&&
-      ['const','let','var'].includes(statement.kind)&&initializedAfter(ix,statement,n)){
-     const value=constant(initializer);if(value!==UNKNOWN)return value;
-    }
+  function constant(root){
+   // Constant aliases and generated predicates can be thousands of nodes deep.
+   // Evaluate them with explicit frames so valid input depth cannot exhaust the
+   // JavaScript call stack. Active bindings also make cyclic initializers
+   // conservatively unknown instead of recursing forever.
+   const active=new Set(),stack=[{node:root,state:'start'}];let result=UNKNOWN;
+   function complete(value){
+    const done=stack.pop();if(done.binding)active.delete(done.binding);
+    const parent=stack.at(-1);if(parent){parent.child=value;parent.hasChild=true;}else result=value;
    }
-   if(n.type==='UnaryExpression'){
-    const value=constant(n.argument);if(value===UNKNOWN)return UNKNOWN;
-    if(n.operator==='!')return !value;if(n.operator==='void')return undefined;
-    if(n.operator==='typeof')return typeof value;if(n.operator==='+'&&['number','string','boolean'].includes(typeof value))return +value;
-    if(n.operator==='-'&&['number','string','boolean'].includes(typeof value))return -value;
-   }
-   if(n.type==='BinaryExpression'){
-    const left=constant(n.left),right=constant(n.right);if(left===UNKNOWN||right===UNKNOWN)return UNKNOWN;
-    switch(n.operator){case '===':return left===right;case '!==':return left!==right;case '==':return left==right;case '!=':return left!=right;case '<':return left<right;case '<=':return left<=right;case '>':return left>right;case '>=':return left>=right;case '+':return left+right;}
-   }
-   if(n.type==='LogicalExpression'){
-    const left=constant(n.left);if(left===UNKNOWN)return UNKNOWN;
-    if(n.operator==='&&')return left?constant(n.right):left;
-    if(n.operator==='||')return left?left:constant(n.right);
-    if(n.operator==='??')return left===null||left===undefined?constant(n.right):left;
-   }
-   if(n.type==='ConditionalExpression'){
-    const test=constant(n.test);return test===UNKNOWN?UNKNOWN:constant(test?n.consequent:n.alternate);
-   }
-   return UNKNOWN;
-  }
-  function render(n){
-   if(removed.has(n))return '';
-   if(n.type==='Property'&&n.shorthand&&replace.has(n.value))return `${source.slice(n.key.start,n.key.end)}: ${render(n.value)}`;
-   if(replace.has(n))return replace.get(n);
-   if(n.type==='IfStatement'){
-    const test=constant(n.test);if(test!==UNKNOWN){
-     const branch=test?n.consequent:n.alternate,result=branch?render(branch):'';
-     const parent=ix.parents.get(n),required=parent&&(
-      parent.type==='IfStatement'&&parent.alternate===n
-      ||parent.type==='LabeledStatement'&&parent.body===n
-      ||parent.type==='WithStatement'&&parent.body===n
-      ||['DoWhileStatement','ForInStatement','ForOfStatement','ForStatement','WhileStatement'].includes(parent.type)&&parent.body===n
-     );
-     // A consequent/alternate may be deleted inside a block, but JavaScript
-     // requires a Statement after `else`, a loop header, or a label. Preserve
-     // the equivalent empty statement so nested `else if` chains stay valid.
-     return result||required?result||';':'';
-    }
-   }
-   if(n.type==='SwitchStatement'){
-    const discriminant=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions.at(-1):n.discriminant;
-    const prefix=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions.slice(0,-1):[];
-    const subject=constant(discriminant);if(subject!==UNKNOWN){
-     let selected=-1,fallback=-1,labelsKnown=true;
-     for(let i=0;i<n.cases.length;i++){
-      const clause=n.cases[i];if(!clause.test){fallback=i;continue;}
-      const test=constant(clause.test);if(test===UNKNOWN){labelsKnown=false;break;}
-      if(subject===test){selected=i;break;}
-     }
-     if(labelsKnown){
-      if(selected<0)selected=fallback;
-      const clauses=selected<0?[]:n.cases.slice(selected),statements=[];let stopped=false,safe=true;
-      for(const clause of clauses){
-       for(const statement of clause.consequent){
-        if(statement.type==='BreakStatement'&&!statement.label){stopped=true;break;}
-        if(statement.type==='VariableDeclaration'&&statement.kind==='var'){safe=false;break;}
-        statements.push(statement);
-       }
-       if(!safe||stopped)break;
+   while(stack.length){
+    const frame=stack.at(-1),n=frame.node;
+    if(frame.state==='start'){
+     if(!n){complete(UNKNOWN);continue;}
+     if(n.type==='Literal'){complete(n.value);continue;}
+     if(n.type==='Identifier'&&n.name==='undefined'&&ix.free(n)){complete(undefined);continue;}
+     if(n.type==='Identifier'){
+      const binding=ix.bindings.get(n),initializer=binding?.init,declarator=initializer&&ix.parents.get(initializer),statement=declarator&&ix.parents.get(declarator);
+      if(binding&&!evaluated.has(binding)&&!binding.writes.length&&initializer&&statement?.type==='VariableDeclaration'&&
+        ['const','let','var'].includes(statement.kind)&&initializedAfter(ix,statement,n)){
+       if(active.has(binding)){complete(UNKNOWN);continue;}
+       active.add(binding);frame.binding=binding;frame.state='child';stack.push({node:initializer,state:'start'});continue;
       }
-      const inside=(node,root)=>node.start>=root.start&&node.end<=root.end;
-      if(safe)for(let i=0;i<n.cases.length;i++)if(i<selected||i>selected&&stopped){
-       const clause=n.cases[i];
-      for(const declaration of switchDeclarations.get(clause)??[]){
+      complete(UNKNOWN);continue;
+     }
+     if(n.type==='UnaryExpression'){frame.state='unary';stack.push({node:n.argument,state:'start'});continue;}
+     if(n.type==='BinaryExpression'){frame.state='binary-left';stack.push({node:n.left,state:'start'});continue;}
+     if(n.type==='LogicalExpression'){frame.state='logical-left';stack.push({node:n.left,state:'start'});continue;}
+     if(n.type==='ConditionalExpression'){frame.state='conditional-test';stack.push({node:n.test,state:'start'});continue;}
+     complete(UNKNOWN);continue;
+    }
+    if(frame.state==='child'){
+     const value=frame.child;complete(value);continue;
+    }
+    if(frame.state==='unary'){
+     const value=frame.child;if(value===UNKNOWN){complete(UNKNOWN);continue;}
+     if(n.operator==='!'){complete(!value);continue;}if(n.operator==='void'){complete(undefined);continue;}
+     if(n.operator==='typeof'){complete(typeof value);continue;}
+     if(n.operator==='+'&&['number','string','boolean'].includes(typeof value)){complete(+value);continue;}
+     if(n.operator==='-'&&['number','string','boolean'].includes(typeof value)){complete(-value);continue;}
+     complete(UNKNOWN);continue;
+    }
+    if(frame.state==='binary-left'){
+     const left=frame.child;if(left===UNKNOWN){complete(UNKNOWN);continue;}
+     frame.left=left;frame.state='binary-right';stack.push({node:n.right,state:'start'});continue;
+    }
+    if(frame.state==='binary-right'){
+     const left=frame.left,right=frame.child;if(right===UNKNOWN){complete(UNKNOWN);continue;}
+     switch(n.operator){
+      case '===':complete(left===right);break;case '!==':complete(left!==right);break;
+      case '==':complete(left==right);break;case '!=':complete(left!=right);break;
+      case '<':complete(left<right);break;case '<=':complete(left<=right);break;
+      case '>':complete(left>right);break;case '>=':complete(left>=right);break;
+      case '+':complete(left+right);break;default:complete(UNKNOWN);
+     }
+     continue;
+    }
+    if(frame.state==='logical-left'){
+     const left=frame.child;if(left===UNKNOWN){complete(UNKNOWN);continue;}
+     if(n.operator==='&&'&&!left||n.operator==='||'&&left||n.operator==='??'&&left!==null&&left!==undefined){complete(left);continue;}
+     if(!['&&','||','??'].includes(n.operator)){complete(UNKNOWN);continue;}
+     frame.state='logical-right';stack.push({node:n.right,state:'start'});continue;
+    }
+    if(frame.state==='logical-right'){complete(frame.child);continue;}
+    if(frame.state==='conditional-test'){
+     const test=frame.child;if(test===UNKNOWN){complete(UNKNOWN);continue;}
+     frame.state='conditional-branch';stack.push({node:test?n.consequent:n.alternate,state:'start'});continue;
+    }
+    if(frame.state==='conditional-branch'){complete(frame.child);continue;}
+   }
+   return result;
+  }
+  function render(root){
+   return renderTree(source,root,n=>{
+    if(removed.has(n))return {direct:true,value:''};
+    if(n.type==='Property'&&n.shorthand&&replace.has(n.value))return {children:[n.value],render:child=>`${source.slice(n.key.start,n.key.end)}: ${child(n.value)}`};
+    if(replace.has(n))return {direct:true,value:replace.get(n)};
+    if(n.type==='IfStatement'){
+     const test=constant(n.test);if(test!==UNKNOWN){
+      const branch=test?n.consequent:n.alternate,parent=ix.parents.get(n),required=parent&&(
+       parent.type==='IfStatement'&&parent.alternate===n
+       ||parent.type==='LabeledStatement'&&parent.body===n
+       ||parent.type==='WithStatement'&&parent.body===n
+       ||['DoWhileStatement','ForInStatement','ForOfStatement','ForStatement','WhileStatement'].includes(parent.type)&&parent.body===n
+      );
+      return {children:branch?[branch]:[],render:child=>{const result=branch?child(branch):'';return result||required?result||';':'';}};
+     }
+    }
+    if(n.type==='SwitchStatement'){
+     const discriminant=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions.at(-1):n.discriminant;
+     const prefix=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions.slice(0,-1):[];
+     const subject=constant(discriminant);if(subject!==UNKNOWN){
+      let selected=-1,fallback=-1,labelsKnown=true;
+      for(let i=0;i<n.cases.length;i++){
+       const clause=n.cases[i];if(!clause.test){fallback=i;continue;}
+       const test=constant(clause.test);if(test===UNKNOWN){labelsKnown=false;break;}
+       if(subject===test){selected=i;break;}
+      }
+      if(labelsKnown){
+       if(selected<0)selected=fallback;
+       const clauses=selected<0?[]:n.cases.slice(selected),statements=[];let stopped=false,safe=true;
+       for(const clause of clauses){
+        for(const statement of clause.consequent){
+         if(statement.type==='BreakStatement'&&!statement.label){stopped=true;break;}
+         if(statement.type==='VariableDeclaration'&&statement.kind==='var'){safe=false;break;}
+         statements.push(statement);
+        }
+        if(!safe||stopped)break;
+       }
+       const inside=(node,root)=>node.start>=root.start&&node.end<=root.end;
+       if(safe)for(let i=0;i<n.cases.length;i++)if(i<selected||i>selected&&stopped){
+        const clause=n.cases[i];
+        for(const declaration of switchDeclarations.get(clause)??[]){
          const binding=ix.bindings.get(declaration.id);
          if(binding?.refs.some(ref=>!inside(ref,clause))){safe=false;break;}
         }
-       if(!safe)break;
-      }
-      // A nested break that targets this switch would change its control flow
-      // when the selected case is moved into a plain block.
-      if(safe){const moved=new Set(statements);if((switchBreakStatements.get(n)??[]).some(statement=>moved.has(statement)))safe=false;}
-      if(safe){
-       const body='{'+statements.map(render).join('\n')+'}';
-       // Switch discriminants evaluate before the switch's lexical case scope.
-       // Keep comma-expression effects in that outer scope so a case binding
-       // cannot shadow a name read by the discriminant.
-       if(prefix.length)return '{'+prefix.map(expression=>render(expression)+';').join('\n')+'\n'+body+'}';
-       return body;
+        if(!safe)break;
+       }
+       // A nested break that targets this switch would change its control flow
+       // when the selected case is moved into a plain block.
+       if(safe){const moved=new Set(statements);if((switchBreakStatements.get(n)??[]).some(statement=>moved.has(statement)))safe=false;}
+       if(safe){
+        const children=[...prefix,...statements];
+        return {children,render:child=>{
+         const renderedBody='{'+statements.map(child).join('\n')+'}';
+         // Switch discriminants evaluate before the switch's lexical case scope.
+         // Keep comma-expression effects in that outer scope so a case binding
+         // cannot shadow a name read by the discriminant.
+         return prefix.length?'{'+prefix.map(expression=>child(expression)+';').join('\n')+'\n'+renderedBody+'}':renderedBody;
+        }};
+       }
       }
      }
     }
-   }
-   if(n.type==='ConditionalExpression'){
-    const test=constant(n.test);if(test!==UNKNOWN)return render(test?n.consequent:n.alternate);
-   }
-   if(n.type==='LogicalExpression'){
-    const left=constant(n.left);if(left!==UNKNOWN){
-     if(n.operator==='&&')return left?render(n.right):render(n.left);
-     if(n.operator==='||')return left?render(n.left):render(n.right);
-     if(n.operator==='??')return left===null||left===undefined?render(n.right):render(n.left);
+    if(n.type==='ConditionalExpression'){
+     const test=constant(n.test);if(test!==UNKNOWN){const branch=test?n.consequent:n.alternate;return {children:[branch],render:child=>child(branch)};}
     }
-   }
-   if(n.type==='VariableDeclaration'&&!hasCommentBetween(n.start,n.end)){
-    const keep=n.declarations.filter(d=>{const b=d.id.type==='Identifier'?ix.bindings.get(d.id):null;return !(b&&!evaluated.has(b)&&!b.refs.length&&!b.writes.length&&(pure(d.init)||/^(?:FunctionExpression|ArrowFunctionExpression)$/.test(d.init?.type||'')));});
-    if(keep.length!==n.declarations.length){
-     const parent=ix.parents.get(n);
-     if(['ForStatement','ForInStatement','ForOfStatement'].includes(parent?.type))return patch(source,n,render);
-     return keep.length?n.kind+' '+keep.map(render).join(', ')+';':'';
+    if(n.type==='LogicalExpression'){
+     const left=constant(n.left);if(left!==UNKNOWN){
+      const branch=n.operator==='&&'?left?n.right:n.left:n.operator==='||'?left?n.left:n.right:n.operator==='??'?left===null||left===undefined?n.right:n.left:null;
+      if(branch)return {children:[branch],render:child=>child(branch)};
+     }
     }
-   }
-   return patch(source,n,render);
+    if(n.type==='VariableDeclaration'&&!hasCommentBetween(n.start,n.end)){
+     const keep=n.declarations.filter(d=>{const b=d.id.type==='Identifier'?ix.bindings.get(d.id):null;return !(b&&!evaluated.has(b)&&!b.refs.length&&!b.writes.length&&(pure(d.init)||/^(?:FunctionExpression|ArrowFunctionExpression)$/.test(d.init?.type||'')));});
+     if(keep.length!==n.declarations.length){
+      const parent=ix.parents.get(n);
+      if(!['ForStatement','ForInStatement','ForOfStatement'].includes(parent?.type))return keep.length?{children:keep,render:child=>n.kind+' '+keep.map(child).join(', ')+';'}:{direct:true,value:''};
+     }
+    }
+    return null;
+   });
   }
   const next=render(tree);if(next===source)break;source=next;
  }
