@@ -97,12 +97,12 @@ for(const {node:n,parent:p,key} of nodes) {
     }
   }
   if(n.type==='AwaitExpression'||n.async)asynchronous=true;
-  if(n.generator||n.type==='YieldExpression')reasons.add('生成器逻辑需独立适配');
   if(n.type==='ThisExpression'){
     let owner=parents.get(n);while(owner&&(!/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(owner.type)||owner.type==='ArrowFunctionExpression'))owner=parents.get(owner);
     const assignment=parents.get(owner),left=assignment?.left;
     const standardPrototype=owner?.type==='FunctionExpression'&&assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===owner&&left?.type==='MemberExpression'&&left.object?.type==='MemberExpression'&&staticProperty(left.object)==='prototype'&&left.object.object?.type==='Identifier'&&standardPrototypes.has(left.object.object.name)&&!bound(left.object.object.name,scopes.get(left.object.object));
-    if(!options.nativeBundle&&(!options.nativeMethods||parents.get(owner)?.type!=='MethodDefinition')&&!ordinary?.descriptorThis(n)&&!standardPrototype)reasons.add('this 绑定尚未审查，需确认旧平台全局或对象上下文');
+    const nativeReceiver=options.nativeMethods&&(parents.get(owner)?.type==='MethodDefinition'||ordinary?.methodReceiver(n));
+    if(!options.nativeBundle&&!nativeReceiver&&!ordinary?.descriptorThis(n)&&!standardPrototype)reasons.add('this 绑定尚未审查，需确认旧平台全局或对象上下文');
     if(options.nativeBundle&&p?.type==='MemberExpression'&&typeof staticProperty(p)==='string'&&staticProperty(p).startsWith('$'))reasons.add('this 访问旧平台全局对象');
   }
   if(n.type==='MemberExpression'&&['then','catch','finally'].includes(staticProperty(n)))asynchronous=true;

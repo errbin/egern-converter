@@ -651,5 +651,33 @@ export function ordinaryReceivers(tree,libraryContracts=[]){
   }
   return false;
  }
- return {safeToString,descriptorThis};
+ function methodReceiver(n){
+  let fn=parents.get(n);while(fn&&(!functions.has(fn.type)||fn.type==='ArrowFunctionExpression'))fn=parents.get(fn);
+  if(!fn)return false;
+  const syntax=parents.get(fn);
+  if(syntax?.type==='MethodDefinition'||syntax?.type==='Property'&&syntax.method)return true;
+  const id=fn.id??(syntax?.type==='VariableDeclarator'&&syntax.init===fn?syntax.id:null),binding=id&&bindings.get(id);
+  if(!binding||binding.writes.length)return false;
+  const refs=binding.refs.filter(ref=>!(ref.start>=fn.start&&ref.end<=fn.end));
+  if(!refs.length)return false;
+  for(const ref of refs){
+   const propertyNode=parents.get(ref),object=parents.get(propertyNode);
+   if(propertyNode?.type!=='Property'||propertyNode.value!==ref||object?.type!=='ObjectExpression')return false;
+   const name=key(propertyNode),declaration=parents.get(object);
+   if(typeof name!=='string'||declaration?.type!=='VariableDeclarator'||declaration.init!==object||declaration.id.type!=='Identifier')return false;
+   if(object.properties.filter(p=>p.type==='Property'&&String(key(p))===name).length!==1)return false;
+   const receiver=bindings.get(declaration.id);
+   if(!receiver||receiver.writes.length||!receiver.refs.length)return false;
+   for(const use of receiver.refs){
+    const member=parents.get(use),call=parents.get(member),operation=parents.get(call),memberName=property(member);
+    if(member?.type!=='MemberExpression'||member.object!==use||member.computed||typeof memberName!=='string')return false;
+    if(memberName===name&&(call?.type!=='CallExpression'||call.callee!==member||call.optional||call.arguments.some(arg=>arg.type==='SpreadElement')))return false;
+    if(operation?.type==='AssignmentExpression'&&operation.left===member||operation?.type==='UpdateExpression'||operation?.type==='UnaryExpression'&&operation.operator==='delete'){
+     if(memberName===name)return false;
+    }
+   }
+  }
+  return true;
+ }
+ return {safeToString,descriptorThis,methodReceiver};
 }

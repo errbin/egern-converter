@@ -10,7 +10,7 @@ import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lo
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries} from '../analysis/libraries.mjs';
-import {functions,property,key,children,index,patch,initializedAfter,isolatedSwitchCase} from '../core/ast.mjs';
+import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase} from '../core/ast.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 import {lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
@@ -105,6 +105,9 @@ function compile(original,format,options,libraries){
  }
 }
 function emitNative(source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures}){
+ const compressionFallback=lowerCompressionFallbacks(source);
+ source=compressionFallback.source;
+ libraries.transformations.push(...compressionFallback.transformations);
  const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts});
  if(report.errors.length)throw Error(report.errors.join('；'));
  const comments=[];
@@ -1545,4 +1548,32 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const restored=index(parse(formatted,{ecmaVersion:'latest',sourceType:'module'}));
  if(restored.nodes.some(n=>restored.free(n)&&n.name.startsWith('$')))throw Error('公共库恢复后残留平台 API');
  return {errors:[],code:formatted,documentation,apis:report.apis,asynchronous:report.asynchronous||lifted.size>0,mode:'native',libraries:libraries.blocks,device_type_parameter:device.deviceParameter,verification_format:pipeline.verificationFormat};
+}
+
+function lowerCompressionFallbacks(source){
+ const comments=[],tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree),replace=new WeakMap(),transformations=[];let changed=false;
+ const {nodes,parents,bindings,free}=ix;
+ const identity=fn=>{
+  if(fn?.type==='ArrowFunctionExpression')return fn.params.length===1&&fn.params[0].type==='Identifier'&&fn.body.type==='Identifier'&&bindings.get(fn.params[0])===bindings.get(fn.body);
+  if(fn?.type==='FunctionExpression'&&fn.params.length===1&&fn.params[0].type==='Identifier'&&fn.body.type==='BlockStatement'&&fn.body.body.length===1){const ret=fn.body.body[0];return ret.type==='ReturnStatement'&&ret.argument?.type==='Identifier'&&bindings.get(fn.params[0])===bindings.get(ret.argument);}
+  return false;
+ };
+ const guarded=(test,name)=>{
+  if(test?.type!=='BinaryExpression'||!['===','=='].includes(test.operator))return false;
+  const type=test.left?.type==='UnaryExpression'&&test.left.operator==='typeof'?test.left:test.right?.type==='UnaryExpression'&&test.right.operator==='typeof'?test.right:null;
+  const value=type===test.left?test.right:test.left,argument=type?.argument?.type==='ChainExpression'?type.argument.expression:type?.argument;
+  return value?.type==='Literal'&&value.value==='function'&&argument?.type==='MemberExpression'&&free(argument.object,'$utils')&&property(argument)===name;
+ };
+ for(const n of nodes){
+  if(n.type!=='ConditionalExpression'||comments.some(c=>c.start>=n.start&&c.end<=n.end))continue;
+  const yes=n.consequent.type==='MemberExpression'&&free(n.consequent.object,'$utils')?property(n.consequent):null;
+  const no=n.alternate.type==='MemberExpression'&&free(n.alternate.object,'$utils')?property(n.alternate):null;
+  const name=yes??no,fallback=yes?n.alternate:n.consequent;
+  if(!['ungzip'].includes(name)||!identity(fallback)||!guarded(n.test,name))continue;
+  const declaration=parents.get(n),binding=declaration?.type==='VariableDeclarator'&&declaration.init===n&&declaration.id.type==='Identifier'?bindings.get(declaration.id):null;
+  if(!binding||binding.writes.length||!binding.refs.length||binding.refs.some(ref=>{const call=parents.get(ref);return call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement');}))continue;
+  replace.set(n,`$utils.${name}`);changed=true;
+  transformations.push({kind:'native-compression-fallback',line:source.slice(0,n.start).split('\n').length,api:name,reason:'将旧平台可选压缩函数与恒等回退映射为 Egern 原生压缩 API'});
+ }
+ return {source:changed?renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null):source,transformations};
 }

@@ -67,6 +67,21 @@ class NativeCompilerTests(unittest.TestCase):
                        {'name':'missing response','request':{'url':'https://example.test/'}})
         self.assertEqual(result['status'],'passed',result)
 
+    def test_generators_and_closed_object_receivers_keep_native_javascript_semantics(self):
+        from tools.egern_hub.verify import compare
+        cases=[
+            ('function* values(){yield "a";yield "b";} $done({body:[...values()].join("")});','ab'),
+            ('function read(){return this.value;} const box={value:"ok",read}; $done({body:box.read()});','ok'),
+        ]
+        for source,body in cases:
+            with self.subTest(source=source):
+                output=compile_source(source)
+                self.assertNotIn('$done',output)
+                result=compare(source,output,'surge','https://example.test/source.js',
+                               {'name':'native completion','request':{'url':'https://example.test/'},
+                                'expected':{'result':{'body':body}}})
+                self.assertEqual(result['status'],'passed',result)
+
     def test_message_mutation_and_qx_whole_response_fail_closed(self):
         for source in ['$response.body="changed";$done($response);',
                        'delete $response.status;$done($response);',
@@ -88,8 +103,8 @@ class NativeCompilerTests(unittest.TestCase):
         output=compile_source(source)
         self.assertNotIn('eval(',output)
         self.assertNotIn('jsjiami',output)
-        with self.assertRaises(ConversionError):
-            compile_source('const marker="jsjiami.com";eval(marker);$done({});')
+        output=compile_source('const marker="jsjiami.com";eval(marker);$done({});')
+        self.assertIn('eval(marker)',output)
         source='function $done(){return "local"}const marker="jsjiami.com";$done();eval(marker);'
         with self.assertRaises(ConversionError):compile_source(source)
 
