@@ -200,7 +200,9 @@ console.log(JSON.stringify({ok:true}));
         self.assertEqual(events[-1]['id'],'bad.js')
         self.assertIn(reports[1]['errors'][0],events[-1]['reason'])
 
-    def test_standard_prototype_receiver_does_not_allow_unknown_object_receivers(self):
+    def test_standard_prototype_and_unknown_receivers_are_ordinary_this(self):
+        # this 是标准 JavaScript：接收者是否可由静态证明不再决定是否拒绝；转换阶段
+        # 对无法证明接收者的位置注入 sloppy 语义包装，运行时保留全局对象语义。
         probe="""
 import {analyze} from './tools/js-analysis/analysis/analyze.mjs';
 import assert from 'node:assert/strict';
@@ -211,7 +213,8 @@ for(const source of [
  'Date.container.fixture=function(){return this.value};$done({});',
  'unreviewed.prototype.fixture=function(){return this.value};$done({});',
  'const Date={prototype:{}};Date.prototype.fixture=function(){return this.value};$done({});'
-])assert(check(source).some(error=>error.includes('this 绑定')));
+])assert.deepEqual(check(source),[]);
+assert(check('function read(){return this.$request.body}$done({});').some(error=>error.includes('this 读取旧平台全局对象')));
 console.log(JSON.stringify({ok:true}));
 """
         result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True)

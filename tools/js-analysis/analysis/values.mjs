@@ -553,22 +553,37 @@ export function ordinaryReceivers(tree,libraryContracts=[]){
   // Unknown inheritance may produce a callable instance (e.g. extends Function).
   return ordinaryClass(cls);
  }
- function constructedThis(n,fn){
-  const b=fn?.type==='FunctionDeclaration'?bindings.get(fn.id):null;
-  const member=parents.get(n);
-  if(!b||b.writes.length||!b.refs.length||member?.type!=='MemberExpression'||member.object!==n||typeof property(member)!=='string'||property(member).startsWith('$'))return false;
-  // Indirect constructor reflection could recover this function as a plain
-  // call. Keep that case outside the closed-new proof.
-  if(ix.nodes.some(r=>free(r,'Reflect')||r.type==='MemberExpression'&&(property(r)===undefined||property(r)==='constructor')))return false;
+ function constructorBinding(fn){
+  if(!fn)return null;
+  const syntax=parents.get(fn);
+  const id=fn.type==='FunctionDeclaration'?fn.id
+   :fn.type==='FunctionExpression'&&syntax?.type==='VariableDeclarator'&&syntax.init===fn&&syntax.id.type==='Identifier'?syntax.id
+   :fn.type==='FunctionExpression'&&syntax?.type==='AssignmentExpression'&&syntax.operator==='='&&syntax.right===fn&&syntax.left.type==='Identifier'?syntax.left
+   :null;
+  return id?bindings.get(id)??null:null;
+ }
+ function prototypeInstall(ref){
+  // 构造函数原型上的成员安装：Ctor.prototype = {...} 或 Ctor.prototype.name = ...
+  const p=parents.get(ref),q=parents.get(p);
+  if(p?.type!=='MemberExpression'||p.object!==ref||property(p)!=='prototype')return false;
+  if(q?.type==='AssignmentExpression'&&q.operator==='='&&q.left===p&&q.right.type==='ObjectExpression')return true;
+  if(q?.type!=='MemberExpression'||q.object!==p||typeof property(q)!=='string')return false;
+  const assignment=parents.get(q);
+  return assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.left===q;
+ }
+ function closedConstructor(b,instances=true){
+  if(!b||b.writes.length||!b.refs.length)return false;
   let constructions=0;
   for(const ref of b.refs){
    const p=parents.get(ref),q=parents.get(p);
    if(p?.type==='NewExpression'&&p.callee===ref){
-    const d=parents.get(p),instance=d?.type==='VariableDeclarator'&&d.init===p&&d.id.type==='Identifier'?bindings.get(d.id):null;
-    if(instance&&(instance.writes.length||instance.refs.some(r=>{const m=parents.get(r);return m?.type!=='MemberExpression'||m.object!==r||typeof property(m)!=='string';})))return false;
+    if(instances){
+     const d=parents.get(p),instance=d?.type==='VariableDeclarator'&&d.init===p&&d.id.type==='Identifier'?bindings.get(d.id):null;
+     if(instance&&(instance.writes.length||instance.refs.some(r=>{const m=parents.get(r);return m?.type!=='MemberExpression'||m.object!==r||typeof property(m)!=='string';})))return false;
+    }
     constructions++;continue;
    }
-   if(p?.type==='MemberExpression'&&p.object===ref&&property(p)==='prototype'&&q?.type==='AssignmentExpression'&&q.operator==='='&&q.left===p&&q.right.type==='ObjectExpression')continue;
+   if(prototypeInstall(ref))continue;
    if(p?.type==='Property'&&key(p)==='constructor'&&p.value===ref){
     const object=parents.get(p),assignment=parents.get(object),left=assignment?.left;
     if(assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===object&&left?.type==='MemberExpression'&&property(left)==='prototype'&&bindings.get(left.object)===b)continue;
@@ -576,6 +591,25 @@ export function ordinaryReceivers(tree,libraryContracts=[]){
    return false;
   }
   return constructions>0;
+ }
+ function constructedThis(n,fn){
+  const b=constructorBinding(fn),member=parents.get(n);
+  if(!b||member?.type!=='MemberExpression'||member.object!==n||typeof property(member)!=='string'||property(member).startsWith('$'))return false;
+  // 间接的构造器反射可能把该函数当普通调用取回，因此显式使用 constructor
+  // 或 Reflect 时否定这条证明。文件别处的动态成员键与当前绑定无关，而上面的
+  // 引用集合已验证构造器没有其他逃逸路径。
+  if(ix.nodes.some(r=>free(r,'Reflect')||r.type==='MemberExpression'&&property(r)==='constructor'))return false;
+  return closedConstructor(b);
+ }
+ function prototypeMethodThis(n,fn){
+  // Ctor.prototype.name = function(){...} 里的 this 是本地构造出的实例。
+  const assignment=parents.get(fn);
+  if(fn?.type!=='FunctionExpression'||assignment?.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.right!==fn)return false;
+  const left=assignment.left;
+  if(left.type!=='MemberExpression'||typeof property(left)!=='string'||property(left)==='prototype'||property(left).startsWith('$'))return false;
+  const prototype=left.object;
+  if(prototype?.type!=='MemberExpression'||property(prototype)!=='prototype'||prototype.object.type!=='Identifier')return false;
+  return closedConstructor(bindings.get(prototype.object),false);
  }
  function staticFieldThis(n){
   const member=parents.get(n);
@@ -595,6 +629,7 @@ export function ordinaryReceivers(tree,libraryContracts=[]){
   if(staticFieldThis(n))return true;
   let fn=parents.get(n);while(fn&&(!functions.has(fn.type)||fn.type==='ArrowFunctionExpression'))fn=parents.get(fn);
   if(constructedThis(n,fn))return true;
+  if(prototypeMethodThis(n,fn))return true;
   const assignment=parents.get(fn),left=assignment?.left;
   if(fn?.type==='FunctionExpression'&&assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===fn&&left?.type==='MemberExpression'&&left.object.type==='MemberExpression'&&free(left.object.object,'Promise')&&property(left.object)==='prototype'&&property(left)==='delay'){const member=parents.get(n);return member?.type==='MemberExpression'&&member.object===n&&property(member)==='then';}
   if(fn?.type==='FunctionExpression'&&assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===fn&&left?.type==='MemberExpression'&&left.object.type==='MemberExpression'&&free(left.object.object,'Object')&&property(left.object)==='prototype'&&typeof property(left)==='string'&&!['constructor','__proto__','toString','valueOf'].includes(property(left))){

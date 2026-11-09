@@ -102,7 +102,17 @@ for(const {node:n,parent:p,key} of nodes) {
     const assignment=parents.get(owner),left=assignment?.left;
     const standardPrototype=owner?.type==='FunctionExpression'&&assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===owner&&left?.type==='MemberExpression'&&left.object?.type==='MemberExpression'&&staticProperty(left.object)==='prototype'&&left.object.object?.type==='Identifier'&&standardPrototypes.has(left.object.object.name)&&!bound(left.object.object.name,scopes.get(left.object.object));
     const nativeReceiver=options.nativeMethods&&(parents.get(owner)?.type==='MethodDefinition'||ordinary?.methodReceiver(n));
-    if(!options.nativeBundle&&!nativeReceiver&&!ordinary?.descriptorThis(n)&&!standardPrototype)reasons.add('this 绑定尚未审查，需确认旧平台全局或对象上下文');
+    // this 本身是标准 JavaScript：被注入的 sloppy 语义包装调用包住的 this 直接放行，
+    // 运行时由该包装把 null/undefined 还原成全局对象，不需要静态证明接收者。
+    const sloppyWrapped=!!options.sloppyThisHelper&&p?.type==='CallExpression'&&p.callee?.type==='Identifier'&&p.callee.name===options.sloppyThisHelper&&p.arguments.length===1&&p.arguments[0]===n;
+    // this 是标准 JavaScript：接收者已证明的保持原样，无法证明接收者的位置已由
+    // 转换阶段包成 sloppy 语义包装（运行时把 null/undefined 还原成全局对象），
+    // 两者都不需要在这里再拦。仍要拦的只有 sloppy 语境下 this.$xxx 这类读取旧平台
+    // 全局对象的写法，它的等价性无法静态证明。
+    if(!options.nativeBundle&&!sloppyWrapped&&!nativeReceiver&&!ordinary?.descriptorThis(n)&&!standardPrototype){
+      const platformReceiver=p?.type==='MemberExpression'&&p.object===n&&typeof staticProperty(p)==='string'&&staticProperty(p).startsWith('$');
+      if(platformReceiver)reasons.add('this 读取旧平台全局对象：'+staticProperty(p));
+    }
     if(options.nativeBundle&&p?.type==='MemberExpression'&&typeof staticProperty(p)==='string'&&staticProperty(p).startsWith('$'))reasons.add('this 访问旧平台全局对象');
   }
   if(n.type==='MemberExpression'&&['then','catch','finally'].includes(staticProperty(n)))asynchronous=true;
@@ -114,7 +124,7 @@ for(const {node:n,parent:p,key} of nodes) {
 }
 if(!options.nativeStandardGlobals&&/jsjiami\.com|javascript-obfuscator|selfDefending/.test(source))reasons.add('混淆/自防御代码尚未完成等价性审查');
 const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
-if(!done&&!options.nativeEntry&&!scheduledOnly)reasons.add('没有可识别的 $done 完成入口');
+if(!done&&!options.nativeEntry&&!scheduledOnly&&!options.allowNoCompletion)reasons.add('没有可识别的 $done 完成入口');
 // Check literal options during conversion as well as dynamic values at runtime.
 // Scope-aware: an author's local $task/$httpClient is not a platform API.
 const checkOptions=(object,allowed,label)=>{

@@ -31,8 +31,10 @@ class ScheduleLanguageFlowTests(unittest.TestCase):
         self.check('const value=new Record();function Record(){flag="kept";this.read=()=>flag} $done({body:value.read()});','kept')
         self.check('const r=new Record();function Record(){this.read=()=>flag;flag="x"}$done({body:r.read()});','x')
         self.check('function Record(v){this.value=v}Record.prototype={constructor:Record};const r=new Record("kept");$done({body:r.value});','kept')
-        for source in ['function Record(){this.value="x"}Record();$done({});','function Record(){this.value="x"}const r=new Record();const f=r.constructor;f();$done({});']:
-            with self.assertRaises(ConversionError):convert_script(source,'Fixture',URL,'')
+        # this 是标准 JavaScript：普通调用构造器、取到 constructor 后再普通调用都不再
+        # 拒绝，转换后由注入的 sloppy 语义包装把 null/undefined 还原成全局对象。
+        self.check('function Record(){this.value="x"}Record();$done({body:typeof this});','object')
+        self.check('function Record(){this.value="x"}const r=new Record();const f=r.constructor;f();$done({body:"kept"});','kept')
 
     def test_http_error_status_is_a_response_and_transport_error_is_separate(self):
         source='const opts={url:"https://api.test/",throwHttpErrors:false};$httpClient.get(opts,(e,r,b)=>$done({body:e||r.status+":"+b+":"+opts.throwHttpErrors}));'

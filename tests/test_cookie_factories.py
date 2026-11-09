@@ -83,8 +83,11 @@ class CookieFactoryTests(unittest.TestCase):
             '"use strict";const r=init();r.done();',
         ]:
             with self.subTest(entry=entry),self.assertRaises(ConversionError):compile_source(entry+FACTORY)
+        # 接收者逃逸的实例方法里的完成结果仍可转换：this 的 sloppy 语义由包装保留，
+        # 完成流按方法调用点传播，不再因为没有静态接收者证明而拒绝。
         source='const r=new Env("Fixture");unknown(r);r.done();function Env(name){this.name=name;this.done=()=>$done({})}'
-        with self.assertRaises(ConversionError):compile_source(source)
+        output=compile_source(source)
+        self.assertNotIn('$done',output)
 
     def test_top_level_message_this_is_readonly_and_lexical(self):
         source='if(this.$request)$persistentStore.write(this.$request.body,"body");$done({});'

@@ -1,5 +1,5 @@
 import {pathSetterField} from '../http/requests.mjs';
-import {finiteLiteralMember} from '../analysis/values.mjs';
+import {finiteLiteralMember,ordinaryReceivers} from '../analysis/values.mjs';
 import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
@@ -535,6 +535,46 @@ export function lowerFunctionDispatch(source){
  }
  const render=n=>replace.has(n)?replace.get(n):patch(source,n,render);
  return {source:render(ix.nodes[0]),transformations,rejected};
+}
+
+// 旧平台脚本运行在 sloppy 模式：普通调用时 this 被强制成全局对象；Egern 产物是 ES
+// 模块（严格模式），普通调用得到 undefined。this 本身是标准 JavaScript，不改写它，
+// 只把"接收者已被证明"之外的位置包成运行时保持的 sloppy 语义：
+//   this  ->  sloppyThis(this)
+// 方法/构造器/原型方法/类体/严格模式函数里的 this 保持原样，避免打乱既有数据流；
+// 类体与 'use strict' 函数本来就是严格语义，无需处理。this.$xxx 表示读取旧平台对象，
+// 留给平台对象降级或分析器处理，不在这里自动改写。
+export function lowerSloppyThis(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),parents=ix.parents,edits=[];
+ const ordinary=ordinaryReceivers(tree,[]);
+ const strictContext=n=>{
+  for(let p=parents.get(n);p;p=parents.get(p)){
+   if(p.type==='Program')return false;
+   if(p.type==='ClassBody'||p.type==='ClassDeclaration'||p.type==='ClassExpression'||p.type==='PropertyDefinition'||p.type==='StaticBlock')return true;
+   if(/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(p.type)&&p.body?.body?.some(s=>s.directive==='use strict'))return true;
+  }
+  return false;
+ };
+ const receiverProven=n=>{
+  try{return !!(ordinary.descriptorThis(n)||ordinary.methodReceiver(n));}catch{return false;}
+ };
+ const platformReceiver=n=>{
+  const p=parents.get(n);
+  if(p?.type!=='MemberExpression'||p.object!==n)return false;
+  const name=p.computed?(p.property?.type==='Literal'?p.property.value:undefined):p.property?.name;
+  return typeof name==='string'&&name.startsWith('$');
+ };
+ for(const n of ix.nodes){
+  if(n.type!=='ThisExpression'||strictContext(n)||receiverProven(n)||platformReceiver(n))continue;
+  edits.push({start:n.start,end:n.end,line:source.slice(0,n.start).split('\n').length});
+ }
+ if(!edits.length)return {source,transformations:[],globalName:null,helperName:null};
+ const taken=new Set(ix.nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let name=base,n=2;while(taken.has(name))name=base+n++;taken.add(name);return name;};
+ const globalName=fresh('scriptGlobalThis'),helperName=fresh('sloppyThis');
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+helperName+'(this)'+output.slice(edit.end);
+ return {source:output,globalName,helperName,transformations:edits.map(({line})=>({kind:'sloppy-this',to:helperName+'(this)',line,reason:'sloppy 模式下 this 为 null/undefined 时取全局对象，ES 模块严格模式需要显式保留'}))};
 }
 
 // Lower accessors on a single closed factory instance to ordinary local calls.
