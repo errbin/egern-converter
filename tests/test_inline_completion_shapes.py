@@ -15,6 +15,7 @@ class InlineCompletionShapeTests(unittest.TestCase):
     def test_closed_direct_driver_is_accepted(self):
         self.check("function run(cb){return cb()}run(function(){$done({body:'ok'})});")
         self.check("const h={cb:function(){$done({body:'ok'})}};h.cb();")
+        self.check("const h={run:function(cb){return cb({})}};h.run(function(){$done({body:'ok'})});")
 
     def test_unprovable_shapes_are_rejected(self):
         for source in [
@@ -25,6 +26,8 @@ class InlineCompletionShapeTests(unittest.TestCase):
             "unknown(...[function(){$done({body:'ok'})}]);",
             "const runtime={wrap(inner,outer){return {next(){return inner({})}}}};"
             "const g=runtime.wrap(function(){$done({body:'ok'})},function(){});g.next();",
+            "const h={run:function(cb){return cb({})}};unknown(h);h.run(function(){$done({body:'ok'})});",
+            "const h={run:function(cb){return cb({})}};h.run=function(){return 1};h.run(function(){$done({body:'ok'})});",
         ]:
             with self.subTest(source=source),self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'')

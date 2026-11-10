@@ -360,6 +360,16 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     else if(callee&&!callee.writes.length&&callee.refs.length){
      calls=callee.refs.map(r=>parents.get(r));
      if(calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==callee.refs[i]||c.arguments.some(a=>a.type==='SpreadElement')))return null;
+    }else if(parent?.type==='Property'&&parent.value===fn&&parent.kind==='init'){
+     // 对象方法简写与函数声明具有相同参数绑定，但调用点必须全部通过同一
+     // 未改写对象的静态成员读取；对象逃逸或调用其他成员都无法证明目标身份。
+     const object=parents.get(parent),declaration=parents.get(object),id=declaration?.type==='VariableDeclarator'&&declaration.init===object?declaration.id:null;
+     const owner=id?.type==='Identifier'?bindings.get(id):null,name=key(parent);
+     if(!owner||owner.writes.length||name===undefined||!owner.refs.length)return null;
+     const members=owner.refs.map(r=>parents.get(r));
+     if(members.some((m,i)=>m?.type!=='MemberExpression'||m.object!==owner.refs[i]||property(m)!==name))return null;
+     calls=members.map(m=>parents.get(m));
+     if(calls.some((c,i)=>c?.type!=='CallExpression'||c.callee!==members[i]||c.arguments.some(a=>a.type==='SpreadElement')))return null;
     }else if(parent?.type==='MethodDefinition'){
      calls=closedMethodCalls(parent);if(!calls)return null;
     }else return null;
