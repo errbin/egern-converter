@@ -1388,27 +1388,50 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   const selector=dynamicMethod?fresh('httpMethod'):null;
   const url=render(f.get('url')),options=`{${out.join(', ')}}`,callee=dynamicMethod?`((${selector}) => {if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${callbackSelector?render(callbackSelector):render(declaredMethod)+'.toLowerCase()'}).bind(${context}.http)`:`${context}.http.${method.toLowerCase()}`;
-  const call=`${callee}(${url}, ${options})`,code=f.runtimeRequest?`((${f.runtimeRequest.name}) => ${call})(${render(f.runtimeRequest.expression)})`:call;
+  const call=`${callee}(${url}, ${options})`,runtime=f.runtimeRequest,guard=runtime?.binaryGuard?`if (${runtime.name} && typeof ${runtime.name} === 'object' && (${runtime.name}["binary-mode"] === true || ${runtime.name}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');`:'',code=runtime?`((${runtime.name}) => {${guard}return ${call};})(${render(runtime.expression)})`:call;
   return {code,url,options,callee,dynamic:dynamicMethod,binary:flag(f,'binary-mode',false),full:flag(f,'full-header-mode',false),runtimeRequest:f.runtimeRequest};
  }
  function forwardedHTTPFields(input){
   const parsedRequest=input?.type==='CallExpression'&&input.arguments.length===1&&input.callee.type==='MemberExpression'&&free(input.callee.object,'JSON')&&property(input.callee)==='parse';
   if(input?.type!=='Identifier'&&!parsedRequest)return null;
+  // 只接受从当前请求对象直接转发的 headers；其内容在运行期确定，发送前
+  // 仍由二进制模式守卫拒绝无法静态映射的响应形态。
+  const requestHeaders=(node,seen=new Set())=>{
+   if(node?.type==='LogicalExpression'&&node.operator==='||')return requestHeaders(node.left,seen)&&requestHeaders(node.right,seen);
+   if(node?.type==='ObjectExpression')return !node.properties.length;
+   if(node?.type==='Identifier'&&free(node,'$request'))return true;
+   if(node?.type!=='MemberExpression'||node.computed||property(node)!=='headers'||node.object.type!=='Identifier')return false;
+   if(free(node.object,'$request'))return true;
+   const binding=bindings.get(node.object);if(!binding||seen.has(binding))return false;
+   const fn=nodes.find(candidate=>functions.has(candidate.type)&&candidate.params.some(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding));
+   if(!fn)return false;
+   const position=fn.params.findIndex(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding);
+   const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fnBinding=id?.type==='Identifier'?bindings.get(id):null;
+   let calls;
+   if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&!parent.arguments.some(argument=>argument.type==='SpreadElement'))calls=[parent];
+   else if(fnBinding&&!fnBinding.writes.length&&fnBinding.refs.length)calls=fnBinding.refs.map(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(argument=>argument.type==='SpreadElement')?call:null;});
+   else return false;
+   if(!calls.length||calls.some(call=>!call))return false;
+   const next=new Set(seen);next.add(binding);
+   return calls.every(call=>requestHeaders(call.arguments[position],next));
+  };
   // A closed request helper may normalize a string/object parameter and then
   // mutate that same record before dispatch. Keep those authored mutations in
   // place and project the live fields at the native call. Every external
   // caller and every field the helper touches must fit this closed record.
   function closedLiveRequest(ref){
-   if(ref?.type!=='Identifier')return null;
-   const binding=bindings.get(ref);if(!binding)return null;
+   const stop=()=>null;
+   if(ref?.type!=='Identifier')return stop('ref');
+   const binding=bindings.get(ref);if(!binding)return stop('binding');
    const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
-   if(!fn)return null;
+   if(!fn)return stop('fn');
    const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fnBinding=id?.type==='Identifier'?bindings.get(id):null;
    const position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding);
    let calls;
    if(parent?.type==='MethodDefinition')calls=closedMethodCalls(parent);
+   else if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&!parent.arguments.some(a=>a.type==='SpreadElement'))calls=[parent];
    else{
-    if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
+    if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return stop('fn binding');
     calls=fnBinding.refs.map(ref=>{
     const direct=parents.get(ref);
     if(direct?.type==='CallExpression'&&direct.callee===ref&&!direct.optional&&!direct.arguments.some(a=>a.type==='SpreadElement'))return direct;
@@ -1433,23 +1456,56 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     });
    }
    if(!calls?.length||calls.some(c=>!c||!c.arguments[position]&&fn.params[position]?.type!=='AssignmentPattern'))return null;
+   // 直接 IIFE 或具名 helper 的实参可能来自外层请求对象。除了当前调用点，
+   // 该对象的其它引用也必须只是静态字段读取或已证明安全的日志/字符串化观察；
+   // 交给未知函数或写入成员都会让封闭字段证明失效。
+   const closedArgument=node=>{
+    if(node?.type!=='Identifier')return true;
+    const b=bindings.get(node);if(!b)return true;
+    for(const ref of b.refs){
+     if(ref===node)continue;
+     const p=parents.get(ref),q=parents.get(p);
+     if(p?.type==='MemberExpression'&&p.object===ref){
+      if(property(p)===undefined)return false;
+      if(q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete')return false;
+      continue;
+     }
+     if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+      if(consoleObservation(p)||p.callee.type==='MemberExpression'&&free(p.callee.object,'JSON')&&property(p.callee)==='stringify')continue;
+      return false;
+     }
+     return false;
+    }
+    return true;
+   };
    const shape=(node,seen=new Set())=>{
-    node=resolve(node,seen);if(!node)return null;
+    node=resolve(node,seen);if(!node)return stop('shape node');
     if(node.type==='Literal'&&typeof node.value==='string'||node.type==='TemplateLiteral')return new Set(['url']);
-    if(node.type!=='ObjectExpression')return null;
+    if(node.type!=='ObjectExpression')return stop('shape type:'+node.type);
     const keys=new Set();
     for(const p of node.properties){
-     if(p.type!=='Property'||p.kind!=='init'||p.method||key(p)===undefined||key(p)==='__proto__')return null;
-     const k=String(key(p));if(!['url','headers','body','params'].includes(k)||keys.has(k))return null;keys.add(k);
+     if(p.type!=='Property'||p.kind!=='init'||p.method||key(p)===undefined||key(p)==='__proto__')return stop('shape property');
+     const k=String(key(p));if(!['url','method','headers','body','bodyBytes','params','timeout','policy','node','redirection','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'].includes(k)||keys.has(k))return stop('shape key:'+k);keys.add(k);
      if(k==='headers'){
-      if(p.value.type!=='ObjectExpression'||p.value.properties.some(h=>h.type!=='Property'||h.kind!=='init'||h.method||key(h)===undefined||['__proto__','constructor'].includes(String(key(h)))))return null;
-      keys.headerNames=new Set(p.value.properties.map(h=>String(key(h)).toLowerCase()));
+      const headerValue=resolve(p.value,seen);
+      if(headerValue.type!=='ObjectExpression')return stop('shape headers:'+headerValue.type);
+      const headerNames=new Set();
+      for(const h of headerValue.properties){
+       if(h.type==='SpreadElement'){
+        if(!requestHeaders(h.argument))return stop('shape header spread');
+        keys.dynamicHeaders=true;continue;
+       }
+       if(h.kind!=='init'||h.method||key(h)===undefined||['__proto__','constructor'].includes(String(key(h))))return stop('shape header property');
+       headerNames.add(String(key(h)).toLowerCase());
+      }
+      keys.headerNames=headerNames;
      }
     }
     return keys.has('url')?keys:null;
    };
    const shapes=calls.map(c=>shape(c.arguments[position]??fn.params[position]?.right));
-   if(shapes.some(s=>!s))return null;
+   if(shapes.some(s=>!s))return stop('shape calls');
+   if(calls.some(c=>!closedArgument(c.arguments[position])))return stop('argument escape');
    const allowed=new Set(['constructor','url','method','headers','body','bodyBytes','params','timeout','policy','node','redirection','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode']);
    let hasDispatch=false;
    for(const r of binding.refs){
@@ -1482,14 +1538,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(p?.type==='CallExpression'&&p.arguments.includes(r)&&p.callee.type==='MemberExpression'&&free(p.callee.object,'$httpClient')){hasDispatch=true;continue;}
     return null;
    }
-   if(!hasDispatch)return null;
+   if(!hasDispatch)return stop('dispatch');
    // Static call-site records establish that Accept and the binary response
    // flags are absent. Do not choose a response mode from a runtime header.
-   if(shapes.some(s=>s.has('binary-mode')||s.has('full-header-mode')||s.headerNames?.has('accept'))||nodes.some(n=>n.type==='MemberExpression'&&n.object.type==='MemberExpression'&&bindings.get(n.object.object)===binding&&property(n.object)==='headers'&&['accept','binary-mode','full-header-mode'].includes(String(property(n)).toLowerCase())&&(()=>{const use=parents.get(n);return use?.type==='AssignmentExpression'&&use.left===n||use?.type==='UpdateExpression'||use?.operator==='delete';})()))return null;
+   if(shapes.some(s=>s.has('binary-mode')||s.has('full-header-mode')||!s.dynamicHeaders&&s.headerNames?.has('accept'))||nodes.some(n=>n.type==='MemberExpression'&&n.object.type==='MemberExpression'&&bindings.get(n.object.object)===binding&&property(n.object)==='headers'&&['accept','binary-mode','full-header-mode'].includes(String(property(n)).toLowerCase())&&(()=>{const use=parents.get(n);return use?.type==='AssignmentExpression'&&use.left===n||use?.type==='UpdateExpression'||use?.operator==='delete';})()))return null;
    const request=fresh('httpRequest'),result=new Map();
    const read=name=>{const value={type:'Identifier',name:'httpRequestField',start:ref.start,end:ref.end};generated.set(value,`${request}[${JSON.stringify(name)}]`);if(['headers','body'].includes(name))optionalHTTPFields.add(value);return value;};
    for(const name of ['url','headers','body'])result.set(name,read(name));
-   result.runtimeRequest={name:request,expression:ref};return result;
+   result.runtimeRequest={name:request,expression:ref,binaryGuard:shapes.some(s=>s.dynamicHeaders)};return result;
   }
   const forwarding=new Set();
   const consoleMethods=new Set(['log','warn','error','info','debug']);
