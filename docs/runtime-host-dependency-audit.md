@@ -148,6 +148,137 @@
 
 E2E：`round8-final.json` 与 `round7-final.json` 逐组合比较，`327` 个 key 相同，成功组合 `122` 不变，失败 URL 集合 `67` 不变，组合差异 `0`。
 
+## 第十二轮：Node/浏览器双目标打包产物的死分支
+
+### 目标集与基线
+
+本轮只处理 `ios151/Rewrite` 下首阻塞为 Node/浏览器全局的 12 个 URL。基线为
+`round11-final3-e2e.json`：**46/109 URL（138/327 组合）**。验收口径仍然是只有
+端到端成功数上升才算有效增益。
+
+| 源文件 | URL 名称 | 首发形态 |
+| --- | --- | --- |
+| `1a3251d4900a71af.js` | `insav-tv/dist/insav.js` | `globalThis` + `require` + `window` |
+| `a121e6fbbd0a770c.js` | `luolita/dist/luolita.js` | `globalThis` + `require` + `window` |
+| `a274a723dd76f7b5.js` | `Hanxiucao/6lpu5.response.js` | `globalThis` + `require` + `window` |
+| `d59d28a0de8558fd.js` | `huangdouduanju/dist/huangdou.js` | `globalThis` + `require` + `window` |
+| `196340e065078c7d.js` | `hvvj0/dist/fi11.js` | `globalThis` + `require` + `window` |
+| `63846a496abf924d.js` | `porntube/dist/porntube.js` | `globalThis` + `require` + `window` |
+| `b169b9bd81b670b1.js` | `qiyoushe/dist/qiyoushequ.js` | `globalThis` + `require` + `window` |
+| `bc599fd45d7145d9.js` | `insav.tv.js` | `process` + `require` |
+| `2545ad685f70738b.js` | `xfbs.js` | `process` + `require` |
+| `07da264c8f8eeda1.js` | `cad.js` | `window` |
+| `7c129fc9129dcfcc.js` | `porntube/dist/porntube-frontend.js` | `window` + DOM |
+| `e67757fe27d87eca.js` | `zimuquan.js` | `window` |
+
+### 形态普查与归组
+
+对 12 份源码逐文件取 free identifier 的父节点和上下文片段后，出现形态归为
+以下六类。计数可重叠，不求和。
+
+| 形态 | 出现方式 | 12 个脚本中的分布 |
+| --- | --- | --- |
+| `typeof X !== "undefined"` 探测 | `window`、`process`、`require`、`module`、`global`；常用于平台/Node 分支和回退链 | 9 个 `globalThis` 模板脚本 + 2 个 Env 脚本 + 3 个 window 脚本 |
+| `X.Y` 静态读取 | `globalThis.process`、`globalThis.window`、`globalThis.require`、`globalThis.fetch`、`globalThis.crypto`、`window.crypto`/`msCrypto` | 9 个模板脚本；`porntube-frontend` |
+| `X` 作为值传递 | 裸 `window`、`process`、`require`、`global`；或 `const root = window` | `cad`、`zimuquan`、`porntube-frontend` 及模板脚本的回退链 |
+| `require(...)` 调用 | `require("fs")`、`require("path")`、`require("crypto")`、`require("got")`、`require("node-fetch")`、`require("fetch-cookie")` | 9 个模板脚本 + `insav.tv` + `xfbs` |
+| `process.env.*` / `process.cwd()` / `process.exit()` | Node Env、Node HTTP 分支、退出路径 | 9 个模板脚本 + `insav.tv` + `xfbs` |
+| 条件赋值回退链 / runtime shim | `globalThis.fetch || (globalThis.fetch = require("node-fetch"))`；`this.send.call(this.env, ...)`；webpack/vite 的 `__webpack_require__` 包装 | 模板脚本；`insav.tv`/`xfbs` 的 Env `send/get` |
+
+模板脚本的共性结构是：
+
+- `const has = n => n in globalThis` 加 `switch(true)` 选平台；
+- `"undefined" != typeof globalThis ? globalThis : typeof window != "undefined" ? window : ...`；
+- `Boolean(globalThis.process?.versions?.node)` 作为 Node 分支；
+- crypto-js UMD 的 `window.crypto`/`self.crypto`/`globalThis.crypto` 与 `require("crypto")`；
+- Node-only 分支里的 `globalThis.fetch = require(...)`、`process.cwd()`、`process.exit()`。
+
+`insav.tv`/`xfbs` 是封闭 Env：`getEnv()/isNode()`、`require("fs"/"path"/"got")`、
+`process.cwd()`、`process.exit()`，以及 `send` 内的 `s = this.get; s.call(this, ...)`。
+
+`cad`/`zimuquan` 的 `window` 出现在混淆器的 catch 回退赋值；`porntube-frontend`
+直接读取 `window.CryptoJS` 并用 `document.createElement("script")` 加载脚本。
+
+### 已实现的折叠边界
+
+1. **缺失全局的 `typeof` 探测**：目标 Egern 宿主没有 `window`、`process`、`require`、
+   `module`、`global` 时，`typeof X` 可折成 `"undefined"`。探测结果只能流入条件、
+   比较、逻辑运算、`Boolean`/`String`/`Number`、已知完成调用，或经单次绑定继续流入
+   这些位置；传入未知函数时 `assertSafeMissingGlobalProbes` 直接拒绝。
+2. **`globalThis` 缺失静态成员**：只对 `globalThis.process/window/require/module/global`
+   的静态读取折叠，且必须处于探测/分支/空值比较/逻辑回退位置。直接作为业务值
+   （如 `$done({body: globalThis.process})`）、动态成员 `globalThis[key]`、或
+   任何 `globalThis.process = ...` 写入都保持拒绝。
+3. **Node 死分支**：`if (typeof process !== "undefined") { require("fs") }` 在目标宿主
+   折成不可达分支后，`require` 调用随分支删除；活分支里的 `require(...)` 结果参与
+   业务仍然拒绝。
+4. **`process.env`**：只有位于已证明不可达的 Node 分支或探测回退右侧时才随分支删除；
+   直接读取并影响业务逻辑仍然拒绝。
+5. **打包 runtime shim**：不按名称猜测 `require`/`__webpack_require__`。只有当完整
+   库正文命中已审查的 AST 契约哈希（CryptoJS、fzstd 等）时，才按原字节保护库正文；
+   contract 不命中、正文被改写或只是注释伪装时仍走普通分析并拒绝。
+6. **库外全局别名**：`const x = globalThis` 只有在 `x` 在当前可见源码中完全没有引用时
+   才替换为可恢复标记，恢复阶段改回 `globalThis`；一旦业务读取该别名就保持原文。
+7. **封闭消息对象**：只允许 helper 局部快照参数上的 `status` 写入；直接写宿主
+   `$response.status`、`$response.statusCode`、未知 callee、对象逃逸、动态成员和
+   headers 方法调用仍然拒绝。
+8. **封闭 Env 别名**：`(alias = instance).method` 和 `method.call(alias, ...)` 只在
+   alias 单次写入、全部引用是静态成员或 `.call` 首参、无重绑/动态成员/方法写入/逃逸
+   时参与折叠；否则整族拒绝。
+
+### 双向反例
+
+新增 `tests/test_node_browser_dead_branches.py`，正向覆盖平台 switch、Node
+`require` 死分支、`globalThis.process/window` 探测和本地同名绑定；反向覆盖：
+
+- 探测结果传入未知函数；
+- 可达的 `globalThis`/浏览器分支；
+- `require()` 结果参与业务；
+- `process.env` 影响业务；
+- `globalThis`/`window` 写入；
+- `globalThis[key]` 动态成员；
+- `globalThis.process` 直接作为业务值。
+
+另有既有 `test_window_fallback_folding`、`test_multi_platform_env`、
+`test_closed_message_objects`、`test_public_libraries` 的双向回归。
+
+### 未通过的下游层
+
+剩余 10 个目标脚本没有在放宽边界的前提下硬凑成功，当前首阻塞如下：
+
+| 源文件 | 当前首阻塞 | 判定 |
+| --- | --- | --- |
+| `1a3251d4900a71af.js` | `dt($request)` 整体传递并修改 headers/body | 可达宿主请求修改，拒绝正确 |
+| `bc599fd45d7145d9.js` | HTTP 请求声明后被修改（offset 约 91638） | 需要独立 live request 证明 |
+| `a274a723dd76f7b5.js` | 写入 `$response` 宿主对象 | 拒绝正确 |
+| `d59d28a0de8558fd.js` | 完成结果形状无法静态确定 | 后续完成传播层 |
+| `196340e065078c7d.js` | `globalThis._fi11_vid = o` 真实全局写入 | 拒绝正确 |
+| `2545ad685f70738b.js` | Env 绑定存在更早 `f = null` 写入，随后 `$done` 调用者不可解析 | 拒绝正确 |
+| `b169b9bd81b670b1.js` | 完成结果形状；可达 `$response` 包装 | 拒绝正确 |
+| `07da264c8f8eeda1.js` | 可达 `= window` catch 回退 | 拒绝正确 |
+| `7c129fc9129dcfcc.js` | DOM/CryptoJS/localStorage | 宿主能力不可证明，拒绝正确 |
+| `e67757fe27d87eca.js` | 可达 `= window` catch 回退 | 拒绝正确 |
+
+### 验收记录
+
+| 指标 | 第十一轮基线 | 第十二轮 | 变化 |
+| --- | ---: | ---: | ---: |
+| URL 成功 | 46/109 | **48/109** | **+2** |
+| 组合成功 | 138/327 | **144/327** | **+6** |
+| 成功 URL 回退 | — | 0 | 0 |
+
+新增成功 URL（三格式全部通过）：
+
+- `https://raw.githubusercontent.com/ios151/Rewrite/main/luolita/dist/luolita.js`
+- `https://raw.githubusercontent.com/ios151/Rewrite/main/porntube/dist/porntube.js`
+
+两个 URL 均在 `qx`、`surge`、`loon` 上用明文响应做了 `verify.compare` 行为差分，
+结果均为 `passed`、`differences=[]`。
+
+全量单测：`539` tests，`38` failures；失败测试名集合与干净 HEAD `01f2e3a`
+的 `525` tests / `38` failures 相比 `diff=0`，本轮没有新增失败。既有失败属于其他
+并行工作流，本轮未修改。
+
 ## 结论
 
 运行环境族 21 个 URL 中，能在不放宽拒收边界前提下静态证明的只有“标准回退链、封闭成员探测、封闭 Env 探测方法”这类局部结构；它们单独都不能把任何一个 URL 推到 E2E 成功，且会暴露新的独立证明族。因此本轮保持拒绝，不为单个脚本加特例，也不把平台对象映射到未经验证的 `ctx` 字段。
