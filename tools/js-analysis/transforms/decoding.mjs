@@ -864,8 +864,8 @@ function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
  // 轮转校验和可能经由同族外壳或本地别名调用解码器，先把外壳并入可解析集合
  if(shells)for(const shell of shells)wrappers.add(shell);
  for(let i=0;i<values.length;i++){
-  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks',alphabet,shells});if(checksumValue===target)return i;if(process.env.EGERN_DEBUG_ROT&&i<2)console.error('DBG checksum',i,checksumValue,'target',target);}
-  catch(error){if(process.env.EGERN_DEBUG_ROT&&i<2)console.error('DBG eval error',i,String(error.message).slice(0,90),'wrappers',wrappers.size,'shells',shells?.size);}
+  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks',alphabet,shells});if(checksumValue===target)return i;}
+  catch{}
   values.push(values.shift());
  }
  fail('js-obfuscator 轮转校验在一轮内没有匹配');
