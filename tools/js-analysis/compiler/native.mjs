@@ -1749,6 +1749,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(info&&!info.snapshot){if(k==='body')return info.body;if(k==='bodyBytes')return info.bytes;if(k==='statusCode')return render(o)+'.status';if(k==='headers'&&info.full)return `Object.entries(${render(o)}.headers).flatMap(([field, value]) => (Array.isArray(value) ? value : [value]).map(value => ({field, value})))`;}
    if(free(o,'$script')){if(k==='name')return context+'.script.name';if(k==='binaryBodyMode')return String(!!options.binary);if(k==='startTime'){if(!started){started=fresh('scriptStarted');prefix.push(`const ${started} = Date.now();`);}return format==='loon'?started:`(${started} / 1000)`;}}
    if(free(o,'$environment'))return k==='language'?context+'.app.language':context+'.env';
+   if(free(o,'$notification')&&k==='post'){
+    const p=parents.get(n);
+    if(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator)||['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===n||p?.type==='LogicalExpression'&&p.left===n)return context+'.notify';
+    fail(n,'通知方法引用只能用于存在性判断或直接调用');
+   }
    if(free(o,'$network')){const map={wifi:'wifi',v4:'ipv4',v6:'ipv6',dns:'dnsServers','cellular-data':'cellular'};if(!map[k])fail(n,'未知网络字段');return context+'.device.'+map[k];}
   }
   if(n.type==='CallExpression'){
