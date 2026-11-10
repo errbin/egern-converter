@@ -885,7 +885,50 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   let f;if(stringValue(input))f=new Map([['url',input]]);else{
    f=forwardedHTTPFields(input);
-   if(!f&&free(input,'$argument')&&!qx){
+   // 闭合的本地请求对象：字段可静态枚举、唯一派发、且只允许"派发前的 url 追加"这一种
+   // 变异，其它变异或派发后的写入仍然拒绝。走与 $argument 相同的实时字段路径，发送时
+   // 读取更新后的 url，不把 += 折叠成表达式。
+   const liveLocalRequest=()=>{
+    if(input?.type!=='Identifier')return false;
+    const binding=bindings.get(input);
+    if(!binding||!binding.init||binding.writes.length)return false;
+    const base=resolve(input);
+    if(base?.type!=='ObjectExpression')return false;
+    const fields=['url','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'];
+    for(const property of base.properties){
+     if(property.type!=='Property'||property.kind!=='init'||property.method||key(property)===undefined||!fields.includes(String(key(property))))return false;
+    }
+    const dispatches=binding.refs.filter(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.arguments.includes(ref)&&call.callee.type==='MemberExpression'&&free(call.callee.object,'$httpClient');});
+    if(dispatches.length!==1)return false;
+    const dispatch=dispatches[0];
+    for(const ref of binding.refs){
+     const p=parents.get(ref),q=parents.get(p);
+     if(p===dispatch)continue;
+     if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return false;
+     const field=String(property(p));
+     if(!fields.includes(field))return false;
+     if(q?.type==='AssignmentExpression'&&q.left===p){
+      if(q.operator!=='+='||field!=='url')return false;
+      if(owners.get(q)!==owners.get(dispatch)||!(q.end<dispatch.start))return false;
+      continue;
+     }
+     if(q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete')return false;
+     if(q?.type==='AssignmentExpression')return false;
+    }
+    return true;
+   };
+   if(!f&&(free(input,'$argument')||liveLocalRequest())&&!qx){
+    // 静的可见记录不允许把传输标志留到运行期判断：只能静态证明未启用才放行。
+    // $argument 派生记录本身是运行期输入，沿用既有运行期守卫，不在本单元改动范围内。
+    if(!free(input,'$argument')){
+     const visible=resolve(input);
+     if(visible?.type==='ObjectExpression')for(const property of visible.properties){
+      const name=String(key(property));
+      if(!['binary-mode','full-header-mode'].includes(name))continue;
+      const value=resolve(property.value);
+      if(!(value?.type==='Literal'&&value.value===false))fail(input,'HTTP 请求的 '+name+' 必须静态证明未启用');
+     }
+    }
     const request=fresh('httpRequest'),dynamicMethod=!!method?.expression,selector=dynamicMethod?fresh('httpMethod'):null;
     const callee=dynamicMethod?`((${selector}) => {if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${render(method.expression)}.toLowerCase()).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
     const url=`typeof ${request} === 'string' ? ${request} : ${request}.url`;
@@ -994,7 +1037,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const keys=new Set();
     for(const p of node.properties){
      if(p.type!=='Property'||p.kind!=='init'||p.method||key(p)===undefined||key(p)==='__proto__')return null;
-     const k=String(key(p));if(!['url','headers','body'].includes(k)||keys.has(k))return null;keys.add(k);
+     const k=String(key(p));if(!['url','headers','body','params'].includes(k)||keys.has(k))return null;keys.add(k);
      if(k==='headers'){
       if(p.value.type!=='ObjectExpression'||p.value.properties.some(h=>h.type!=='Property'||h.kind!=='init'||h.method||key(h)===undefined||['__proto__','constructor'].includes(String(key(h)))))return null;
       keys.headerNames=new Set(p.value.properties.map(h=>String(key(h)).toLowerCase()));
@@ -1004,7 +1047,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    };
    const shapes=calls.map(c=>shape(c.arguments[position]??fn.params[position]?.right));
    if(shapes.some(s=>!s))return null;
-   const allowed=new Set(['constructor','url','method','headers','body','bodyBytes','timeout','policy','node','redirection','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode']);
+   const allowed=new Set(['constructor','url','method','headers','body','bodyBytes','params','timeout','policy','node','redirection','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode']);
    let hasDispatch=false;
    for(const r of binding.refs){
     const p=parents.get(r),q=parents.get(p);
@@ -1017,7 +1060,19 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(p?.type==='MemberExpression'&&p.object===r&&property(p)!==undefined){
      const field=String(property(p));if(!allowed.has(field))return null;
      if(q?.type==='MemberExpression'&&q.object===p&&!['constructor','headers','method'].includes(field))return null;
-     if(q?.type==='AssignmentExpression'&&q.left===p&&q.operator!=='='||q?.type==='UpdateExpression')return null;
+     // 允许"发送前对 url 做追加"这一合法形态：它的实际执行被保留，HTTP 请求在发送
+     // 时读取更新后的实时字段，因此不需要把 += 折叠成右侧表达式（折叠会丢原始 URL
+     // 或让 queryStr 之类的调用重复执行）。其它非 = 的成员写入仍然拒绝。
+     const dispatches=binding.refs.flatMap(ref=>{
+      const call=parents.get(ref);
+      return call?.type==='CallExpression'&&call.arguments.includes(ref)&&call.callee.type==='MemberExpression'&&free(call.callee.object,'$httpClient')?[call]:[];
+     });
+     if(q?.type==='AssignmentExpression'&&q.left===p&&q.operator!=='='){
+      const appendBeforeSend=field==='url'&&q.operator==='+='&&dispatches.length>0&&
+       dispatches.every(call=>owners.get(call)===owners.get(q)&&q.end<call.start);
+      if(!appendBeforeSend)return null;
+     }
+     if(q?.type==='UpdateExpression')return null;
      if(q?.type==='CallExpression'&&q.callee===p&&!['toLocaleLowerCase'].includes(field))return null;
      continue;
     }
