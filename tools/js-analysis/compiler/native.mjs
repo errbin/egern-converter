@@ -421,6 +421,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  structured ||= [...complete].some(fn=>fn!==tree&&[...exits(fn.body)].some(path=>path==='return'||path==='continue'));
  structured ||= nodes.some(n=>n.type==='NewExpression'&&free(n.callee,'Promise')&&complete.has(target(n.arguments[0])));
  structured ||= nodes.some(n=>n.type==='CallExpression'&&free(n.callee,'setTimeout')&&[1,2].includes(n.arguments.length)&&complete.has(target(n.arguments[0])));
+ // 展开/数组中的完成函数没有可证明的调用契约，必须进入结构化校验后拒绝。
+ structured ||= nodes.some(n=>(n.type==='SpreadElement'||n.type==='ArrayExpression')&&nodes.some(c=>c.start>=n.start&&c.end<=n.end&&isDone(c)));
  // Root Promise completion with trailing Date method installation needs the
  // structured final join to preserve the original synchronous launch point.
  const rootCompletionChains=nodes.filter(n=>n.type==='CallExpression'&&owners.get(n)===tree&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&terminal(n));
