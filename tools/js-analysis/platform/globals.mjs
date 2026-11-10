@@ -5,6 +5,48 @@ import {index,patch,renderTree,property,key,children,functions,initializedAfter,
 const UNKNOWN=Symbol('not statically known');
 const PRESENT_VERSION=Symbol('platform version exists; exact value unknown');
 const PRESENT_GLOBALS=new Map();
+const safeProbeCallees=new Set(['Boolean','String','Number','parseInt','parseFloat','isNaN','isFinite']);
+// 探测结果只能流入可证明不改变语义的消费点：条件、比较、布尔/字符串
+// 转换、已知完成调用，或经单次绑定继续流向前述位置。传入未知函数、
+// 直接逃逸或动态写入时返回 false。
+export function probeResultSafeAt(ix,start){
+ const seen=new Set();
+ function walk(node){
+  if(seen.has(node))return true;seen.add(node);
+  const parent=ix.parents.get(node);if(!parent)return true;
+  if(parent.type==='ChainExpression'&&parent.expression===node)return walk(parent);
+  if(parent.type==='UnaryExpression'&&parent.argument===node)return ['!','void','typeof'].includes(parent.operator)&&walk(parent);
+  if(parent.type==='BinaryExpression'&&(parent.left===node||parent.right===node))return ['==','!=','===','!==','<','>','<=','>=','+'].includes(parent.operator)&&walk(parent);
+  if(parent.type==='LogicalExpression'&&(parent.left===node||parent.right===node))return walk(parent);
+  if(parent.type==='ConditionalExpression'){
+   if(parent.test===node)return walk(parent);
+   return false;
+  }
+  if(['IfStatement','WhileStatement','DoWhileStatement','ForStatement'].includes(parent.type)&&parent.test===node)return true;
+  if(parent.type==='SwitchCase'&&parent.test===node)return true;
+  if(parent.type==='CallExpression'&&parent.arguments.includes(node)){
+   if(parent.callee.type==='Identifier'&&safeProbeCallees.has(parent.callee.name))return walk(parent);
+   return parent.callee.type==='Identifier'&&ix.free(parent.callee,'$done');
+  }
+  if(parent.type==='Property'&&parent.value===node){const object=ix.parents.get(parent);return object?.type==='ObjectExpression'&&walk(object);}
+  if(parent.type==='ObjectExpression'&&parent.properties.includes(node))return walk(parent);
+  if(parent.type==='ArrayExpression'&&parent.elements.includes(node))return walk(parent);
+  if(parent.type==='TemplateLiteral'&&parent.expressions.includes(node))return walk(parent);
+  if(parent.type==='VariableDeclarator'&&parent.init===node&&parent.id.type==='Identifier'){
+   const binding=ix.bindings.get(parent.id);if(!binding||binding.writes.length)return false;
+   const refs=binding.refs.filter(ref=>ref!==parent.id);return !!refs.length&&refs.every(ref=>walk(ref));
+  }
+  if(parent.type==='AssignmentExpression'&&parent.right===node&&parent.left.type==='Identifier'){
+   const binding=ix.bindings.get(parent.left);if(!binding||binding.writes.length!==1||binding.writes[0]!==parent)return false;
+   return binding.refs.filter(ref=>ref!==parent.left).every(ref=>walk(ref));
+  }
+  if(parent.type==='ReturnStatement'&&parent.argument===node)return true;
+  if(parent.type==='ExpressionStatement'&&parent.expression===node)return true;
+  if(parent.type==='ArrowFunctionExpression'&&parent.body===node)return true;
+  return false;
+ }
+ return walk(start);
+}
 export function platformFold(source,format,options={}){
  let qx;
  for(let pass=0;pass<3;pass++){
@@ -13,6 +55,14 @@ export function platformFold(source,format,options={}){
   source=folded.source;
  }
  return {source,qx};
+}
+// 最终产物里若仍有缺失的 Node/浏览器全局探测，且探测结果流入未知函数，
+// 就不能用“目标宿主缺失”解释它的用途。保留拒绝，避免把探针结果交给
+// 未解析代码后产生与宿主能力相关的分支。
+export function assertSafeMissingGlobalProbes(source){
+ const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
+ const missing=new Set(['window','global','module','exports','process','require','importModule','document','$drive']);
+ for(const n of ix.nodes)if(n.type==='UnaryExpression'&&n.operator==='typeof'&&n.argument.type==='Identifier'&&missing.has(n.argument.name)&&ix.free(n.argument)&&!probeResultSafeAt(ix,n))throw Error('Node/浏览器全局缺失探测结果传入了未知代码，无法证明可折叠：'+n.argument.name);
 }
 function fold(source,format,options,qxHint){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
@@ -83,6 +133,30 @@ function fold(source,format,options,qxHint){
  // global object or discard an escaped/mutated array.
  const globalMembership=new WeakMap(),keySnapshots=new WeakSet();
  const markers=new Map(['$task','$loon','$rocket','$environment'].map(name=>[name,false]));markers.set('Egern',true);
+ // 目标宿主确定没有的 Node/浏览器全局。只有直接读取 `globalThis` 上这些
+ // 静态成员时才折叠；动态成员、裸值和任何可能改写成员关系的写入仍拒绝。
+ const absentMembers=new Set(['process','require','module','global','window']);
+ const probeResultSafe=start=>probeResultSafeAt(ix,start);
+ function absentMemberProbeResult(n){
+  let current=n;
+  for(let parent=ix.parents.get(current);parent;current=parent,parent=ix.parents.get(current)){
+   if(parent.type==='MemberExpression'&&parent.object===current){if(parent.computed)return false;continue;}
+   if(parent.type==='ChainExpression'&&parent.expression===current)continue;
+   if(parent.type==='CallExpression'&&parent.callee.type==='Identifier'&&ix.free(parent.callee,'Boolean')&&parent.arguments.length===1&&parent.arguments[0]===current)return probeResultSafe(parent)?true:null;
+   if(parent.type==='UnaryExpression'&&parent.argument===current)return ['!','typeof'].includes(parent.operator)&&probeResultSafe(parent)?true:null;
+   if(parent.type==='BinaryExpression'&&(parent.left===current||parent.right===current)){
+    const other=parent.left===current?parent.right:parent.left;
+    if(['==','!=','===','!=='].includes(parent.operator)&&(ix.free(other,'undefined')||other?.type==='Literal'&&other.value===null))return probeResultSafe(parent)?true:null;
+    return null;
+   }
+   if(parent.type==='LogicalExpression'&&(parent.left===current||parent.right===current))return probeResultSafe(parent)?true:null;
+   if(parent.type==='ConditionalExpression'&&parent.test===current)return true;
+   if(['IfStatement','WhileStatement','DoWhileStatement','ForStatement'].includes(parent.type)&&parent.test===current)return true;
+   if(parent.type==='SwitchCase'&&parent.test===current)return true;
+   return null;
+  }
+  return null;
+ }
  // 只有可能改变 globalThis 成员关系（自身属性、原型链或 Object.keys/Array.includes
   // 契约）的写入才否定探针。普通库函数改写自己的 prototype 不影响宿主全局。
  const written=n=>{const p=ix.parents.get(n);return p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete';};
@@ -102,7 +176,7 @@ function fold(source,format,options,qxHint){
   }
   if(n.type==='Identifier'&&markers.has(n.name)&&ix.free(n)&&written(n))return true;
   if(n.type==='Identifier'&&ix.free(n,'globalThis')&&written(n))return true;
-  if(n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&(property(n)===undefined||markers.has(property(n)))&&written(n))return true;
+  if(n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&(property(n)===undefined||markers.has(property(n))||absentMembers.has(property(n)))&&written(n))return true;
   return false;
  });
  // 只折叠对已知平台标记的 `'name' in globalThis` 查询。未知名称仍保持未知，
@@ -137,7 +211,7 @@ function fold(source,format,options,qxHint){
    const frame=stack.at(-1),n=frame.node;
    if(frame.state==='start'){
     if(n.type==='UnaryExpression'){
-     if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete('undefined');continue;}
+     if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete(probeResultSafe(n)?'undefined':UNKNOWN);continue;}
      if(n.operator==='typeof'&&ix.free(n.argument,'globalThis')){complete('object');continue;}
      if(n.operator==='typeof'&&n.argument.type==='ChainExpression'){frame.argument=n.argument.expression;}
      else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip'){complete('function');continue;}
@@ -228,6 +302,7 @@ function fold(source,format,options,qxHint){
    if(name==='surge-version')return format==='surge'?PRESENT_VERSION:undefined;
    if(name==='stash-version')return format==='stash'?PRESENT_VERSION:undefined;
   }
+  if(n.type==='MemberExpression'&&!n.computed&&ix.free(n.object,'globalThis')&&absentMembers.has(property(n))&&probeBuiltinsStable&&absentMemberProbeResult(n))return undefined;
   if(n.type==='MemberExpression'){const object=value(n.object,new Set(seen));if(object&&records.has(object)&&Object.hasOwn(object,property(n)))return object[property(n)];}
   if(n.type==='Identifier'){
    if(ix.free(n,'undefined'))return undefined;
@@ -280,7 +355,7 @@ function fold(source,format,options,qxHint){
    }
   }
   if(n.type==='UnaryExpression'){
-   if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name)))return 'undefined';
+   if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name)))return probeResultSafe(n)?'undefined':UNKNOWN;
    if(n.operator==='typeof'&&ix.free(n.argument,'globalThis'))return 'object';
    if(n.operator==='typeof'&&n.argument.type==='ChainExpression')return value({...n,argument:n.argument.expression},seen);
    if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip')return 'function';
@@ -462,7 +537,13 @@ function fold(source,format,options,qxHint){
     if(cases.every(c=>c!==UNKNOWN&&c!==PRESENT_VERSION)){
      let start=n.cases.findIndex(c=>c.test&&value(c.test)===v);if(start<0)start=n.cases.findIndex(c=>!c.test);
      const selected=[];let stopped=false;
-     for(const c of n.cases.slice(start<0?n.cases.length:start))for(const s of c.consequent){if(stopped)break;if(s.type==='BreakStatement'&&!s.label){stopped=true;break;}selected.push(s);}
+     for(const c of n.cases.slice(start<0?n.cases.length:start))for(const s of c.consequent){
+      if(stopped)break;
+      // 选中的 case 在首个中断语句处结束；越过它继续拼接后续 case，
+      // 会把平台 switch 刚刚证明不可达的 Node/浏览器死分支重新带回。
+      if(s.type==='BreakStatement'||s.type==='ContinueStatement'||s.type==='ReturnStatement'||s.type==='ThrowStatement'){stopped=true;if(s.type!=='BreakStatement'&&s.type!=='ContinueStatement')selected.push(s);break;}
+      selected.push(s);
+     }
      const patternBindings=n=>!n?[]:n.type==='Identifier'?[ix.bindings.get(n)]:n.type==='RestElement'?patternBindings(n.argument):n.type==='AssignmentPattern'?patternBindings(n.left):n.type==='ArrayPattern'?n.elements.flatMap(patternBindings):n.type==='ObjectPattern'?n.properties.flatMap(p=>patternBindings(p.type==='RestElement'?p.argument:p.value)):[];
      const selectedStatements=new Set(selected),excludedBindings=new Set();
      const collectExcludedBindings=root=>{
@@ -476,16 +557,23 @@ function fold(source,format,options,qxHint){
      for(const branch of n.cases)for(const statement of branch.consequent)if(!selectedStatements.has(statement))collectExcludedBindings(statement);
      const insideExcludedCode=ref=>ref.start>=n.start&&ref.end<=n.end&&!selected.some(s=>ref.start>=s.start&&ref.end<=s.end);
      const excludedReferences=[...excludedBindings].some(binding=>binding.refs.some(ref=>!insideExcludedCode(ref)));
-     const containsBreak=root=>{
+     // 选中语句里嵌套的 break 通常属于内层循环或 switch；只有最近的可中断
+     // 祖先就是当前 switch 的无标签 break 才会直接退出它，不能随裁剪保留。
+     const exitsThisSwitch=root=>{
       const pending=[root];
       while(pending.length){
-       const node=pending.pop();if(node.type==='BreakStatement')return true;
+       const node=pending.pop();
+       if(node.type==='BreakStatement'&&!node.label){
+        let owner=ix.parents.get(node);
+        while(owner&&!['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement','SwitchStatement'].includes(owner.type)&&!functions.has(owner.type))owner=ix.parents.get(owner);
+        if(owner===n)return true;
+       }
        for(const [,child] of children(node))pending.push(child);
       }
       return false;
      };
-     const nestedBreak=selected.some(containsBreak);
-     if(!excludedReferences&&!nestedBreak){const prefix=sequence.slice(0,-1),selectedNodes=selected;return {children:[...prefix,...selectedNodes],render:child=>'{'+prefix.map(e=>child(e)+';').join('')+selectedNodes.map(child).join('\n')+'}'};}
+     const nestedSwitchBreak=selected.some(exitsThisSwitch);
+     if(!excludedReferences&&!nestedSwitchBreak){const prefix=sequence.slice(0,-1),selectedNodes=selected;return {children:[...prefix,...selectedNodes],render:child=>'{'+prefix.map(e=>child(e)+';').join('')+selectedNodes.map(child).join('\n')+'}'};}
     }
    }
   }
@@ -567,36 +655,47 @@ export function lowerSelfNormalizedArgument(source,format){
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return source;}
  const {nodes,parents,bindings,free}=ix;
  const member=n=>n?.type==='MemberExpression'&&!n.computed&&n.object?.type==='Identifier'&&free(n.object,'globalThis')&&property(n)==='$argument';
+ const bare=n=>n?.type==='Identifier'&&n.name==='$argument'&&free(n,'$argument');
+ const reference=n=>member(n)?n:bare(n)?n:null;
  const globals=nodes.filter(n=>free(n,'globalThis'));
- if(!globals.length||globals.some(n=>!member(parents.get(n))))return source;
+ // 归一化只依赖 `$argument` 成员；同一脚本中其它 globalThis 静态成员读取
+ // 不改变这个值，可以留给后续成员映射。裸 globalThis 或动态成员仍然拒绝。
+ if(globals.some(n=>{const p=parents.get(n);return p?.type!=='MemberExpression'||p.object!==n||property(p)===undefined;}))return source;
  // 输入侧需要改写成裸 `$argument` 交给后续原生映射；存在同名绑定时会被词法遮蔽。
  if(nodes.some(n=>n.type==='Identifier'&&n.name==='$argument'&&bindings.has(n)))return source;
- const members=globals.map(n=>parents.get(n));
- const assignments=nodes.filter(n=>n.type==='AssignmentExpression'&&n.operator==='='&&member(n.left));
+ const references=nodes.filter(n=>reference(n));
+ // qualified lowering 可能已把 `globalThis.$argument` 改成裸 `$argument`；
+ // 两种写法都表示同一个宿主输入，归一化判据保持一致。
+ const assignments=nodes.filter(n=>n.type==='AssignmentExpression'&&n.operator==='='&&reference(n.left));
  if(assignments.length!==1)return source;
  const assignment=assignments[0];
+ // 同一处归一化不能把两种访问形态混在一起：写回后出现的另一形态读取
+ // 仍是宿主原值，而不是归一化后的局部值，必须继续拒绝。
+ const assignedMember=!!member(assignment.left);
+ for(const item of references){
+  if(item===assignment.left||item.start<=assignment.end)continue;
+  if(!!member(item)!==assignedMember)return source;
+ }
  // 只接受顶层表达式中的无条件写回；函数、条件、循环或 try 内的写回不传播。
  let child=assignment;
  while(parents.get(child)?.type==='SequenceExpression')child=parents.get(child);
  if(parents.get(child)?.type!=='ExpressionStatement'||parents.get(parents.get(child))!==tree)return source;
- const input=members.filter(n=>n.start>=assignment.right.start&&n.end<=assignment.right.end);
+ const input=references.filter(n=>n.start>=assignment.right.start&&n.end<=assignment.right.end);
  if(!input.length)return source;
- for(const item of members){
+ for(const item of references){
   if(item===assignment.left||input.includes(item))continue;
   if(item.start<=assignment.end)return source;
   const p=parents.get(item),use=parents.get(p);
   if(p?.type==='AssignmentExpression'&&p.left===item||p?.type==='UpdateExpression'||p?.type==='UnaryExpression'&&p.operator==='delete')return source;
   if(p?.type==='MemberExpression'&&p.object===item&&(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'))return source;
  }
- // 写回之后的裸 `$argument` 读取会绕过归一化结果；保留拒绝，避免混用两种值。
- if(nodes.some(n=>free(n,'$argument')&&n.start>assignment.end))return source;
  const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
  let local='selfNormalizedArgument',suffix=2;
  while(names.has(local))local='selfNormalizedArgument'+(suffix++);
  const replace=new WeakMap();
  replace.set(assignment.left,local);
  for(const item of input)replace.set(item,'$argument');
- for(const item of members)if(item!==assignment.left&&!input.includes(item))replace.set(item,local);
+ for(const item of references)if(item!==assignment.left&&!input.includes(item))replace.set(item,local);
  let output=renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
  let insert=tree.body[0]?.start??0;
  for(const statement of tree.body){if(statement.type!=='ExpressionStatement'||typeof statement.directive!=='string')break;insert=statement.end;}
@@ -743,8 +842,11 @@ export function foldFactoryProbes(source,format,options){
  for(const n of nodes)if(n.type==='MemberExpression'&&n.object.type==='Identifier'){
   const binding=bindings.get(n.object);if(!binding)continue;
   const declaration=parents.get(parents.get(binding.init));
-  if(declaration?.type!=='VariableDeclaration'||parents.get(declaration)!==tree||!initializedAfter(ix,declaration,n))continue;
+  if(declaration?.type!=='VariableDeclaration')continue;
   if(!cache.has(binding)){const context=contextFor(n.object);cache.set(binding,context);if(context)contexts.push(context);}const ctx=cache.get(binding);if(!ctx)continue;
+  // 类方法的封闭常量谓词不依赖实例属性初始化时机；普通成员读取仍须由
+  // 声明支配，避免把构造器尚未赋值的字段当成已知值。
+  if(!initializedAfter(ix,declaration,n))continue;
   const expr=ctx.entries.get(property(n));if(!expr)continue;
   const use=parents.get(n),fn=expr.type==='Identifier'?target(expr):expr;
   const call=use?.type==='CallExpression'&&use.callee===n&&!use.arguments.length&&!use.optional;
