@@ -223,7 +223,129 @@ export function lowerMessageParameters(source){
   if(!parameter?.refs.length||parameter.writes.length)continue;
   const fields=new Set();let valid=true;
   for(const r of parameter.refs){const member=parents.get(r),key=property(member);if(member?.type!=='MemberExpression'||member.object!==r||!['url','method','headers','body','bodyBytes','status','statusCode'].includes(key)){valid=false;break;}fields.add(key);}
-  if(valid)replace.set(ref,'{'+[...fields].map(key=>JSON.stringify(key)+':'+kind+'['+JSON.stringify(key)+']').join(', ')+'}');
+  if(valid)replace.set(ref,'{'+[...fields].map(key=>{
+   const value=key==='headers'?`Object.fromEntries([...${kind}["headers"].entries()].map(([name, value]) => [name, ${kind}["headers"].getAll(name).length > 1 ? ${kind}["headers"].getAll(name) : value]))`:`${kind}[${JSON.stringify(key)}]`;
+   return JSON.stringify(key)+':'+value;
+  }).join(', ')+'}');
+ }
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
+}
+
+// Project only wholly observed message objects whose complete local data flow is
+// a closed set of known fields. This keeps native messages out of unknown code
+// while preserving ordinary object mutation and return semantics for adapters.
+export function lowerClosedMessageObjects(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,parents,bindings,free}=ix;
+ const fieldsByKind={$request:new Set(['url','method','headers','body']),$response:new Set(['status','statusCode','headers','body'])};
+ const nullish=n=>free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void';
+ function target(callee){
+  if(functions.has(callee?.type))return callee;
+  if(callee?.type!=='Identifier')return null;
+  const binding=bindings.get(callee);return binding?.fn&&functions.has(binding.fn.type)?binding.fn:null;
+ }
+ function directCalls(fn){
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
+  if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&parent.arguments.every(a=>a.type!=='SpreadElement'))return [parent];
+  if(!binding||binding.writes.length||!binding.refs.length)return null;
+  const calls=[];for(const ref of binding.refs){const call=parents.get(ref);if(call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement'))return null;calls.push(call);}
+  return calls;
+ }
+ function headerValue(kind){const value=`${kind}["headers"]`;return `Object.fromEntries([...${value}.entries()].map(([name, value]) => [name, ${value}.getAll(name).length > 1 ? ${value}.getAll(name) : value]))`;}
+ function objectLiteral(kind,fields){
+  return '{'+[...fields].map(field=>JSON.stringify(field)+': '+(field==='headers'?headerValue(kind):`${kind}[${JSON.stringify(field)}]`)).join(', ')+'}';
+ }
+ function fieldUse(kind,ref,fields,state){
+  const member=parents.get(ref),key=property(member);if(member?.type!=='MemberExpression'||member.object!==ref||key===undefined||!fieldsByKind[kind].has(String(key)))return null;
+  fields.add(String(key));
+  const outer=parents.get(member);
+  if(outer?.type==='MemberExpression'&&outer.object===member&&String(key)==='headers')return null;
+  if(outer?.type==='CallExpression'&&outer.callee===member)return null;
+  const write=outer?.type==='AssignmentExpression'&&outer.left===member&&outer.operator==='='||outer?.type==='UpdateExpression'||outer?.type==='UnaryExpression'&&outer.operator==='delete';
+  if(write&&['status','statusCode'].includes(String(key)))return null;
+  if(write)state.write=true;
+  return 'used';
+ }
+ function proveBinding(binding,kind,fields,state,seen=new Set()){
+  if(!binding||seen.has(binding))return false;seen=new Set(seen);seen.add(binding);
+  const before=state.write;
+  for(const ref of binding.refs){
+   const parent=parents.get(ref);
+   if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&binding.writes.includes(parent))continue;
+   if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
+   const other=parent?.left===ref?parent.right:parent?.right===ref?parent.left:null;
+   if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||nullish(other)))continue;
+   if(fieldUse(kind,ref,fields,state))continue;
+   return false;
+  }
+  return state.write===before;
+ }
+ function proveReturnedValue(fn,kind,fields,state,seen=new Set()){
+  const calls=directCalls(fn);if(!calls||!calls.length||seen.has(fn))return false;seen=new Set(seen);seen.add(fn);
+  return calls.every(call=>proveValue(call,kind,fields,state,seen));
+ }
+ function proveParameter(fn,parameter,kind,fields,state,seen=new Set()){
+  const binding=bindings.get(parameter);if(!binding||seen.has(binding))return false;seen=new Set(seen);seen.add(binding);
+  let returned=false;
+  for(const ref of binding.refs){
+   const parent=parents.get(ref);
+   if(parent?.type==='ReturnStatement'&&parent.argument===ref||parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===ref&&parents.get(parent)?.type==='ReturnStatement'){returned=true;continue;}
+   if(!fieldUse(kind,ref,fields,state))return false;
+  }
+  return !returned||proveReturnedValue(fn,kind,fields,state,seen);
+ }
+ function proveValue(node,kind,fields,state,seen=new Set()){
+  let current=node;
+  while(current&&(current.type==='AwaitExpression'||current.type==='ChainExpression'))current=current.argument??current.expression;
+  while(parents.get(current)?.type==='AwaitExpression'&&parents.get(current).argument===current||parents.get(current)?.type==='ChainExpression'&&parents.get(current).expression===current)current=parents.get(current);
+  while(parents.get(current)?.type==='SequenceExpression'&&parents.get(current).expressions.at(-1)===current&&parents.get(parents.get(current))?.type!=='ReturnStatement')current=parents.get(current);
+  const parent=parents.get(current);if(!parent)return true;
+  if(parent.type==='ExpressionStatement'||parent.type==='SequenceExpression'&&parent.expressions.at(-1)!==current)return true;
+  if(parent.type==='CallExpression'&&parent.arguments.includes(current)){
+   const fn=target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(current)];
+   return !!parameter&&parameter.type==='Identifier'&&proveParameter(fn,parameter,kind,fields,state,seen);
+  }
+  if(parent.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return proveBinding(bindings.get(parent.id),kind,fields,state,seen);
+  if(parent.type==='AssignmentExpression'&&parent.right===current&&parent.left.type==='Identifier')return proveBinding(bindings.get(parent.left),kind,fields,state,seen);
+  if(parent.type==='MemberExpression'&&parent.object===current){
+   const key=property(parent);if(key===undefined||!fieldsByKind[kind].has(String(key)))return false;fields.add(String(key));
+   const outer=parents.get(parent);if(outer?.type==='MemberExpression'&&outer.object===parent&&parents.get(outer)?.type==='CallExpression'&&parents.get(outer).callee===outer)return false;
+   if(outer?.type==='CallExpression'&&outer.callee===parent)return false;
+   return true;
+  }
+  return false;
+ }
+ const ignored=n=>{const p=parents.get(n),other=p?.left===n?p.right:p?.left;return p?.type==='UnaryExpression'&&p.operator==='typeof'||p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||nullish(other))||p?.type==='ExpressionStatement'&&p.expression===n;};
+ for(const kind of ['$request','$response']){
+  const refs=nodes.filter(n=>free(n,kind));
+  if(!refs.length)continue;
+  const plans=[];let valid=true,directRefs=0,directWrites=0;
+  for(const ref of refs){
+   if(ignored(ref))continue;
+   const parent=parents.get(ref);
+   if(parent?.type==='MemberExpression'&&parent.object===ref){
+    directRefs++;
+    const outer=parents.get(parent);if(outer?.type==='UpdateExpression'||outer?.type==='UnaryExpression'&&outer.operator==='delete'||outer?.type==='AssignmentExpression'&&outer.left===parent)directWrites++;
+    continue;
+   }
+   if(parent?.type==='VariableDeclarator'&&parent.init===ref&&parent.id.type==='Identifier'){
+    const binding=bindings.get(parent.id);if(!binding||binding.writes.length){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},binding});continue;
+   }
+   if(parent?.type==='AssignmentExpression'&&parent.right===ref&&parent.operator==='='&&parent.left.type==='Identifier'){
+    const binding=bindings.get(parent.left);if(!binding||binding.writes.length!==1||binding.writes[0]!==parent){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},binding});continue;
+   }
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+    const fn=target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(ref)];
+    if(!fn||parameter?.type!=='Identifier'){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},fn,parameter});continue;
+   }
+   valid=false;break;
+  }
+  if(!valid||!plans.length)continue;
+  const fields=new Set();
+  if(!plans.every(plan=>plan.binding?proveBinding(plan.binding,kind,plan.fields,plan.state):proveParameter(plan.fn,plan.parameter,kind,plan.fields,plan.state)))continue;
+  for(const plan of plans)for(const field of plan.fields)fields.add(field);
+  if(directRefs&&plans.some(plan=>plan.state.write)||directWrites||plans.length>1&&plans.some(plan=>plan.state.write))continue;
+  for(const plan of plans)replace.set(plan.ref,objectLiteral(kind,fields));
  }
  return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }

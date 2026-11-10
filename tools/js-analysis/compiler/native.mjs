@@ -6,7 +6,7 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries} from '../analysis/libraries.mjs';
@@ -89,7 +89,7 @@ function compile(original,format,options,libraries){
  const finish=input=>{
   const normalizedArgument=lowerSelfNormalizedArgument(input,format);
   const factories=lowerHTTPFactoryFields(lowerHTTPHelpers(lowerSelectedHTTP(lowerAPIObjectAliases(normalizedArgument))),format);
-  const result=emitNative(lowerMessageParameters(factories.source),original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
+  const result=emitNative(lowerClosedMessageObjects(lowerMessageParameters(factories.source)),original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
   libraries.transformations.push(...factories.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
