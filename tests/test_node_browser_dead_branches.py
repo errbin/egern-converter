@@ -52,6 +52,55 @@ class NodeBrowserDeadBranchTests(unittest.TestCase):
         )
         self.check(source, 'false|fallback|undefined')
 
+    def test_typeof_probe_used_only_as_conditional_test_folds(self):
+        source = (
+            "const root=typeof window!=='undefined'?window:{};"
+            "root.value='egern';$done({body:root.value});"
+        )
+        self.check(source, 'egern')
+
+    def test_typeof_probe_returned_from_condition_expression_still_rejects(self):
+        source = (
+            "const probe=typeof window!=='undefined'?typeof window:typeof window;"
+            "unknown(probe);$done({body:'x'});"
+        )
+        with self.assertRaises(ConversionError):
+            self.convert(source)
+
+    def test_typeof_probe_in_if_sequence_test_folds(self):
+        source = (
+            "if((0,typeof require)==='function'){}"
+            "$done({body:'egern'});"
+        )
+        self.check(source, 'egern', format='surge')
+
+    def test_typeof_probe_in_closed_conditional_comparison_folds(self):
+        source = (
+            "const ops={};ops.eq=(a,b)=>a===b;ops.neq=(a,b)=>a!==b;"
+            "const key='neq';"
+            "const alias=ops;"
+            "const root=alias[key](typeof window,'function')?{value:'egern'}:{};"
+            "$done({body:root.value});"
+        )
+        self.check(source, 'egern')
+
+    def test_typeof_probe_in_open_conditional_call_still_rejects(self):
+        source = (
+            "const probe=typeof window;"
+            "unknown(probe)?$done({body:'x'}):$done({body:'y'});"
+        )
+        with self.assertRaises(ConversionError):
+            self.convert(source)
+
+    def test_typeof_probe_in_conditional_object_write_still_rejects(self):
+        source = (
+            "let leaked;const ops={capture:(a,b)=>{leaked=a;return a===b}};"
+            "const root=ops.capture(typeof window,'undefined')?1:2;"
+            "unknown(leaked);$done({body:String(root)});"
+        )
+        with self.assertRaises(ConversionError):
+            self.convert(source)
+
     def test_local_node_and_browser_bindings_are_not_host_probes(self):
         source = (
             "const process={env:{NODE_ENV:'local'}};"

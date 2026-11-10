@@ -11,6 +11,46 @@ const safeProbeCallees=new Set(['Boolean','String','Number','parseInt','parseFlo
 // 直接逃逸或动态写入时返回 false。
 export function probeResultSafeAt(ix,start){
  const seen=new Set();
+ // 混淆脚本常把平台探测作为局部比较对象方法的实参。只有对象本身封闭、
+ // 每个方法只由参数/字面量组成且没有外部写入，并且调用结果只决定条件时，
+ // 才能证明探测值只参与条件比较，没有进入业务数据。
+ const closedConditionalCall=call=>{
+  if(call.type!=='CallExpression'||call.arguments.length===0||call.callee.type!=='MemberExpression')return false;
+  const object=call.callee.object;
+  let literal=object,binding=null;
+  const tableBindings=new Set();
+  for(let depth=0;literal?.type==='Identifier'&&depth<4;depth++){
+   binding=ix.bindings.get(literal);
+   if(!binding||binding.writes.length)return false;
+   tableBindings.add(binding);
+   literal=binding.init;
+  }
+  if(literal?.type!=='ObjectExpression')return false;
+  const entries=literal.properties.filter(p=>p.type==='Property'&&p.kind==='init');
+  if(entries.length!==literal.properties.length)return false;
+  const writes=binding?ix.nodes.filter(n=>n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='Identifier'&&tableBindings.has(ix.bindings.get(n.left.object))):[];
+  if(writes.some(n=>n.start>=call.start))return false;
+  const values=[...entries.map(p=>p.value),...writes.map(n=>n.right)];
+  const methods=values.filter(v=>functions.has(v?.type));
+  if(!methods.length)return false;
+  const closedFunction=fn=>{
+   if(!functions.has(fn?.type)||fn.async||fn.generator)return false;
+   const params=new Set(fn.params.filter(p=>p.type==='Identifier').map(p=>ix.bindings.get(p)).filter(Boolean));
+   if(params.size!==fn.params.length)return false;
+   let safe=true;
+   for(const node of ix.nodes){
+    if(node.start<fn.start||node.end>fn.end)continue;
+    if(['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(node.type)&&node!==fn)return false;
+    if(['AssignmentExpression','UpdateExpression','DeleteExpression'].includes(node.type)||node.type==='UnaryExpression'&&node.operator==='delete'){safe=false;break;}
+    if(node.type!=='Identifier'||!ix.reference(node))continue;
+    if(params.has(ix.bindings.get(node))||ix.free(node,'undefined'))continue;
+    safe=false;break;
+   }
+   return safe;
+  };
+  // 字符串解码等非函数成员不会成为可调用方法；只证明函数成员本身封闭。
+  return methods.every(closedFunction);
+ };
  function walk(node){
   if(seen.has(node))return true;seen.add(node);
   const parent=ix.parents.get(node);if(!parent)return true;
@@ -18,14 +58,21 @@ export function probeResultSafeAt(ix,start){
   if(parent.type==='UnaryExpression'&&parent.argument===node)return ['!','void','typeof'].includes(parent.operator)&&walk(parent);
   if(parent.type==='BinaryExpression'&&(parent.left===node||parent.right===node))return ['==','!=','===','!==','<','>','<=','>=','+'].includes(parent.operator)&&walk(parent);
   if(parent.type==='LogicalExpression'&&(parent.left===node||parent.right===node))return walk(parent);
+  if(parent.type==='SequenceExpression'){
+   // 逗号表达式只把最后一个值传出去；前面的值只保留求值副作用。
+   return parent.expressions.at(-1)!==node||walk(parent);
+  }
   if(parent.type==='ConditionalExpression'){
-   if(parent.test===node)return walk(parent);
+   // 条件测试只决定执行哪个分支，探测值本身不会成为条件表达式的值。
+   // 分支结果仍需在后续使用点单独证明；这里不能把测试值误当成分支值追踪。
+   if(parent.test===node)return true;
    return false;
   }
   if(['IfStatement','WhileStatement','DoWhileStatement','ForStatement'].includes(parent.type)&&parent.test===node)return true;
   if(parent.type==='SwitchCase'&&parent.test===node)return true;
   if(parent.type==='CallExpression'&&parent.arguments.includes(node)){
    if(parent.callee.type==='Identifier'&&safeProbeCallees.has(parent.callee.name))return walk(parent);
+   if(closedConditionalCall(parent)&&walk(parent))return true;
    return parent.callee.type==='Identifier'&&ix.free(parent.callee,'$done');
   }
   if(parent.type==='Property'&&parent.value===node){const object=ix.parents.get(parent);return object?.type==='ObjectExpression'&&walk(object);}
