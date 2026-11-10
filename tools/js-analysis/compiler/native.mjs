@@ -793,6 +793,40 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return null;
  }
+ function promiseResolverShape(n,seen=new Set()){
+  if(n?.type!=='NewExpression'||!free(n.callee,'Promise')||n.arguments.length!==1)return null;
+  const executor=functions.has(n.arguments[0].type)?n.arguments[0]:target(n.arguments[0]);
+  if(!executor||executor.async||executor.generator||executor.params[0]?.type!=='Identifier')return null;
+  const resolver=bindings.get(executor.params[0]);
+  if(!resolver||resolver.writes.length||!resolver.refs.length)return null;
+  const calls=resolver.refs.map(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.callee===ref&&call.arguments.length===1&&call.arguments[0].type!=='SpreadElement'?call:null;});
+  if(calls.some(call=>!call))return null;
+  const fields=new Map();
+  for(const call of calls)mergeShape(fields,shape(call.arguments[0],new Set(seen)),seen);
+  return fields;
+ }
+ function hostResponseShape(binding){
+  const fn=nodes.find(candidate=>functions.has(candidate.type)&&candidate.params.some(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding));
+  const call=fn&&parents.get(fn);
+  if(!call||call.type!=='CallExpression'||call.callee.type!=='MemberExpression'||!free(call.callee.object,'$httpClient')||!call.arguments.includes(fn))return null;
+  const allowed=new Set(['status','statusCode','statusText','headers','body','bodyBytes','ok']);
+  const fields=new Map();
+  for(const ref of binding.refs){
+   const member=parents.get(ref),field=property(member);
+   if(member?.type==='MemberExpression'&&member.object===ref&&field!==undefined&&allowed.has(String(field))){
+    if(field==='statusCode'){if(!fields.has('status'))fields.set('status',member);}
+    else if(field!=='statusText'&&field!=='ok')fields.set(String(field),member);
+    continue;
+   }
+   const resolverCall=parents.get(ref);
+   const calleeBinding=resolverCall?.type==='CallExpression'&&resolverCall.callee.type==='Identifier'?bindings.get(resolverCall.callee):null;
+   const executor=calleeBinding&&nodes.find(candidate=>functions.has(candidate.type)&&bindings.get(candidate.params[0])===calleeBinding);
+   const construction=executor&&parents.get(executor);
+   if(resolverCall?.type==='CallExpression'&&resolverCall.arguments.includes(ref)&&construction?.type==='NewExpression'&&free(construction.callee,'Promise'))continue;
+   return null;
+  }
+  return fields;
+ }
  function completionTruthyGuard(n,binding){
   const completion=parents.get(n),guard=parents.get(completion);
   if(completion?.type!=='CallExpression'||!isDone(completion)||!completion.arguments.includes(n))return false;
@@ -807,6 +841,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  function shape(n,seen=new Set()){
   if(!n)return new Map();
   if(n.type==='AwaitExpression')return promiseShape(n.argument,seen)??shape(n.argument,seen);
+  const resolved=promiseResolverShape(n,seen);if(resolved)return resolved;
+  // 逗号表达式的完成值就是最后一个表达式；前面的副作用语句仍原样保留，
+  // 不影响“最终返回的是哪个闭合对象”的形状证明。
+  if(n.type==='SequenceExpression')return shape(n.expressions.at(-1),new Set(seen));
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='then'&&n.arguments.length===1&&promiseValue(n.callee.object)){
    const fn=target(n.arguments[0]);
    if(fn?.type==='ArrowFunctionExpression'&&fn.body.type==='ObjectExpression')return shape(fn.body,seen);
@@ -828,6 +866,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='Identifier'){
    const b=bindings.get(n);if(!b||seen.has(b))fail(n,'无法静态追溯完成结果');seen.add(b);
+   const host=hostResponseShape(b);if(host)return host;
    const callbackFn=owners.get(n),callback=parents.get(callbackFn),callbackIndex=callback?.type==='CallExpression'?callback.arguments.indexOf(callbackFn):-1;
    if(callbackIndex>=0&&callback.callee.type==='MemberExpression'&&property(callback.callee)==='finally'&&promiseValue(callback.callee.object)){
     const parameter=callbackFn.params[callbackIndex];
@@ -879,6 +918,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(a?.type==='AssignmentExpression'&&a.left===p)mergeShape(fields,new Map([[property(p),a.right]]),seen);
      }else if(p?.type==='IfStatement'&&p.test===ref&&b.refs.some(other=>completionTruthyGuard(other,b)===ref))continue;
       else if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
+     else if(p?.type==='LogicalExpression'&&['||','??'].includes(p.operator)&&p.left===ref&&p.right.type==='AssignmentExpression'&&p.right.left.type==='Identifier'&&bindings.get(p.right.left)===b)continue;
      else if(!(p?.type==='CallExpression'&&isDone(p))&&!(p?.type==='CallExpression'&&target(p.callee)&&complete.has(target(p.callee))))fail(ref,'可变完成结果对象逃逸，无法确定字段');
     }
     return fields;

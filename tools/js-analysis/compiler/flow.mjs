@@ -193,7 +193,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    return result('undefined',[...prefix,`${completion} = {value: ${payload(v)}};`,...(concurrent?[`${finish}(${completion}.value);`]:[]),owner===tree?`return ${completion}.value;`:'return;']);
   }
   if(n.type==='SequenceExpression'){
-   const before=[];for(const part of n.expressions.slice(0,-1)){const e=expression(part,owner);before.push(...e.before,e.code+';');}
+   const before=[];for(const part of n.expressions.slice(0,-1)){const e=expression(part,owner);before.push(...e.before,'('+e.code+');');}
    const last=expression(n.expressions.at(-1),owner);return result(last.code,[...before,...last.before]);
   }
   if(n.type==='LogicalExpression'){
