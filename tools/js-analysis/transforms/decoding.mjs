@@ -483,7 +483,7 @@ function decodeRC4(encoded,key,alphabet,atob=false){
 }
 
 // 结构识别：未列入哈希契约、但与已审查的"缓存式 RC4 解码器"同形。
-// 只负责把候选收敛掉；真正的证明仍由 collect 的后续严格检查（表工厂三段式、静态字符串表、
+// 只负责把候选收敛掉；真正的证明仍由 collect 的后续严格检查（表工厂静态来源唯一、
 // 常量偏移、唯一轮转且校验和数值可复算）完成，因此不构成放宽。
 function cachedDecoderShape(fn,ix){
  if(fn?.type!=='FunctionDeclaration'||fn.params.length!==2||fn.params.some(p=>p.type!=='Identifier'))return false;
@@ -528,9 +528,8 @@ function collect(source,variant,only){
  if(variant==='ks'){
   const first=decoder.body.body[0],factory=first?.type==='VariableDeclaration'&&first.declarations.length===1?first.declarations[0].init:null;
   tableFactory=factory?.type==='CallExpression'&&!factory.arguments.length&&functions.has(bindings.get(factory.callee)?.init?.type)?bindings.get(factory.callee).init:null;
-  const decl=tableFactory?.body.body[0],tableDecl=decl?.type==='VariableDeclaration'&&decl.declarations.length===1?decl.declarations[0]:null;
-  if(!tableFactory||tableFactory.body.body.length!==3||tableDecl?.init?.type!=='ArrayExpression')fail('表工厂不符合已审查结构');
-  tableBinding=bindings.get(tableFactory.id);values=literalArray(tableDecl.init,ix,source);
+  if(!tableFactory)fail('表工厂不符合已审查结构');
+  tableBinding=bindings.get(tableFactory.id);values=tableFactoryValues(tableFactory,ix,source);
   const assignment=decoder.body.body[1]?.argument?.expressions?.[0];
   const inner=assignment?.type==='AssignmentExpression'?assignment.right:null,sub=inner?.type==='FunctionExpression'?inner.body.body[0]?.expression:null;
   if(sub?.type!=='AssignmentExpression'||sub.operator!=='='||sub.right.type!=='BinaryExpression'||sub.right.operator!=='-'||sub.right.left.type!=='Identifier')fail('解码器索引没有固定偏移');
@@ -572,6 +571,107 @@ function literalArray(array,ix,source){
   }
   fail('字符串表包含非字面量项：'+source.slice(e?.start??0,e?.end??0));
  });
+}
+
+// 求值表工厂的唯一静态来源。表可以由数组字面量、无参 IIFE、无副作用的 concat、
+// 静态展开或局部无参工厂调用构造；所有依赖绑定都必须本地、唯一初始化且没有外部写入。
+function staticStringArray(node,ix,source,state){
+ const {root,depth=0,aliases=new Set(),functionsSeen=new Set()}=state;
+ if(depth>32)fail('字符串表构造层级过深');
+ if(!node)fail('字符串表表达式缺失');
+ if(node.type==='Literal'){
+  if(typeof node.value!=='string')fail('字符串表包含非字符串项');
+  return [node.value];
+ }
+ if(node.type==='Identifier'){
+  const binding=ix.bindings.get(node);
+  if(!binding||!binding.init||binding.writes.length||aliases.has(binding))fail('字符串表别名不是唯一的静态初始化');
+  if(binding.init.start<root.start||binding.init.end>root.end)fail('字符串表别名必须在本条构造语句内初始化');
+  aliases.add(binding);
+  return staticStringArray(binding.init,ix,source,{root,depth:depth+1,aliases,functionsSeen});
+ }
+ if(node.type==='ArrayExpression'){
+  const out=[];
+  for(const element of node.elements){
+   if(element?.type==='SpreadElement'){
+    out.push(...staticStringArray(element.argument,ix,source,{root,depth:depth+1,aliases,functionsSeen}));
+    if(out.length>LIMIT)fail('字符串表条目超过上限');
+    continue;
+   }
+   if(element?.type==='Literal'&&typeof element.value==='string'){out.push(element.value);continue;}
+   if(element?.type==='Identifier'){
+    const binding=ix.bindings.get(element);
+    if(binding?.init?.type==='Literal'&&typeof binding.init.value==='string'){out.push(binding.init.value);continue;}
+   }
+   fail('字符串表包含非字面量项：'+source.slice(element?.start??0,element?.end??0));
+  }
+  return out;
+ }
+ if(node.type==='CallExpression'){
+  const callee=node.callee;
+  if(callee.type==='MemberExpression'&&property(callee)==='concat'&&node.arguments.length){
+   const out=staticStringArray(callee.object,ix,source,{root,depth:depth+1,aliases,functionsSeen});
+   for(const argument of node.arguments){
+    if(argument.type==='SpreadElement')fail('字符串表 concat 参数不能是动态展开');
+    out.push(...staticStringArray(argument,ix,source,{root,depth:depth+1,aliases,functionsSeen}));
+    if(out.length>LIMIT)fail('字符串表条目超过上限');
+   }
+   return out;
+  }
+  if(node.arguments.length)fail('字符串表工厂调用不能带参数');
+  let fn=null;
+  if(functions.has(callee.type))fn=callee;
+  else if(callee.type==='Identifier'){
+   const binding=ix.bindings.get(callee);
+   if(!binding||binding.writes.length)fail('字符串表工厂不是唯一的本地函数');
+   fn=binding.fn??binding.init;
+   if(!functions.has(fn?.type)||functionsSeen.has(fn)||aliases.has(binding))fail('字符串表工厂不是唯一的本地函数');
+   if(binding.refs.some(ref=>ref.start<root.start||ref.end>root.end))fail('字符串表工厂还被构造语句以外的代码引用');
+   aliases.add(binding);functionsSeen.add(fn);
+  }else fail('字符串表工厂不是唯一的本地函数');
+  if(fn.async||fn.generator||fn.params.length)fail('字符串表工厂必须是无参同步函数');
+  if(fn.body.type!=='BlockStatement')return staticStringArray(fn.body,ix,source,{root,depth:depth+1,aliases,functionsSeen});
+  const statements=fn.body.body;
+  if(statements.length!==1||statements[0].type!=='ReturnStatement')fail('字符串表工厂必须只返回一个静态表达式');
+  return staticStringArray(statements[0].argument,ix,source,{root,depth:depth+1,aliases,functionsSeen});
+ }
+ fail('字符串表来源不是已审查的静态表达式');
+}
+
+// 证明表工厂只维护一份静态数组：首条声明来源，第二条把同一个工厂绑定缓存为
+// 返回该数组的无参函数，第三条调用该绑定。工厂绑定只允许这一次自赋值，数组绑定
+// 不得被外层读取，避免来源被替换或逃逸。
+function tableFactoryValues(factory,ix,source){
+ const body=factory?.body?.body;
+ if(!Array.isArray(body)||body.length!==3)fail('表工厂不符合已审查结构');
+ const [declaration,assignment,returned]=body;
+ const tableDecl=declaration.type==='VariableDeclaration'&&declaration.declarations.length===1?declaration.declarations[0]:null;
+ if(!tableDecl||tableDecl.id.type!=='Identifier')fail('表工厂必须声明唯一的字符串表');
+ const factoryBinding=ix.bindings.get(factory.id),tableBinding=ix.bindings.get(tableDecl.id);
+ if(!factoryBinding||!tableBinding||tableBinding.writes.length||tableBinding.refs.some(ref=>ref.start<factory.start||ref.end>factory.end))fail('表工厂的字符串表来源不唯一');
+ const values=staticStringArray(tableDecl.init,ix,source,{root:tableDecl.init,depth:0});
+ const set=assignment.type==='ExpressionStatement'?assignment.expression:null;
+ if(set?.type!=='AssignmentExpression'||set.operator!=='='||set.left.type!=='Identifier'||ix.bindings.get(set.left)!==factoryBinding)fail('表工厂缓存赋值目标不匹配');
+ if(factoryBinding.writes.length!==1||factoryBinding.writes[0]!==set)fail('表工厂只能自赋值一次');
+ const cached=set.right;
+ if(!functions.has(cached?.type)||cached.async||cached.generator||cached.params.length)fail('表工厂缓存值必须是无参同步函数');
+ const cachedStatements=cached.body.type==='BlockStatement'?cached.body.body:null;
+ if(!cachedStatements||cachedStatements.length!==1||cachedStatements[0].type!=='ReturnStatement'||cachedStatements[0].argument.type!=='Identifier'||ix.bindings.get(cachedStatements[0].argument)!==tableBinding)fail('表工厂缓存函数必须只返回字符串表');
+ const call=returned.type==='ReturnStatement'?returned.argument:null;
+ if(call?.type!=='CallExpression'||call.arguments.length||call.callee.type!=='Identifier'||ix.bindings.get(call.callee)!==factoryBinding)fail('表工厂返回值必须来自自身缓存');
+ return values;
+}
+
+// 只读诊断入口：验证缓存式解码器能沿唯一静态来源求值出字符串表。它不折叠、
+// 不执行输入函数，也不替代 collect 对轮转、自防御壳和业务引用的完整检查。
+export function inspectCachedTableFactory(source,only){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const decoders=ix.nodes.filter(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===KS_DECODER||cachedDecoderShape(n,ix))&&(!only||n.id?.name===only));
+ if(decoders.length!==1)fail('已识别标记，但解码器语法数量不唯一');
+ const decoder=decoders[0],first=decoder.body.body[0],factory=first?.type==='VariableDeclaration'&&first.declarations.length===1?first.declarations[0].init:null;
+ const tableFactory=factory?.type==='CallExpression'&&!factory.arguments.length&&functions.has(ix.bindings.get(factory.callee)?.init?.type)?ix.bindings.get(factory.callee).init:null;
+ if(!tableFactory)fail('表工厂不符合已审查结构');
+ return {factory:tableFactory.id?.name,values:tableFactoryValues(tableFactory,ix,source)};
 }
 function number(n,depth=0){
  if(depth>24)fail('常量算术过深');
