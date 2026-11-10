@@ -7,9 +7,9 @@ import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs'
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
-import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
+import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
-import {protectLibraries} from '../analysis/libraries.mjs';
+import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
@@ -87,9 +87,12 @@ function compile(original,format,options,libraries){
   return specializeCallbacks(input,generatedFunctions);
  };
  const finish=input=>{
-  const normalizedArgument=lowerSelfNormalizedArgument(input,format);
+  const detached=lowerDetachedGlobalObjectAliases(input);
+  const normalizedArgument=lowerQualifiedPlatformGlobals(lowerSelfNormalizedArgument(detached,format),format);
   const factories=lowerHTTPFactoryFields(lowerHTTPHelpers(lowerSelectedHTTP(lowerAPIObjectAliases(normalizedArgument))),format);
-  const result=emitNative(lowerClosedMessageObjects(lowerMessageParameters(factories.source)),original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
+  const messageSource=lowerMessageParameters(factories.source);
+  const closedSource=lowerClosedMessageObjects(messageSource);
+  const result=emitNative(closedSource,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
   libraries.transformations.push(...factories.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
@@ -293,6 +296,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const forwarders=lowerDirectPlatformForwarders(source);
  source=forwarders.source;
  libraries.transformations.push(...forwarders.transformations);
+ const detachedAliases=lowerDetachedGlobalObjectAliases(source);
+ source=detachedAliases;
+ assertSafeMissingGlobalProbes(source);
  const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper,allowNoCompletion:options.allowNoCompletion});
  if(report.errors.length)throw Error(report.errors.join('；'));
  const comments=[];
