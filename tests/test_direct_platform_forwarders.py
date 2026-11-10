@@ -37,6 +37,18 @@ class DirectPlatformForwarderTests(unittest.TestCase):
             "h.same(h,{});h.done($done,{body:'ok'});"
         )
 
+    def test_truthiness_observation_keeps_the_forwarder_proven(self):
+        self.check(
+            "const h={done:function(f,v){return f(v)}};"
+            "const observed=h?1:0;if(h&&observed)h.done($done,{body:'ok'});"
+        )
+        for source in [
+            "const h={done:function(f,v){return f(v)}};unknown(true?h:{});h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};unknown(h||{});h.done($done,{body:'ok'});",
+        ]:
+            with self.subTest(source=source),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'')
+
     def test_platform_value_forwarders_cover_notify_and_timers(self):
         notify = "const h={call:function(f,a,b,c,d){return f(a,b,c,d)}};h.call($notify,'t','s','b',{url:'https://example.test/'});$done({body:'ok'});"
         native = convert_script(notify, 'Fixture', URL, '', source_format='qx')

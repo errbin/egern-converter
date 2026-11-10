@@ -236,6 +236,17 @@ function lowerDirectPlatformForwarders(source){
  };
  const readOnlyEscape=(ref,seen)=>{
   const parent=parents.get(ref);
+  // 真值判断、typeof/void 观察和纯表达式语句只读取当前对象值，不会把对象
+  // 或其方法交给未知代码；成员读取另由 writesMember 检查，写入仍会拒绝。
+  const observed=node=>{
+   const p=parents.get(node);
+   if(p?.type==='ConditionalExpression'&&p.test===node||
+      ['IfStatement','WhileStatement','DoWhileStatement'].includes(p?.type)&&p.test===node||
+      p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator)||
+      p?.type==='ExpressionStatement'&&p.expression===node)return true;
+   return p?.type==='LogicalExpression'&&p.left===node&&observed(p);
+  };
+  if(observed(ref))return true;
   if(parent?.type!=='CallExpression'||!parent.arguments.includes(ref))return false;
   if(parent.arguments.filter(arg=>arg===ref).length!==1)return false;
   const fn=localFunction(parent.callee);

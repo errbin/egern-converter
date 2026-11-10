@@ -575,7 +575,7 @@ function rotationStatementShape(statement,outer,ix,decoder,tableFactory,wrappers
  const outside=ix.nodes.filter(node=>inside(node,statement)&&!inside(node,outer));
  if(statement.type==='IfStatement'){
   if(statement.alternate||statement.consequent?.type!=='BlockStatement'||statement.consequent.body.length)fail('轮转初始化语句包含业务分支');
- }else if(statement.type!=='ExpressionStatement')fail('轮转初始化语句不是闭合表达式');
+ }else if(!['ExpressionStatement','CallExpression'].includes(statement.type))fail('轮转初始化语句不是闭合表达式');
  if(outside.some(node=>['NewExpression','AwaitExpression','YieldExpression','ThisExpression','Super'].includes(node.type)))fail('轮转初始化语句包含未审查的调用或副作用');
  for(const node of outside){
   if(node.type==='CallExpression'){
@@ -678,10 +678,14 @@ function nestedRotationShape(call,ix,tableFactory,decoder){
  const allowedObjects=new Set([shiftValue.expression.right.callee.object,unshift.expression.callee.object,pushed.expression.callee.object]);
  if(tableBinding.refs.some(ref=>!allowedObjects.has(ref)))fail('嵌套轮转只允许操作本地表');
  const tree=ix.nodes[0];
- const statement=topStatement(outer,ix.parents,tree);
+ const top=topStatement(outer,ix.parents,tree);
+ const statement=narrowRotationStatement(top,outer,ix.parents);
  rotationStatementShape(statement,outer,ix,decoder,tableFactory,decoderWrappers(ix,decoder));
  const factoryBinding=ix.bindings.get(tableFactory.id);
- if(factoryBinding.refs.some(ref=>!inside(ref,tableFactory)&&!inside(ref,decoder)&&!inside(ref,statement)))fail('字符串表工厂在轮转初始化之外仍被引用');
+ // 原语句中与轮转并列的裸表工厂读取只用于保持本地表绑定，不执行调用；
+ // 任何成员读取或调用仍必须位于轮转初始化或解码器内部。
+ const bareFactoryRead=ref=>{const parent=ix.parents.get(ref);return inside(ref,top)&&(parent?.type==='SequenceExpression'||parent?.type==='ExpressionStatement'&&parent.expression===ref);};
+ if(factoryBinding.refs.some(ref=>!inside(ref,tableFactory)&&!inside(ref,decoder)&&!inside(ref,statement)&&!bareFactoryRead(ref)))fail('字符串表工厂在轮转初始化之外仍被引用');
  return {call,inner,outer,statement,checksum,target,regex,factoryArg};
 }
 function collect(source,variant,only){
@@ -720,7 +724,7 @@ function collect(source,variant,only){
   }else{
    rotationCall=direct[0];rotationFn=rotationCall.callee;
    if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
-   rotationStatement=topStatement(rotationCall,parents,tree);
+   rotationStatement=narrowRotationStatement(topStatement(rotationCall,parents,tree),rotationCall,parents);
    rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells);
   }
  }else{
@@ -735,7 +739,7 @@ function collect(source,variant,only){
   if(matches.length!==1)fail('v6 轮转语法数量不唯一');
   rotationCall=matches[0];rotationFn=rotationCall.callee;
   if(rotationCall.arguments.length!==3||bindings.get(rotationCall.arguments[0])!==tableBinding||number(rotationCall.arguments[1])!==0x99||number(rotationCall.arguments[2])!==0x9900)fail('v6 版本轮转参数不匹配');
-  rotationStatement=topStatement(rotationCall,parents,tree);
+  rotationStatement=narrowRotationStatement(topStatement(rotationCall,parents,tree),rotationCall,parents);
   rotationSteps=rotatePdd(rotationFn,values,ix,source);
  }
  if(values.length<3||values.length>LIMIT||values.some(v=>typeof v!=='string')||values.reduce((n,v)=>n+v.length,0)>1048576)fail('字符串表为空或超过静态边界');
@@ -877,6 +881,14 @@ function number(n,depth=0){
  fail('表达式包含非静态数字运算');
 }
 function topStatement(n,parents,tree){let child=n,p=parents.get(n);while(p&&p!==tree){child=p;p=parents.get(child);}return p===tree?child:null;}
+// 轮转调用可能只是顶层序列表达式的一项；只移除该项，不能连同同一语句中的
+// 业务表达式一起删除。更深的父节点仍按原语句处理，保持既有闭合检查。
+function narrowRotationStatement(statement,node,parents){
+ if(statement?.type!=='ExpressionStatement'||statement.expression.type!=='SequenceExpression')return statement;
+ let child=node;while(parents.get(child)&&parents.get(child)!==statement)child=parents.get(child);
+ if(child===statement.expression)child=statement.expression.expressions.find(expression=>node.start>=expression.start&&node.end<=expression.end);
+ return statement.expression.expressions.includes(child)?child:statement;
+}
 
 function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
  const target=number(call.arguments[1]),loop=ix.nodes.find(n=>n.type==='TryStatement'&&n.start>=fn.start&&n.end<=fn.end),checksum=loop?.block.body[0]?.declarations?.[0]?.init;
@@ -1561,6 +1573,10 @@ function foldObfuscatedTables(source,only){
  const render=n=>renderTree(source,n,node=>{
   if(removed.has(node))return {direct:true,value:''};
   if(replace.has(node))return {direct:true,value:replace.get(node)};
+  if(node.type==='SequenceExpression'&&node.expressions.some(removed.has.bind(removed))){
+   const expressions=node.expressions.filter(expression=>!removed.has(expression));
+   return expressions.length?{children:expressions,render:child=>expressions.map(child).join(', ')}:{direct:true,value:''};
+  }
   if(node.type==='VariableDeclaration'&&node.declarations.some(removed.has.bind(removed))){const ds=node.declarations.filter(d=>!removed.has(d));return ds.length?{children:ds,render:child=>`${node.kind} ${ds.map(child).join(', ')};`}:{direct:true,value:''};}
   if(node.type==='ObjectExpression'&&node.properties.some(removed.has.bind(removed))){const ps=node.properties.filter(p=>!removed.has(p));return {children:ps,render:child=>`{${ps.map(child).join(', ')}}`};}
   return null;

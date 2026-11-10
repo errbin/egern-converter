@@ -59,18 +59,18 @@ def decoder(name,names,mode='valid',with_shell=True):
     return f"""function {name}(a,b){{var c=tf();return {name}=function(d,e){{d=d-0x10;var f=c[d];{guard}var A='{ALPHABET}';return f;}},{name}(a,b);}}"""
 
 
-def fixture(names=None,mode='valid',shells=2):
+def fixture(names=None,mode='valid',shells=2,sequence=False):
     names=names or BASE
     values="['%s','%s','%s','%s','%s']"%(VERSION,'X'+VERSION,*CIPHER)
     rotation="(function(a,b){var aM=dec,c=a();while(!![]){try{var d=parseInt(aM(0x10))/0x1;if(d===b)break;else c['push'](c['shift']());}catch(e){c['push'](c['shift']());}}}(tf,100))"
     second=decoder('dec2',names,mode=mode,with_shell=shells==2)
+    completion=f"({rotation},$done({{body:d5(0x10)+dec2(0x10)}}));" if sequence else f"{rotation};\n$done({{body:d5(0x10)+dec2(0x10)}});"
     return f"""var _0xodK='{VERSION}';
 function tf(){{var a={values};tf=function(){{return a;}};return tf();}}
 {decoder('dec',names,mode=mode)}
 {second}
 var d0=dec,d1=d0,d2=d1,d3=d2,d4=d3,d5=d4;
-{rotation};
-$done({{body:d5(0x10)+dec2(0x10)}});
+{completion}
 """
 
 
@@ -80,6 +80,13 @@ def fold(source):
 
 
 class CachedShellFamilyTests(unittest.TestCase):
+
+    def test_rotation_removed_from_sequence_preserves_sibling_business(self):
+        data=fold(fixture(sequence=True))
+        self.assertNotIn('error',data)
+        self.assertEqual(data['transformations'],1)
+        self.assertIn('$done({body:"100"+"100"})',data['source'])
+        self.assertNotIn('parseInt',data['source'])
 
     def test_random_key_variants_fold_every_shell_and_decode_through_deep_aliases(self):
         for names in (BASE,ALT):

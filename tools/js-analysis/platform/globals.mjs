@@ -142,6 +142,12 @@ function fold(source,format,options,qxHint){
   if(readonlyRecords.has(b))return readonlyRecords.get(b);
   const safe=b.refs.filter(r=>!b.writes.some(w=>w.left===r)).every(r=>{const p=ix.parents.get(r),q=ix.parents.get(p);
    if(p?.type==='MemberExpression'&&p.object===r)return property(p)!==undefined&&!(q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.operator==='delete'||['ForInStatement','ForOfStatement'].includes(q?.type)&&q.left===p);
+   // 真值判断、typeof/void 观察和纯表达式语句只读取对象值，不会让对象或
+   // 方法逃逸；成员写入仍由上面的分支拒绝。
+   if(p?.type==='ConditionalExpression'&&p.test===r||
+      ['IfStatement','WhileStatement','DoWhileStatement'].includes(p?.type)&&p.test===r||
+      p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator)||
+      p?.type==='ExpressionStatement'&&p.expression===r)return true;
    return p?.type==='VariableDeclarator'&&p.init===r&&p.id.type==='ObjectPattern'&&p.id.properties.every(v=>v.type==='Property'&&!v.computed&&v.value.type==='Identifier');
   });readonlyRecords.set(b,safe);return safe;
  }
@@ -471,6 +477,8 @@ function fold(source,format,options,qxHint){
   if(n.type==='UnaryExpression')return n.operator==='typeof'&&n.argument.type==='Identifier'||['!','void','+','-'].includes(n.operator)&&inert(n.argument);
   if(['BinaryExpression','LogicalExpression'].includes(n.type))return inert(n.left)&&inert(n.right);
   if(n.type==='ConditionalExpression')return inert(n.test)&&inert(n.consequent)&&inert(n.alternate);
+ if(n.type==='ObjectExpression')return n.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.computed&&(functions.has(p.value?.type)||inert(p.value)));
+ if(n.type==='ArrayExpression')return n.elements.every(element=>element&&element.type!=='SpreadElement'&&inert(element));
   if(n.type==='VariableDeclaration')return n.declarations.every(d=>d.id.type==='Identifier'&&inert(d.init));
   return false;
  }
@@ -504,8 +512,13 @@ function fold(source,format,options,qxHint){
   const declaration=ix.parents.get(binding.init),statement=ix.parents.get(declaration),block=ix.parents.get(statement);
   if(declaration?.type!=='VariableDeclarator'||statement?.type!=='VariableDeclaration'||!['Program','BlockStatement'].includes(block?.type))return false;
   if(declarationCounts.get(binding)!==1)return false;
-  if(ix.owners.get(ref)!==ix.owners.get(statement))return statement.kind==='const'&&
-   (block.body.slice(0,block.body.indexOf(statement)+1).every(inert)||enteredAfter(ix.owners.get(ref),statement));
+  // `var` 与 `const` 的差别只在初始化前读取；绑定没有任何写入时，嵌套函数
+  // 若只会在声明之后进入，读到的同样是这个已初始化的对象字面量。
+  if(ix.owners.get(ref)!==ix.owners.get(statement)){
+   const index=statement.declarations.indexOf(declaration);
+   const prefix=index>=0&&statement.declarations.slice(0,index+1).every(d=>d.id.type==='Identifier'&&inert(d.init));
+   return prefix&&block.body.slice(0,block.body.indexOf(statement)).every(inert)||enteredAfter(ix.owners.get(ref),statement);
+  }
   if(ref.start>=binding.init.end&&ref.end<=statement.end)return true;
   let enclosing=ref;while(ix.parents.get(enclosing)&&ix.parents.get(enclosing)!==block)enclosing=ix.parents.get(enclosing);
   return ix.parents.get(enclosing)===block&&enclosing.start>=statement.end;
