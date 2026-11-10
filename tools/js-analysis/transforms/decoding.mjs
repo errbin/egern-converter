@@ -728,6 +728,15 @@ export function inspectNestedRotation(source,only){
  return {factory:data.tableFactory?.id?.name??null,values:data.values,steps:data.rotationSteps};
 }
 
+// 只读诊断入口：统计缓存式解码器族中的内嵌自防御壳数量，供语料回归使用。
+export function inspectCachedShellFamily(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ return ix.nodes.filter(node=>node.type==='FunctionDeclaration'&&cachedDecoderShape(node,ix)).map(decoder=>({
+  decoder:decoder.id?.name??null,
+  shells:shellSites(decoder,ix).length,
+ })).filter(item=>item.shells);
+}
+
 function literalArray(array,ix,source){
  if(array.elements.length>LIMIT)fail('字符串表条目超过上限');
  return array.elements.map(e=>{
@@ -938,11 +947,233 @@ function decoderAlphabet(decoder){
  if(found.some(a=>a!==found[0]))fail('解码器内部字母表不唯一');
  return found[0];
 }
+
+// 缓存式解码器内嵌的自防御壳只维护实例状态，并在格式自检为真时走固定返回 -1
+// 的短路分支。这里逐项校验随机键名归一化后的结构契约，不执行输入函数；壳内部
+// 仍以同一套 AST 角色关联，因此改键名、换局部变量名不会放宽，改变语义则拒绝。
+const CACHED_SHELL_GLOBALS=new Set(['RegExp','Boolean','Math']);
+const CACHED_SHELL_REGEX_A='\\w+ *\\(\\) *{\\w+ *';
+const CACHED_SHELL_REGEX_B='[\'|"].+[\'|"];? *}';
+const insideNode=(node,range)=>!!node&&!!range&&node.start>=range.start&&node.end<=range.end;
+const sameNodeBinding=(ix,left,right)=>left?.type==='Identifier'&&right?.type==='Identifier'&&ix.bindings.get(left)&&ix.bindings.get(left)===ix.bindings.get(right);
+const memberKey=node=>node?.type==='MemberExpression'?property(node):undefined;
+const thisKey=(node,key)=>node?.type==='MemberExpression'&&node.object.type==='ThisExpression'&&memberKey(node)===key;
+function literalSample(fn){
+ if(fn?.type!=='FunctionExpression'||fn.async||fn.generator||fn.params.length||fn.body.type!=='BlockStatement'||fn.body.body.length!==1)return false;
+ const statement=fn.body.body[0];
+ return statement.type==='ReturnStatement'&&statement.argument?.type==='Literal'&&typeof statement.argument.value==='string';
+}
+function shellConstructorRoles(fn,ix){
+ if(fn?.type!=='FunctionExpression'||fn.async||fn.generator||fn.params.length!==1||fn.params[0].type!=='Identifier')fail('缓存式自防御壳构造器结构不匹配');
+ const body=fn.body?.body;
+ if(body?.length!==1||body[0].type!=='ExpressionStatement'||body[0].expression.type!=='SequenceExpression'||body[0].expression.expressions.length!==5)fail('缓存式自防御壳构造器结构不匹配');
+ const param=ix.bindings.get(fn.params[0]),roles={},keys=new Set();
+ for(const assignment of body[0].expression.expressions){
+  if(assignment.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.left.type!=='MemberExpression'||assignment.left.object.type!=='ThisExpression')fail('缓存式自防御壳构造器结构不匹配');
+  const keyName=memberKey(assignment.left);
+  if(typeof keyName!=='string'||keys.has(keyName))fail('缓存式自防御壳构造器键名不唯一');
+  keys.add(keyName);
+  const right=assignment.right;
+  if(right.type==='Identifier'&&ix.bindings.get(right)===param)roles.externalKey=keyName;
+  else if(right.type==='ArrayExpression'&&right.elements.length===3&&right.elements.every((item,index)=>item?.type==='Literal'&&item.value===[1,0,0][index]))roles.stateKey=keyName;
+  else if(literalSample(right)){roles.sampleKey=keyName;roles.sample=right;}
+  else if(right.type==='Literal'&&typeof right.value==='string'){
+   if(roles.regexAKey===undefined){roles.regexAKey=keyName;roles.regexAValue=right.value;}
+   else if(roles.regexBKey===undefined){roles.regexBKey=keyName;roles.regexBValue=right.value;}
+   else fail('缓存式自防御壳构造器结构不匹配');
+  }
+  else fail('缓存式自防御壳构造器结构不匹配');
+ }
+ return roles.externalKey&&roles.stateKey&&roles.sampleKey&&roles.regexAKey&&roles.regexBKey?roles:null;
+}
+function shellMethods(shellBinding,decoder,ix){
+ return ix.nodes.filter(node=>node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='MemberExpression'&&node.left.object.type==='MemberExpression'&&property(node.left.object)==='prototype'&&node.left.object.object.type==='Identifier'&&ix.bindings.get(node.left.object.object)===shellBinding&&insideNode(node,decoder)&&typeof memberKey(node.left)==='string'&&node.right?.type==='FunctionExpression');
+}
+function checkerMethod(fn,roles,ix){
+ const body=fn.body?.body;
+ if(fn.async||fn.generator||fn.params.length||body?.length!==2)return null;
+ const declaration=body[0],returned=body[1];
+ if(declaration.type!=='VariableDeclaration'||declaration.declarations.length!==2||returned.type!=='ReturnStatement')return null;
+ const [regexDeclaration,resultDeclaration]=declaration.declarations;
+ if(regexDeclaration.id.type!=='Identifier'||resultDeclaration.id.type!=='Identifier'||!regexDeclaration.init||!resultDeclaration.init)return null;
+ const regex=regexDeclaration.init;
+ if(regex.type!=='NewExpression'||regex.callee.type!=='Identifier'||!ix.free(regex.callee,'RegExp')||regex.arguments.length!==1)return null;
+ const source=regex.arguments[0];
+ if(source?.type!=='BinaryExpression'||source.operator!=='+'||!thisKey(source.left,roles.regexAKey)||!thisKey(source.right,roles.regexBKey))return null;
+ const selected=resultDeclaration.init;
+ if(selected.type!=='ConditionalExpression')return null;
+ const test=selected.test;
+ if(test?.type!=='CallExpression'||test.arguments.length!==1||test.callee.type!=='MemberExpression'||memberKey(test.callee)!=='test'||!sameNodeBinding(ix,test.callee.object,regexDeclaration.id))return null;
+ const tested=test.arguments[0];
+ if(tested?.type!=='CallExpression'||tested.arguments.length||tested.callee.type!=='MemberExpression'||memberKey(tested.callee)!=='toString'||!thisKey(tested.callee.object,roles.sampleKey))return null;
+ const decrement=(node,index)=>node?.type==='UpdateExpression'&&node.operator==='--'&&node.prefix&&node.argument.type==='MemberExpression'&&thisKey(node.argument.object,roles.stateKey)&&memberKey(node.argument)===index;
+ if(!decrement(selected.consequent,1)||!decrement(selected.alternate,0))return null;
+ const next=returned.argument;
+ if(next?.type!=='CallExpression'||next.arguments.length!==1||next.callee.type!=='MemberExpression'||next.callee.object.type!=='ThisExpression'||typeof memberKey(next.callee)!=='string'||!sameNodeBinding(ix,next.arguments[0],resultDeclaration.id))return null;
+ return {helperKey:memberKey(next.callee)};
+}
+function helperMethod(fn,roles,ix){
+ const body=fn.body?.body;
+ if(fn.async||fn.generator||fn.params.length!==1||fn.params[0].type!=='Identifier'||body?.length!==2)return null;
+ const [guard,returned]=body,param=ix.bindings.get(fn.params[0]);
+ if(guard.type!=='IfStatement'||guard.alternate)return null;
+ const test=guard.test;
+ if(test?.type!=='UnaryExpression'||test.operator!=='!'||test.argument.type!=='CallExpression'||test.argument.arguments.length!==1||test.argument.callee.type!=='Identifier'||!ix.free(test.argument.callee,'Boolean'))return null;
+ const inverted=test.argument.arguments[0];
+ if(inverted?.type!=='UnaryExpression'||inverted.operator!=='~'||inverted.argument.type!=='Identifier'||ix.bindings.get(inverted.argument)!==param)return null;
+ if(guard.consequent.type!=='ReturnStatement'||!sameNodeBinding(ix,guard.consequent.argument,fn.params[0]))return null;
+ const next=returned.type==='ReturnStatement'?returned.argument:null;
+ if(next?.type!=='CallExpression'||next.arguments.length!==1||next.callee.type!=='MemberExpression'||next.callee.object.type!=='ThisExpression'||typeof memberKey(next.callee)!=='string'||!thisKey(next.arguments[0],roles.externalKey))return null;
+ return {recursiveKey:memberKey(next.callee)};
+}
+function recursiveMethod(fn,roles,ix){
+ const body=fn.body?.body;
+ if(fn.async||fn.generator||fn.params.length!==1||fn.params[0].type!=='Identifier'||body?.length!==2)return null;
+ const [loop,returned]=body,param=ix.bindings.get(fn.params[0]);
+ if(loop.type!=='ForStatement'||loop.init?.type!=='VariableDeclaration'||loop.init.declarations.length!==2||!loop.test||!loop.update||loop.body.type!=='BlockStatement'||loop.body.body.length!==1)return null;
+ const [counter,length]=loop.init.declarations;
+ if(counter.id.type!=='Identifier'||counter.init?.type!=='Literal'||counter.init.value!==0||length.id.type!=='Identifier')return null;
+ const lengthRead=length.init;
+ if(lengthRead?.type!=='MemberExpression'||memberKey(lengthRead)!=='length'||!thisKey(lengthRead.object,roles.stateKey))return null;
+ if(loop.test.type!=='BinaryExpression'||loop.test.operator!=='<'||!sameNodeBinding(ix,loop.test.left,counter.id)||!sameNodeBinding(ix,loop.test.right,length.id))return null;
+ if(loop.update.type!=='UpdateExpression'||loop.update.operator!=='++'||!sameNodeBinding(ix,loop.update.argument,counter.id))return null;
+ const mutations=loop.body.body[0];
+ if(mutations.type!=='ExpressionStatement'||mutations.expression.type!=='SequenceExpression'||mutations.expression.expressions.length!==2)return null;
+ const [push,refresh]=mutations.expression.expressions;
+ if(push.type!=='CallExpression'||push.arguments.length!==1||push.callee.type!=='MemberExpression'||memberKey(push.callee)!=='push'||!thisKey(push.callee.object,roles.stateKey))return null;
+ const rounded=push.arguments[0];
+ if(rounded.type!=='CallExpression'||rounded.arguments.length!==1||rounded.callee.type!=='MemberExpression'||memberKey(rounded.callee)!=='round'||rounded.callee.object.type!=='Identifier'||!ix.free(rounded.callee.object,'Math'))return null;
+ const random=rounded.arguments[0];
+ if(random.type!=='CallExpression'||random.arguments.length||random.callee.type!=='MemberExpression'||memberKey(random.callee)!=='random'||random.callee.object.type!=='Identifier'||!ix.free(random.callee.object,'Math'))return null;
+ if(refresh.type!=='AssignmentExpression'||refresh.operator!=='='||!sameNodeBinding(ix,refresh.left,length.id)||refresh.right?.type!=='MemberExpression'||memberKey(refresh.right)!=='length'||!thisKey(refresh.right.object,roles.stateKey))return null;
+ const next=returned.type==='ReturnStatement'?returned.argument:null;
+ if(next?.type!=='CallExpression'||next.arguments.length!==1||next.callee.type!=='Identifier'||ix.bindings.get(next.callee)!==param)return null;
+ const value=next.arguments[0];
+ if(value?.type!=='MemberExpression'||memberKey(value)!==0||!thisKey(value.object,roles.stateKey))return null;
+ return true;
+}
+function shellSites(decoder,ix){
+ const sites=[];
+ for(const construct of ix.nodes){
+  if(construct.type!=='NewExpression'||construct.callee.type!=='Identifier'||!insideNode(construct,decoder))continue;
+  const binding=ix.bindings.get(construct.callee);
+  if(!binding?.init||binding.init.type!=='FunctionExpression')continue;
+  const methods=shellMethods(binding,decoder,ix);
+  if(methods.length)sites.push({binding,methods});
+ }
+ return sites;
+}
+function discardedValue(node,ix){
+ const parent=ix.parents.get(node);
+ if(parent?.type==='ExpressionStatement'&&parent.expression===node)return true;
+ if(parent?.type!=='SequenceExpression')return false;
+ return parent.expressions[parent.expressions.length-1]!==node||discardedValue(parent,ix);
+}
+function proveShellWrites(ranges,ix,shellBinding){
+ const local=new Set();
+ for(const n of ix.nodes){
+  if(!ranges.some(range=>insideNode(n,range)))continue;
+  if(functions.has(n.type)&&n.params)for(const param of n.params)if(param.type==='Identifier')local.add(ix.bindings.get(param));
+  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier')local.add(ix.bindings.get(n.id));
+  if(n.type==='FunctionDeclaration'&&n.id)local.add(ix.bindings.get(n.id));
+ }
+ const rootOf=node=>{let root=node;while(root?.type==='MemberExpression')root=root.object;return root;};
+ const inspectWrite=target=>{
+  const root=rootOf(target);
+  if(root?.type==='ThisExpression')return;
+  if(root?.type!=='Identifier')fail('缓存式自防御壳写入了外部绑定');
+  const binding=ix.bindings.get(root);
+  if(!binding)fail('缓存式自防御壳写入了自由绑定');
+  if(binding===shellBinding)return;
+  if(!local.has(binding))fail('缓存式自防御壳写入了外部绑定');
+ };
+ for(const n of ix.nodes){
+  if(!ranges.some(range=>insideNode(n,range)))continue;
+  if(n.type==='AssignmentExpression')inspectWrite(n.left);
+  else if(n.type==='UpdateExpression')inspectWrite(n.argument);
+  else if(['ForInStatement','ForOfStatement'].includes(n.type)&&n.left.type!=='VariableDeclaration')inspectWrite(n.left);
+ }
+}
+function proveShellGlobals(ranges,ix){
+ const free=new Set(),declared=new Set();
+ for(const n of ix.nodes){
+  if(!ranges.some(range=>insideNode(n,range)))continue;
+  if(n.type==='Identifier'&&ix.free(n))free.add(n.name);
+  if(n.type==='Identifier'&&CACHED_SHELL_GLOBALS.has(n.name)&&!ix.free(n))fail('缓存式自防御壳遮蔽了自由全局：'+n.name);
+  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier')declared.add(n.id.name);
+  if(functions.has(n.type)&&n.params)for(const param of n.params)if(param.type==='Identifier')declared.add(param.name);
+  if(n.type==='FunctionDeclaration'&&n.id)declared.add(n.id.name);
+ }
+ for(const name of free)if(!CACHED_SHELL_GLOBALS.has(name))fail('缓存式自防御壳使用了未审查的自由全局：'+name);
+ for(const name of CACHED_SHELL_GLOBALS)if(declared.has(name))fail('缓存式自防御壳重复声明了自由全局：'+name);
+ for(const n of ix.nodes){
+  if(!ranges.some(range=>insideNode(n,range)))continue;
+  const target=n.type==='AssignmentExpression'?n.left:n.type==='UpdateExpression'?n.argument:null;
+  let root=target;while(root?.type==='MemberExpression')root=root.object;
+  if(root?.type==='Identifier'&&(!ix.bindings.get(root)||CACHED_SHELL_GLOBALS.has(root.name)))fail('缓存式自防御壳写入了自由全局：'+root.name);
+ }
+}
+function proveEmbeddedShells(decoder,site,source,ix){
+ if(site.methods.length!==3)fail('缓存式自防御壳方法数量不匹配');
+ const constructorRange=site.binding.init,methodRanges=site.methods.map(node=>node.right);
+ proveShellGlobals([constructorRange,...methodRanges],ix);
+ proveShellWrites([constructorRange,...methodRanges],ix,site.binding);
+ const roles=shellConstructorRoles(site.binding.init,ix);
+ if(!roles)fail('缓存式自防御壳构造器结构不匹配');
+ if(roles.regexAValue!==CACHED_SHELL_REGEX_A||roles.regexBValue!==CACHED_SHELL_REGEX_B)fail('缓存式自防御壳的格式自检正则被改动');
+ const methods=site.methods.map(node=>({key:memberKey(node.left),fn:node.right}));
+ if(new Set(methods.map(method=>method.key)).size!==3)fail('缓存式自防御壳方法键名重复');
+ const checkers=methods.filter(method=>checkerMethod(method.fn,roles,ix));
+ if(checkers.length!==1)fail('缓存式自防御壳缺少唯一的格式自检方法');
+ const checker=checkers[0],checkerProof=checkerMethod(checker.fn,roles,ix);
+ const helpers=methods.filter(method=>helperMethod(method.fn,roles,ix));
+ if(helpers.length!==1||helpers[0].key!==checkerProof.helperKey)fail('缓存式自防御壳的短路辅助方法不匹配');
+ const helperProof=helperMethod(helpers[0].fn,roles,ix);
+ const recursives=methods.filter(method=>recursiveMethod(method.fn,roles,ix));
+ if(recursives.length!==1||recursives[0].key!==helperProof.recursiveKey)fail('缓存式自防御壳的失败路径方法不匹配');
+ if(new Set([checker.key,helpers[0].key,recursives[0].key]).size!==3)fail('缓存式自防御壳方法角色不唯一');
+ const constructed=ix.nodes.filter(node=>node.type==='NewExpression'&&node.callee.type==='Identifier'&&ix.bindings.get(node.callee)===site.binding&&insideNode(node,decoder));
+ if(constructed.length!==1)fail('缓存式自防御壳调用数量不一致');
+ const instance=constructed[0];
+ if(instance.arguments.length!==1||!sameNodeBinding(ix,instance.arguments[0],decoder.id))fail('缓存式自防御壳的解码器参数不匹配');
+ const member=ix.parents.get(instance),call=member&&ix.parents.get(member);
+ if(member?.type!=='MemberExpression'||member.object!==instance||call?.type!=='CallExpression'||call.callee!==member||call.arguments.length||memberKey(member)!==checker.key)fail('缓存式自防御壳自检调用结构不匹配');
+ if(!discardedValue(call,ix))fail('缓存式自防御壳的自检结果没有被丢弃');
+ const format=new RegExp(CACHED_SHELL_REGEX_A+CACHED_SHELL_REGEX_B);
+ if(!format.test(source.slice(roles.sample.start,roles.sample.end)))fail('缓存式自防御壳的格式自检正则没有通过，失败路径可达');
+ // 初始状态为 [1,0,0]；正则命中时走 state[1] 前置自减，辅助方法对 -1 直接短路。
+ const safeValue=[1,0,0][1]-1;
+ if(safeValue!==-1||!(!Boolean(~safeValue)))fail('缓存式自防御壳的安全路径没有返回 -1');
+}
+function proveEmbeddedShellFamily(decoders,source,ix){
+ let total=0;const sitesByDecoder=new Map();
+ for(const decoder of decoders){
+  const sites=shellSites(decoder,ix);
+  if(sites.length>1)fail('缓存式自防御壳的外壳数量不一致');
+  if(sites.length){total+=sites.length;sitesByDecoder.set(decoder,sites[0]);}
+ }
+ if(!total)return false;
+ if(total!==decoders.length)fail('缓存式自防御壳的外壳数量不一致');
+ for(const decoder of decoders)proveEmbeddedShells(decoder,sitesByDecoder.get(decoder),source,ix);
+ return true;
+}
 // 解析调用目标：允许沿本地别名（var aD=a0e / var aQ=a0d）解析到已确认的解码器或外壳，
-// 别名链最多 4 跳；不在已确认集合内的目标一律返回 null，交由调用方拒绝。
+// 别名链最多 16 跳且必须无写入、无环；不在已确认集合内的目标一律返回 null，交由调用方拒绝。
 function resolveCallable(callee,ix,wrappers){
- let fn=functionFor(callee,ix);
- for(let hop=0;hop<4&&fn&&fn.type==='Identifier';hop++){const next=functionFor(fn,ix);if(!next||next===fn)break;fn=next;}
+ let fn=functionFor(callee,ix);const seen=new Set();
+ const initial=callee.type==='Identifier'?ix.bindings.get(callee):null;
+ if(fn?.type==='Identifier'&&initial?.writes.length&&!functions.has((initial.fn??initial.init)?.type))return null;
+ for(let hop=0;hop<16;hop++){
+  if(!fn)return null;
+  if(fn.type!=='Identifier')break;
+  const binding=ix.bindings.get(fn);
+  if(!binding||binding.writes.length&&!functions.has((binding.fn??binding.init)?.type)||seen.has(fn))return null;
+  seen.add(fn);
+  const next=functionFor(fn,ix);
+  if(!next||next===fn)return null;
+  fn=next;
+  if(hop===15&&fn.type==='Identifier')return null;
+ }
  return fn&&wrappers.has(fn)?fn:null;
 }
 function decoderWrappers(ix,decoder){
@@ -1057,6 +1288,7 @@ function foldObfuscatedTables(source,only){
  const data=collect(source,ks?'ks':'pdd',only),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant}=data;
  const wrappers=decoderWrappers(ix,decoder),replace=new Map(),removed=new WeakSet(),removedRanges=[];
  const alphabet=data.alphabet,shells=data.shells;
+ let family=[decoder];
  // 共用同一表工厂的同形外壳共享解码器身份：并入 wrapper 集合，保证轮转校验和经由任一外壳都能静态求值
  const factoryName=tableFactoryName(decoder,ix);
  for(const fn of nodes){
@@ -1091,8 +1323,15 @@ function foldObfuscatedTables(source,only){
   const child=tree.body.find(n=>n.type==='VariableDeclaration'&&n.declarations.some(d=>d.id.name==='_0x511896'));
   const shellCall=tree.body.find(n=>n.type==='ExpressionStatement'&&n.expression.type==='CallExpression'&&n.expression.callee.name==='_0x511896');
   const shellDecl=shell?.declarations.find(d=>d.id.name==='_0x554d94'),childDecl=child?.declarations.find(d=>d.id.name==='_0x511896');
-  if(!shellDecl||methodContract(shellDecl.init)!==KS_SHELL||!childDecl||methodContract(childDecl.init)!==KS_SHELL_CHILD||!shellCall||methodContract(shellCall.expression)!==KS_SHELL_CALL)fail('js-obfuscator 自防御壳与已审查契约不同');
-  mark(shell);mark(child);mark(shellCall);
+  const legacy=!!(shellDecl||childDecl||shellCall);
+  if(legacy){
+   if(!shellDecl||methodContract(shellDecl.init)!==KS_SHELL||!childDecl||methodContract(childDecl.init)!==KS_SHELL_CHILD||!shellCall||methodContract(shellCall.expression)!==KS_SHELL_CALL)fail('js-obfuscator 自防御壳与已审查契约不同');
+   mark(shell);mark(child);mark(shellCall);
+  }else{
+   family=[decoder,...shells].filter(fn=>fn.type==='FunctionDeclaration');
+   if(!proveEmbeddedShellFamily(family,source,ix))fail('js-obfuscator 自防御壳与已审查契约不同');
+   for(const fn of family)mark(fn);
+  }
  }
 
  // Delete only closed lookup wrappers whose every reference is either a
@@ -1107,8 +1346,39 @@ function foldObfuscatedTables(source,only){
   const accesses=nodes.filter(n=>n.type==='MemberExpression'&&bindings.get(n.object)===objectBinding&&String(property(n))===String(key(p)));
   if(accesses.every(n=>{const call=parents.get(n);return call?.type==='CallExpression'&&call.callee===n&&replace.has(call);}))mark(p);
  }
- const decoderRefs=decoderBinding.refs.filter(r=>!isRemoved(r)&&!removable.has(parents.get(r))&&!removable.has(parents.get(parents.get(r))));
- if(decoderRefs.some(r=>{const p=parents.get(r);return !(p?.type==='CallExpression'&&p.callee===r&&replace.has(p));}))fail('解码器仍有动态、逃逸或未识别的引用');
+
+ // 同表解码器的局部别名只允许用于已替换的字面量调用。先沿别名链收敛，再在
+ // 无写入且全部引用均已消失时删除声明；任何逃逸引用都会在下方解码器检查中拒绝。
+ const aliases=new Map(),known=new Set(family.map(fn=>bindings.get(fn.id)));
+ for(let changed=true;changed;){
+  changed=false;
+  for(const declarator of nodes){
+   if(declarator.type!=='VariableDeclarator'||declarator.id.type!=='Identifier'||declarator.init?.type!=='Identifier')continue;
+   const source=bindings.get(declarator.init),target=bindings.get(declarator.id);
+   if(!source||!target||!known.has(source)||known.has(target))continue;
+   known.add(target);aliases.set(target,declarator);changed=true;
+  }
+ }
+ const removableAliases=new Set();
+ for(let changed=true;changed;){
+  changed=false;
+  for(const [binding,declarator]of aliases){
+   if(removableAliases.has(binding)||binding.writes.length)continue;
+   const safe=binding.refs.every(ref=>{
+    if(isRemoved(ref))return true;
+    const parent=parents.get(ref);
+    if(parent?.type==='CallExpression'&&parent.callee===ref&&replace.has(parent))return true;
+    if(parent?.type==='VariableDeclarator'&&parent.init===ref)return removableAliases.has(bindings.get(parent.id));
+    return false;
+   });
+   if(safe){removableAliases.add(binding);mark(declarator);changed=true;}
+  }
+ }
+ for(const fn of family){
+  const binding=bindings.get(fn.id),decoderRefs=binding.refs.filter(r=>!isRemoved(r)&&!removable.has(parents.get(r))&&!removable.has(parents.get(parents.get(r))));
+  const unsafe=decoderRefs.filter(r=>{const p=parents.get(r);return !(p?.type==='CallExpression'&&p.callee===r&&replace.has(p));});
+  if(unsafe.length)fail('解码器仍有动态、逃逸或未识别的引用');
+ }
  const tableRefs=tableBinding.refs.filter(r=>!isRemoved(r)&&!isRemoved(parents.get(r)));
  if(tableRefs.some(r=>bindings.get(r)!==decoderBinding&&!(parents.get(r)?.type==='CallExpression'&&parents.get(r).callee===r)))fail('字符串表仍被解码器以外的业务读取');
  for(const d of nodes.filter(n=>n.type==='ExpressionStatement'&&n.expression.type==='AssignmentExpression'&&n.expression.left.type==='Identifier'&&n.expression.left.name==='_0xodJ'&&n.expression.right.type==='Literal'&&n.expression.right.value==='jsjiami.com.v6')){
