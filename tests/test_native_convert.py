@@ -310,7 +310,6 @@ $done({body:JSON.stringify([text,pattern.source,String(big),result()===undefined
             'const finish=()=>{$done({})};[1].forEach(finish);$done({});',
             'const finish=()=>{$done({})};const box={finish};box.finish();',
             'try{$done({});}finally{$notify("late");}',
-            'const alias=$response; $done({body:alias.body});',
             'const input={url:"https://api.example"};input.timeout=5;$task.fetch(input).then(r=>$done({}));',
             'const f=()=>JSON.parse("{}");$done(f());',
             'let result={};result={body:"changed"};$done(result);',

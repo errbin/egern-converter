@@ -3,6 +3,7 @@ import unittest
 
 from tools.egern_hub.convert import ConversionError
 from tools.egern_hub.script_convert import convert_script
+from tools.egern_hub.verify import compare
 
 URL = 'https://example.test/message.js'
 
@@ -28,6 +29,17 @@ const result=snapshot($response);$done({body:JSON.stringify(result.headers)});''
         native = self.convert(source)
         self.assertIn('ctx.response["headers"].entries()', native)
         self.assertIn('ctx.response["status"]', native)
+
+    def test_response_alias_body_is_differentially_equivalent(self):
+        source = 'const alias=$response; $done({body:alias.body});'
+        native = self.convert(source)
+        self.assertNotIn('$response', native)
+        for body in ['', 'plain', '{"ok":true}', '中文正文']:
+            with self.subTest(body=body):
+                case = {'name': 'response alias body', 'request': {'url': URL},
+                        'response': {'body': body}, 'expected': {'result': {'body': body}}}
+                result = compare(source, native, 'qx', URL, case)
+                self.assertEqual(result['status'], 'passed', result)
 
     def test_unknown_dynamic_method_or_status_mutation_still_rejects(self):
         sources = [
