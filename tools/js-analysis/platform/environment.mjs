@@ -789,7 +789,9 @@ export function normalizePrototypeEnv(source){
   const methodNames=new Set(methods.map(item=>item.name));
   for(const construction of constructions){
    const declarator=parents.get(construction),declaration=parents.get(declarator);
-   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1){valid=false;break;}
+   // 同一 var/let 语句可以同时声明普通响应字段等无关变量；实例引用仍由下面
+   // 的逐项封闭检查约束，因此不必要求目标声明器独占整条声明。
+   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'){valid=false;break;}
    const instance=bindings.get(declarator.id);
    if(!instance||!instance.refs.length||instance.writes.length){valid=false;break;}
    for(const ref of instance.refs){
@@ -887,6 +889,40 @@ function platformProbe(method,ix){
 // 任一条件不成立即跳过整个候选，保持原文并让后续分析继续拒绝。
 function multiPlatformEnv(ix,source){
  const {nodes,parents,bindings}=ix,candidates=[];
+ // 打包器偶尔把实例临时存进局部别名，仅用于在后续 `.call` 中保留接收者。
+ // 别名必须只有这一次写入、没有初始化，并且所有读取都只是静态成员或 `.call`
+ // 的第一个参数；任何重绑、动态成员、方法写入或其它逃逸都让整个候选失效。
+ function aliasMembers(assignment){
+  const aliasNode=assignment.left;
+  if(aliasNode?.type!=='Identifier')return null;
+  const alias=bindings.get(aliasNode);
+  if(!alias||alias.init||alias.writes.length!==1||alias.writes[0]!==assignment)return null;
+  const members=new Set();
+  for(const ref of alias.refs){
+   if(ref===aliasNode)continue;
+   const member=parents.get(ref),use=parents.get(member),name=property(member);
+   if(member?.type==='MemberExpression'&&member.object===ref&&typeof name==='string'&&!member.optional){
+    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')return null;
+    members.add(name);continue;
+   }
+   const call=parents.get(ref);
+   if(call?.type==='CallExpression'&&call.arguments[0]===ref&&!call.optional&&
+      call.callee.type==='MemberExpression'&&property(call.callee)==='call'&&!call.arguments.some(argument=>argument.type==='SpreadElement'))continue;
+   return null;
+  }
+  return members;
+ }
+ function receiverMember(ref){
+  const direct=parents.get(ref);
+  if(direct?.type==='MemberExpression'&&direct.object===ref)return {member:direct,aliased:null};
+  if(direct?.type==='AssignmentExpression'&&direct.operator==='='&&direct.right===ref){
+   const member=parents.get(direct);
+   if(member?.type==='MemberExpression'&&member.object===direct){
+    const aliased=aliasMembers(direct);if(aliased)return {member,aliased};
+   }
+  }
+  return null;
+ }
  for(const factory of nodes){
   if(factory.type!=='FunctionDeclaration'&&factory.type!=='FunctionExpression')continue;
   const body=factory.body?.body;
@@ -948,8 +984,9 @@ function multiPlatformEnv(ix,source){
    const instance=bindings.get(declarator.id);
    if(!instance||!instance.refs.length||instance.writes.length){valid=false;break;}
    for(const use of instance.refs){
-    const member=parents.get(use);
-    if(member?.type!=='MemberExpression'||member.object!==use||member.optional){valid=false;break;}
+    const receiver=receiverMember(use);
+    if(!receiver){valid=false;break;}
+    const {member,aliased}=receiver;
     const name=property(member);
     if(typeof name!=='string'||['constructor','prototype','__proto__'].includes(name)){valid=false;break;}
     const useParent=parents.get(member);
@@ -959,6 +996,7 @@ function multiPlatformEnv(ix,source){
     }
     if(useParent?.type==='UpdateExpression'||useParent?.type==='UnaryExpression'&&useParent.operator==='delete'){valid=false;break;}
     if(methods.has(name))roots.add(name);
+    if(aliased)for(const aliasName of aliased)if(methods.has(aliasName))roots.add(aliasName);
    }
    if(!valid)break;
    instances.push(declarator);

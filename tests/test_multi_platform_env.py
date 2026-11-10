@@ -86,6 +86,35 @@ class MultiPlatformEnvTests(unittest.TestCase):
     def test_closed_class_factory_folds_platform_and_node_branches(self):
         self.assert_folded(CLASS_FIXTURE)
 
+    def test_closed_instance_alias_and_call_receiver_fold(self):
+        for replacement in [
+            "const runtime = new Env('fixture');\nlet alias;\nruntime.done({body:(alias=runtime).getdata('key')});",
+            "const runtime = new Env('fixture');\nlet alias;\nruntime.done({body:(alias=runtime).getdata.call(alias,'key')});",
+        ]:
+            changed = CLASS_FIXTURE.replace(
+                "const runtime = new Env('fixture');\nruntime.done({body: runtime.getdata('key')});",
+                replacement,
+            )
+            self.assertNotEqual(changed, CLASS_FIXTURE)
+            with self.subTest(replacement=replacement):
+                self.assert_folded(changed)
+
+    def test_instance_alias_rebind_dynamic_member_write_and_escape_reject(self):
+        replacements = [
+            "const runtime = new Env('fixture');\nlet alias;\nalias=runtime;\nalias=other;\nruntime.done({body:(alias=runtime).getdata('key')});",
+            "const runtime = new Env('fixture');\nconst key='getdata';\nlet alias;\nruntime.done({body:(alias=runtime)[key]});",
+            "const runtime = new Env('fixture');\nlet alias;\n(alias=runtime).done=1;\nruntime.done({body: runtime.getdata('key')});",
+            "const runtime = new Env('fixture');\nlet alias;\nuse(alias=runtime);\nruntime.done({body: runtime.getdata('key')});",
+        ]
+        for replacement in replacements:
+            changed = CLASS_FIXTURE.replace(
+                "const runtime = new Env('fixture');\nruntime.done({body: runtime.getdata('key')});",
+                replacement,
+            )
+            self.assertNotEqual(changed, CLASS_FIXTURE)
+            with self.subTest(replacement=replacement):
+                self.assert_unknown(changed)
+
     def test_closed_prototype_factory_is_normalized_before_folding(self):
         self.assert_folded(PROTOTYPE_FIXTURE, normalized=True)
 
