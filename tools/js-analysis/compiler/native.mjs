@@ -1147,10 +1147,26 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  }
  function http(input,method,qx){
   function stringValue(n,seen=new Set()){
+   const stringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr']);
    if(values.string(n))return true;
    n=resolve(n,seen);if(!n)return false;
+   if(n.type==='CallExpression'&&!n.optional&&n.callee.type==='MemberExpression'&&stringMethods.has(property(n.callee))&&values.type(n.callee.object)==='string')return true;
    if(n.type==='Literal')return typeof n.value==='string';
    if(n.type==='TemplateLiteral')return true;
+   if(n.type==='Identifier'){
+    const b=bindings.get(n);
+    for(let owner=owners.get(n),position=-1;b&&functions.has(owner?.type);owner=owners.get(parents.get(owner))){
+     position=owner.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);
+     if(position<0)continue;
+     const call=parents.get(owner);
+     if(!b.writes.length&&!seen.has(b)&&['FunctionExpression','ArrowFunctionExpression'].includes(owner.type)&&call?.type==='CallExpression'&&call.callee===owner&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')){
+      let argument=call.arguments[position],parameter=owner.params[position];
+      if((!argument||free(argument,'undefined'))&&parameter.type==='AssignmentPattern')argument=parameter.right;
+      if(argument&&stringValue(argument,new Set(seen).add(b)))return true;
+     }
+     break;
+    }
+   }
    if(n.type==='MemberExpression'){
     const obj=resolve(n.object,new Set(seen));
     if(obj?.type==='ObjectExpression')return obj.properties.every(p=>p.type==='Property'&&stringValue(p.value,new Set(seen)));
