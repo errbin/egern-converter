@@ -242,6 +242,105 @@ export function initializedAfter(ix,statement,ref){
  return answer;
 }
 
+// 证明一个未等待的 Promise 完成链是封闭的根任务。证明只沿静态调用图展开：
+// 基座必须是立即执行的异步函数、可追溯的 Promise 工厂，或引用全部为直接调用
+// 且声明支配调用点的本地异步函数；完成回调必须是内联函数或同样闭合的命名
+// 函数。条件/循环/异常边界、绑定写入、回调别名逃逸，以及根之后出现无法证明
+// 的普通语句，都会否决整条链。后续如果还有完成根，也必须是同样可证的根。
+export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set()){
+ const {parents,bindings,free}=ix;
+ const methods=new Set(['then','catch','finally']);
+ if(call?.type!=='CallExpression'||seen.has(call))return false;
+ const statement=parents.get(call);
+ if(statement?.type!=='ExpressionStatement'||statement.expression!==call)return false;
+ const block=parents.get(statement);
+ if(!block||!['Program','BlockStatement'].includes(block.type))return false;
+ const chain=[];let base=call;
+ while(base.type==='CallExpression'&&base.callee.type==='MemberExpression'&&methods.has(property(base.callee))){
+  const method=property(base.callee);
+  if(base.optional||base.callee.optional||base.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(base.arguments.length<1||base.arguments.length>(method==='then'?2:1))return false;
+  chain.unshift({method,arguments:base.arguments});
+  base=base.callee.object;
+ }
+ if(!chain.length)return false;
+ const declarationStatement=fn=>{
+  if(fn?.type==='FunctionDeclaration')return fn;
+  const declarator=parents.get(fn),declaration=parents.get(declarator);
+  return declarator?.type==='VariableDeclarator'&&declarator.init===fn&&declaration?.type==='VariableDeclaration'?declaration:null;
+ };
+ const callbackRegistration=ref=>{
+  const argument=parents.get(ref),method=parents.get(argument);
+  return method?.type==='CallExpression'&&argument.type!=='SpreadElement'&&
+   method.callee.type==='MemberExpression'&&methods.has(property(method.callee))&&method.arguments.includes(argument);
+ };
+ // 完成回调只允许内联函数或初始化后未改绑、且只出现在已知 Promise 回调位置的
+ // 命名函数。这同时排除提前注册、闭包逃逸和回调身份被替换。
+ const callback=argument=>{
+  if(functions.has(argument?.type))return argument;
+  if(argument?.type!=='Identifier')return null;
+  const binding=bindings.get(argument);
+  if(!binding||binding.writes.length)return null;
+  const fn=binding.fn??(functions.has(binding.init?.type)?binding.init:null);
+  if(!fn||!binding.refs.length||binding.refs.some(ref=>!callbackRegistration(ref)))return null;
+  const declaration=declarationStatement(fn);
+  if(!declaration||!initializedAfter(ix,declaration,argument))return null;
+  return fn;
+ };
+ let hasCompletion=false;
+ for(const step of chain)for(const argument of step.arguments){
+  const fn=callback(argument);
+  if(!fn)return false;
+  if(completes(fn))hasCompletion=true;
+ }
+ if(!hasCompletion)return false;
+ // 基座只能是闭合异步函数的一次直接调用，或标准 Promise 的已知工厂。
+ const directAsync=fn=>{
+  const parent=parents.get(fn);
+  if(parent!==base||base.callee!==fn)return false;
+  if(!fn.async&&!ix.nodes.some(node=>ix.owners.get(node)===fn&&node.type==='AwaitExpression'))return false;
+  if(fn.id?.name){const binding=bindings.get(fn.id);if(binding&&binding.refs.some(ref=>ref!==fn.id))return false;}
+  return true;
+ };
+ if(base.type==='NewExpression'){
+  if(!free(base.callee,'Promise')||base.arguments.length!==1||!callback(base.arguments[0]))return false;
+ }else if(base.type==='CallExpression'){
+  if(functions.has(base.callee.type)){if(!directAsync(base.callee))return false;}
+  else if(base.callee.type==='Identifier'){
+   const binding=bindings.get(base.callee),fn=binding?.fn??(functions.has(binding?.init?.type)?binding.init:null);
+   if(!binding||binding.writes.length||!fn||!binding.refs.length)return false;
+   if(binding.refs.some(ref=>{const use=parents.get(ref);return use?.type!=='CallExpression'||use.callee!==ref||use.optional||use.arguments.some(argument=>argument.type==='SpreadElement');}))return false;
+   const declaration=declarationStatement(fn);
+   if(!declaration||binding.refs.some(ref=>!initializedAfter(ix,declaration,ref)))return false;
+  }else if(base.callee.type==='MemberExpression'){
+   const knownPromise=free(base.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any'].includes(property(base.callee));
+   const closedFetch=free(base.callee.object,'$task')&&property(base.callee)==='fetch';
+   if(!knownPromise&&!closedFetch)return false;
+  }else return false;
+ }else return false;
+ // 根任务之前不能处于条件、循环或异常处理分支，否则原生 Promise 的启动和
+ // 拒绝路径会与作者代码不同。透明的 BlockStatement 只承载作用域，不构成旁路。
+ for(let child=statement,parent=parents.get(child);parent;child=parent,parent=parents.get(child)){
+  if(parent.type==='Program'||functions.has(parent.type))break;
+  if(['IfStatement','ConditionalExpression','LogicalExpression','SwitchStatement','SwitchCase','ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement','TryStatement','CatchClause'].includes(parent.type))return false;
+  if(!['BlockStatement','LabeledStatement'].includes(parent.type))return false;
+ }
+ // 根之后只能有声明或另一个可证完成根；普通语句会在原生汇合后产生无法证明
+ // 的额外执行路径。逐层越过透明块，直到函数/程序边界。
+ const nextSeen=new Set(seen);nextSeen.add(call);
+ for(let child=statement,parent=parents.get(child);parent;child=parent,parent=parents.get(child)){
+  if(parent.type==='Program'||parent.type==='BlockStatement'){
+   for(const next of parent.body.slice(parent.body.indexOf(child)+1)){
+    if(['FunctionDeclaration','EmptyStatement'].includes(next.type))continue;
+    if(next.type==='ExpressionStatement'&&closedAsyncCompletionRoot(ix,next.expression,completes,nextSeen))continue;
+    return false;
+   }
+  }
+  if(parent.type==='Program'||functions.has(parent.type))break;
+ }
+ return true;
+}
+
 // 证明类实例方法的全部引用都是已确认闭合接收者上的直接调用：同类内部的
 // `this.name()`，或由 `new` 创建、从未逃逸或改绑的实例上的 `obj.name()`。
 // 这是调用图闭合证明，不是对任意对象方法的近似推断。封闭工厂返回的匿名类只有

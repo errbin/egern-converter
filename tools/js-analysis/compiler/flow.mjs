@@ -1,4 +1,4 @@
-import {children,patch,renderTree,property,key,functions,initializedAfter,standardGlobals as builtin,index} from '../core/ast.mjs';
+import {children,patch,renderTree,property,key,functions,initializedAfter,closedAsyncCompletionRoot,standardGlobals as builtin,index} from '../core/ast.mjs';
 import {parse} from '../core/syntax.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 
@@ -163,7 +163,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   return true;
  }
  const asyncCompletionReceiver=n=>{let base=n;while(base?.type==='CallExpression'&&base.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(base.callee)))base=base.callee.object;return base?.type==='CallExpression'&&targets(base.callee).some(fn=>done.has(fn)&&(fn.async||asyncAdded.has(fn)));};
- const detachedCalls=new Set(nodes.filter(n=>n.type==='CallExpression'&&parents.get(n)?.type==='ExpressionStatement'&&(targets(n.callee).some(fn=>done.has(fn)&&(asyncAdded.has(fn)||fn.async))||asyncCompletionReceiver(n)&&promiseValue(n))&&!tail(n,true)));
+ const detachedCalls=new Set(nodes.filter(n=>n.type==='CallExpression'&&parents.get(n)?.type==='ExpressionStatement'&&(targets(n.callee).some(fn=>done.has(fn)&&(asyncAdded.has(fn)||fn.async))||asyncCompletionReceiver(n)&&promiseValue(n)||closedAsyncCompletionRoot(ix,n,fn=>done.has(fn))&&promiseValue(n))&&!tail(n,true)));
  const detachedHTTP=new Set(nodes.filter(n=>n.type==='CallExpression'&&parents.get(n)?.type==='ExpressionStatement'&&isHTTP?.(n)&&targets(n.arguments[1]).some(fn=>done.has(fn))&&!tail(n,true)));
  const executorCompletion=[...executors].some(fn=>done.has(fn));
  const concurrent=executorCompletion||nodes.some(n=>done.has(timerCallback(n)))||detachedCalls.size>0||detachedHTTP.size>0;
