@@ -49,6 +49,22 @@ class PublicLibraryBoundaryTests(unittest.TestCase):
             with self.assertRaises(ConversionError):convert_script('$done({body:'+value+'});','Original','https://example.test/a.js','')
         with self.assertRaises(ConversionError):convert_script('globalThis.Object={};$done({});','Original','https://example.test/a.js','')
 
+    def test_detached_global_alias_only_removes_unreferenced_initializers(self):
+        probe = """
+import assert from 'node:assert/strict';
+import {lowerDetachedGlobalObjectAliases,protectLibraries} from './tools/js-analysis/analysis/libraries.mjs';
+const lowered=lowerDetachedGlobalObjectAliases('const x=globalThis;');
+assert.match(lowered,/publicLibraryGlobalAlias\\d+/);
+assert.equal(protectLibraries(lowered).restore(lowered),'const x=globalThis;');
+assert.equal(lowerDetachedGlobalObjectAliases('const x=globalThis;use(x);'),'const x=globalThis;use(x);');
+console.log(JSON.stringify({ok:true}));
+"""
+        result = subprocess.run(
+            ['node', '--input-type=module', '-e', probe],
+            cwd=ROOT, text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), {'ok': True})
+
 
 @unittest.skipUnless(TIEBA.is_file() and BAIDU.is_file(),'Fetch the public source snapshots for embedded library integration tests')
 class PublicLibraryIntegrationTests(unittest.TestCase):

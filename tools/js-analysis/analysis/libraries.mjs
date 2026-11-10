@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,key,renderTree} from '../core/ast.mjs';
+import {index,key,property,renderTree} from '../core/ast.mjs';
 import {methodContract} from '../platform/clients.mjs';
 
 // Preserve reviewed embedded public libraries. Only the business/platform code
@@ -11,6 +11,17 @@ export const libraryContracts=new Map([
  ['6d1475ca208f0b71db2613c54de3b114e41acf3bbcd8134ba7a5683aacad2012',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js',globalReceiver:true,valueContracts:[{global:'CryptoJS',nonCallableCalls:['AES.encrypt','DES.encrypt','TripleDES.encrypt','MD5','enc.Utf8.parse','enc.Hex.parse','enc.Hex.stringify','enc.Base64.parse'],resultFormatters:['MD5','DES.encrypt','TripleDES.encrypt','enc.Base64.parse']}]}],
  ['1d801bf22e2f15b3f95a89787621ed7361cdd160988b00e0718c957507718e55',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js',globalReceiver:true,valueContracts:[{global:'CryptoJS',nonCallableCalls:['AES.encrypt','DES.encrypt','TripleDES.encrypt','MD5','enc.Utf8.parse','enc.Hex.parse','enc.Hex.stringify','enc.Base64.parse'],resultFormatters:['MD5','DES.encrypt','TripleDES.encrypt','enc.Base64.parse']}]}],
  ['ee4f09f5002e4669a973dd3ccfec144156c063af4b74bbbc685c38098cee07fb',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js',valueContracts:[{global:'CryptoJS',nonCallableCalls:['AES.encrypt','DES.encrypt','TripleDES.encrypt','MD5','enc.Utf8.parse','enc.Hex.parse','enc.Hex.stringify','enc.Base64.parse'],resultFormatters:['MD5','DES.encrypt','TripleDES.encrypt','enc.Base64.parse']}]}],
+ // 同一份 CryptoJS CommonJS 工厂在不同 webpack/vite 产物中仅局部标识符被重命名。
+ // 这些摘要是公开发行代码的完整性校验，不是按 URL 放行；命中后正文仍按字节保留。
+ ['5cdc636394ac4d6eeac0c262cebf52f828ac25bbb66fb14b56a7a11a26494ddf',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['bca86738314abcfce9448bb3aff2b9777d4275801f8c09ddf03ed7173e402c6c',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['155e6af318b5e13b461887721ad031de1cdca2c76bd3ac82d64a12f9081b3822',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['1dea05e7663899b6b2c7ef3721e09a2cdbd4c13b9d6f7bcfd9f655d0593a78ad',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['c6f09961ded38c7322b0803dfb8e1f67cb351bcb56429d905743fa63de7b33f5',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['208a25438373345446f9d58fb6bc3a6acd8de68bd753bbd023f4be6a161a9505',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['768554f7c05f67b21e787ceefe377ffa413c3f1cfbe40f0c101f533515bc382c',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js'}],
+ ['e828e6dd64f69a63beea2a5e12309e177b722763cc3cf695b98f6fc3ff671113',{name:'CryptoJS embedded full bundle',source:'https://github.com/brix/crypto-js',globalReceiver:true}],
+ ['6510a610da1e95c3da840135bfade5d4d4fa722956b18e33d7dbc8b0890edb98',{name:'fzstd embedded decompressor',source:'https://github.com/101arrowz/fzstd'}],
  ['852be7b2194fd311c020e53402486e3001057f70b4ac96ff6a823e928b5e14e6',{name:'JSEncrypt embedded bundle',source:'https://github.com/travist/jsencrypt'}],
  ['7279d3fe48ff1f10e6ace7de1356ecc17967f0c659d203a0d5500b8788703b68',{name:'CryptoJS embedded AES variant',source:'https://github.com/brix/crypto-js'}],
  ['62809d899a0e2085283a72c6f39acfe6a4982989556ce09f7c4994e3f9e6f5b3',{name:'he HTML entities',source:'https://github.com/mathiasbynens/he',globalReceiver:true}],
@@ -28,6 +39,27 @@ export const libraryContracts=new Map([
 ]);
 
 function contract(body){return methodContract({type:'Program',sourceType:'script',start:body[0].start,end:body.at(-1).end,body});}
+
+// 被审查库的正文在分析阶段是占位符，库外仅剩对全局对象的简单别名。
+// 若该别名在当前可见源码中完全没有引用，它的初始化只可能服务于稍后按字节恢复的
+// 库正文：把初始化换成可恢复标记，既能让宿主探测分析通过，又原样恢复 globalThis。
+// 只要别名仍被业务代码读取，就保持原文并让分析层继续拒绝。
+export function lowerDetachedGlobalObjectAliases(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const {nodes,bindings,free}=ix;
+ const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ let suffix=0;
+ let changed=false;
+ const fresh=()=>{let name;do{name='publicLibraryGlobalAlias'+suffix++;}while(names.has(name));names.add(name);return name;};
+ for(const declarator of nodes){
+  if(declarator.type!=='VariableDeclarator'||declarator.id.type!=='Identifier'||declarator.init?.type!=='Identifier'||!free(declarator.init,'globalThis'))continue;
+  const binding=bindings.get(declarator.id);
+  if(!binding||binding.refs.length||binding.writes.length)continue;
+  replace.set(declarator.init,fresh());changed=true;
+ }
+ if(!changed)return source;
+ return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
+}
 export function protectLibraries(source,{sourceType='script'}={}){
  const tree=parse(source,{ecmaVersion:'latest',sourceType,allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
  const names=new Set(ix.nodes.filter(n=>n.type==='Identifier').map(n=>n.name)),blocks=new Map(),replace=new WeakMap();
@@ -40,6 +72,15 @@ export function protectLibraries(source,{sourceType='script'}={}){
  // start of an IIFE. The exact contract, not this boundary heuristic, grants
  // preservation; stop before the first statement touching a free proxy API.
  for(const group of groups){
+  const runtimeExports=n=>n.type==='ExpressionStatement'&&n.expression.type==='AssignmentExpression'&&n.expression.left.type==='MemberExpression'&&property(n.expression.left)==='exports';
+  for(let start=0;start<group.body.length;start++){
+   const first=group.body[start];
+   if(first.type!=='VariableDeclaration'||!source.slice(first.start,first.end).includes('typeof globalThis'))continue;
+   const end=group.body.findIndex((n,i)=>i>start&&runtimeExports(n));
+   if(end<=start)continue;
+   const body=group.body.slice(start,end+1);
+   if(libraryContracts.has(contract(body))){candidates.push(body);break;}
+  }
   const first=group.body[0];
   if(first?.type!=='VariableDeclaration'||!source.slice(first.start,first.end).includes('exports'))continue;
   const body=[];
@@ -53,6 +94,9 @@ export function protectLibraries(source,{sourceType='script'}={}){
  // an exact reviewed AST contract admits these declarations; names and
  // attribution comments never exempt arbitrary constructors.
  for(const group of groups)for(const n of group.body)if(n.type==='FunctionDeclaration')candidates.push([n]);
+ // 有些打包器会把完整的纯库保留为一条很大的声明。准入仍要求命中已审查的
+ // 精确契约，因此这里只扩大发现范围，不改变信任边界。
+ for(const group of groups)for(const n of group.body)if(n.type==='VariableDeclaration')candidates.push([n]);
  for(const group of groups)for(const n of group.body)if(n.type==='ExpressionStatement'){
   const expression=n.expression.type==='UnaryExpression'?n.expression.argument:n.expression;
   if(expression?.type==='CallExpression'&&['FunctionExpression','ArrowFunctionExpression'].includes(expression.callee.type)){
@@ -172,8 +216,14 @@ export function protectLibraries(source,{sourceType='script'}={}){
   for(const n of i.nodes)if(n.type==='VariableDeclaration'){
    const b=blocks.get(n.declarations[0]?.id?.name);if(!b)continue;
    if(found.has(n.declarations[0].id.name))throw Error('Duplicate public library placeholder');
-   found.add(n.declarations[0].id.name);for(const name of b.placeholderBindings)placeholderBindings.add(name);replacements.set(n,globalReceiver?b.code:b.raw);
+   found.add(n.declarations[0].id.name);for(const name of b.placeholderBindings)placeholderBindings.add(name);
+   // 若库外业务仍读取库内声明，IIFE 包装会让这些绑定失联；此时必须按原
+   // 字节直出，让库与业务继续共享作者原本的词法作用域。
+   const referenced=b.placeholderBindings.some(name=>i.nodes.some(x=>x.type==='Identifier'&&x.name===name&&i.reference(x)));
+   replacements.set(n,globalReceiver&&!referenced?b.code:b.raw);
   }
+  // 分析阶段把库外的无用全局对象别名换成了标记；恢复时改回真实的全局对象。
+  for(const n of i.nodes)if(n.type==='Identifier'&&/^publicLibraryGlobalAlias\d+$/.test(n.name)&&i.parents.get(n)?.type==='VariableDeclarator'&&i.parents.get(n).init===n)replacements.set(n,'globalThis');
   if(found.size!==blocks.size)throw Error('Public library placeholder lost during compilation');
   return renderTree(code,t,n=>{
    if(replacements.has(n))return {direct:true,value:replacements.get(n)};
