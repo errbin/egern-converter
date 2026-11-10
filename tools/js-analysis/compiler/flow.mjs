@@ -87,6 +87,8 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    if(n.init.type==='ObjectExpression'&&binding?.refs.some(r=>{const p=parents.get(r),q=parents.get(p);return !(p?.type==='ForInStatement'&&p.right===r||p?.type==='MemberExpression'&&p.object===r&&q?.type==='CallExpression'&&q.callee===p);}))fail(n,'完成函数分发表发生修改或逃逸');
   }
   if(n.type==='FunctionDeclaration'&&done.has(n)&&bindings.get(n.id)?.writes.length)fail(n,'完成函数被重新赋值');
+  // wrap 状态机回调的返回值由 wrap/_invoke 消费，且状态参数可进入完成载荷；
+  // “目标函数忽略返回值”不能成立，因此该族继续按未知回调拒绝。
   if(functions.has(n.type)&&(done.has(n)||asyncAdded.has(n))&&n.type!=='FunctionDeclaration'){
    const p=parents.get(n);
    if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
