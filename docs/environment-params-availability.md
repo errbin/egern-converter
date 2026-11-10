@@ -1,6 +1,6 @@
 # Loon `$environment.params` 原生可用性审计
 
-核对日期：2026-11-10。范围限定为本工作区的 `egern-upstream`、`egern-core`、`egern-skills` 和 `egern-site`；没有联网补充材料。
+第九轮穷尽复核日期：2026-11-10。范围限定为本工作区的 `egern-upstream`、`egern-core`、`egern-skills` 和 `egern-site`；没有联网补充材料。
 
 ## 正式结论
 
@@ -12,6 +12,43 @@
 - 只有取得官方 API 字段、官方类型定义或可复核的 Egern 原生运行证据后，才重新开启通用映射研究。
 
 这是项目证据规则下的正式结论，不是“已证明 Egern 永远不存在该能力”。未来官方资料出现后，必须以通用数据流规则和双向回归替换本结论。
+
+## 第九轮穷尽复核记录
+
+本轮重新检索四个资料库的全部文档、references、脚本快照和类型定义，结论与第八轮一致：**工作区内没有找到任何 Egern 原生 `ctx` 字段，可以作为动态节点、当前策略或规则运行上下文参数的映射出处**。因此没有可写的“来源字段 → 原生字段”映射；该能力正式归入“既定策略拒绝”。
+
+复核范围与可重复事实：
+
+- `egern-upstream` 有 486 个 Markdown、907 个 JavaScript 文件；`egern-upstream/README.md:3` 说明该目录只保存上游原始字节和抓取快照。
+- `egern-core` 有 2 个 Markdown、0 个 JavaScript 文件；`egern-core/README.md:3` 说明它只承担上游抓取、同步与网站构建。
+- `egern-skills` 有 30 个 Markdown、0 个 JavaScript 文件；全部 references 与交接文档已纳入检索。
+- `egern-site` 只有 1 个 Markdown、0 个 JavaScript 文件；`egern-site/README.md:3` 说明它只存放构建后的静态网站。
+- 四个资料库中的 `.ts`、`.d.ts`、`.d.mts`、`.d.cts` 文件数量均为 0，不存在可引用的 Egern 原生类型定义。
+
+关键证据与边界：
+
+- `egern-skills/skills/egern-native-conversion/references/原生API.md:5` 说明请求、响应、定时、小组件、网络等入口各有不同上下文，不能无条件访问所有字段。
+- `原生API.md:15` 列出参数、语言、脚本名和 cron 的原生位置是 `ctx.env`、`ctx.app.language`、`ctx.script.name`、`ctx.cron`；`:26` 明确 `ctx.env` 是字符串键值配置，不能冒充动态节点参数。
+- `原生API.md:17` 把网络/IP 信息指向 `ctx.device` 与 `ctx.lookupIP`；这些是网络环境或地址查询能力，不是当前节点、当前策略或规则上下文。
+- `egern-skills/skills/egern-native-conversion/references/Loon.md:21` 明确 Loon `$environment.params` 在某些入口可含动态检测上下文，不能凭名称相似映射到 `ctx.env`。
+- `egern-skills/skills/egern-native-conversion/references/Stash.md:17` 明确不能把配置策略名当作动态当前节点信息。
+- `egern-skills/skills/egern-verification/references/排障与回归.md:21` 把“`ctx.env` 同名即认为等价”列为明确禁止的误判。
+- `egern-skills/docs/接手验收.md:25` 要求节点检测 params 必须证明来源运行参数与原生上下文；`egern-skills/docs/当前状态.md:25` 记录该能力尚未证明。
+- `egern-skills/docs/官方资料.md:7` 只登记 Egern JavaScript API 的外部地址；工作区没有该官方页面的正文或类型镜像。
+
+候选映射的否定结论：
+
+| 候选 | 拒绝原因 |
+| --- | --- |
+| `ctx.env` | 用户配置的字符串键值，不是动态节点或规则上下文 |
+| `ctx.device` | 本地网络环境，与代理节点名、协议、地址、端口和 TLS 信息无关 |
+| `ctx.network` | 本地网络接口信息，不是当前策略或规则上下文 |
+| `ctx.lookupIP` | IP 查询能力，不是节点检测参数 |
+| 请求选项 `policy` | 出口选择参数；写入策略名不能反证当前节点信息可读 |
+
+第三方原生脚本中的防御式探测不构成 API 证明。`egern-upstream/raw/CaoXiaoMann/XiaoMan/main/Egern/Scripts/Network-Pro/Network-Pro.js:2999-3046` 同时尝试 `node`、`currentProxy`、`selectedProxy`、`selectedNode`、`outbound`、`profile.currentNode` 等互斥形状，并在缺失时返回空值；这只能说明作者不知道稳定字段契约，不能作为字段存在的出处。
+
+Loon 侧来源同样只证明原平台语义，不证明 Egern 等价能力。`egern-upstream/raw/getsomecat/Loon/main/Net_Speedlite.js:34`、`:43`、`:64` 读取 `$environment.params.node` 与 `.nodeInfo.name`；`egern-upstream/raw/MCdasheng/Loon/main/Streaming/ChatGPT.js:36`、`:93`、`:137` 读取 `$environment.params.node`。这些文件证明的是待转换输入，不是目标平台 API。
 
 ## 审计范围
 
