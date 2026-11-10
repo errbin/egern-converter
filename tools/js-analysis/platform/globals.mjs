@@ -516,6 +516,52 @@ export function lowerQualifiedPlatformGlobals(source,format){
  return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
+// 将顶层一次性的 `globalThis.$argument = parse(globalThis.$argument)` 归一化
+// 为局部变量。只有写回无条件执行、之后仅读取同一成员、且没有裸 `$argument`
+// 与其它 `globalThis` 用法时才成立；否则保留原文让分析层继续拒绝。
+export function lowerSelfNormalizedArgument(source,format){
+ if(!['surge','loon','qx','stash','shadowrocket'].includes(format))return source;
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return source;}
+ const {nodes,parents,bindings,free}=ix;
+ const member=n=>n?.type==='MemberExpression'&&!n.computed&&n.object?.type==='Identifier'&&free(n.object,'globalThis')&&property(n)==='$argument';
+ const globals=nodes.filter(n=>free(n,'globalThis'));
+ if(!globals.length||globals.some(n=>!member(parents.get(n))))return source;
+ // 输入侧需要改写成裸 `$argument` 交给后续原生映射；存在同名绑定时会被词法遮蔽。
+ if(nodes.some(n=>n.type==='Identifier'&&n.name==='$argument'&&bindings.has(n)))return source;
+ const members=globals.map(n=>parents.get(n));
+ const assignments=nodes.filter(n=>n.type==='AssignmentExpression'&&n.operator==='='&&member(n.left));
+ if(assignments.length!==1)return source;
+ const assignment=assignments[0];
+ // 只接受顶层表达式中的无条件写回；函数、条件、循环或 try 内的写回不传播。
+ let child=assignment;
+ while(parents.get(child)?.type==='SequenceExpression')child=parents.get(child);
+ if(parents.get(child)?.type!=='ExpressionStatement'||parents.get(parents.get(child))!==tree)return source;
+ const input=members.filter(n=>n.start>=assignment.right.start&&n.end<=assignment.right.end);
+ if(!input.length)return source;
+ for(const item of members){
+  if(item===assignment.left||input.includes(item))continue;
+  if(item.start<=assignment.end)return source;
+  const p=parents.get(item),use=parents.get(p);
+  if(p?.type==='AssignmentExpression'&&p.left===item||p?.type==='UpdateExpression'||p?.type==='UnaryExpression'&&p.operator==='delete')return source;
+  if(p?.type==='MemberExpression'&&p.object===item&&(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'))return source;
+ }
+ // 写回之后的裸 `$argument` 读取会绕过归一化结果；保留拒绝，避免混用两种值。
+ if(nodes.some(n=>free(n,'$argument')&&n.start>assignment.end))return source;
+ const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ let local='selfNormalizedArgument',suffix=2;
+ while(names.has(local))local='selfNormalizedArgument'+(suffix++);
+ const replace=new WeakMap();
+ replace.set(assignment.left,local);
+ for(const item of input)replace.set(item,'$argument');
+ for(const item of members)if(item!==assignment.left&&!input.includes(item))replace.set(item,local);
+ let output=renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
+ let insert=tree.body[0]?.start??0;
+ for(const statement of tree.body){if(statement.type!=='ExpressionStatement'||typeof statement.directive!=='string')break;insert=statement.end;}
+ output=output.slice(0,insert)+`\nlet ${local};\n`+output.slice(insert);
+ return output;
+}
+
 // In a classic non-strict script, a plain call to a function gives it the
 // global object as `this`; arrows nested in that function capture the same
 // receiver. Once emitted as an Egern module, make only explicit proxy-global

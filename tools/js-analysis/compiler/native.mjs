@@ -7,7 +7,7 @@ import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs'
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
-import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
+import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
@@ -87,7 +87,8 @@ function compile(original,format,options,libraries){
   return specializeCallbacks(input,generatedFunctions);
  };
  const finish=input=>{
-  const factories=lowerHTTPFactoryFields(lowerHTTPHelpers(lowerSelectedHTTP(lowerAPIObjectAliases(input))),format);
+  const normalizedArgument=lowerSelfNormalizedArgument(input,format);
+  const factories=lowerHTTPFactoryFields(lowerHTTPHelpers(lowerSelectedHTTP(lowerAPIObjectAliases(normalizedArgument))),format);
   const result=emitNative(lowerMessageParameters(factories.source),original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
   libraries.transformations.push(...factories.transformations);return result;
  };
