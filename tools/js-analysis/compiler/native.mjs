@@ -1729,6 +1729,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(compression){if(n.arguments.length!==1||n.arguments[0].type==='SpreadElement')fail(n,'压缩 API 必须接收一个二进制参数');return `(await ${context}.compress.${compression}(${bytes(n.arguments[0])}))`;}
    if(isDone(n)){const value=payload(n.arguments[0]);return pending?`((value) => (${pendingFinished} = true, value))(${value})`:value;}
    if(isAPI(n,'$notify')||isAPI(n,'$notification','post'))return notification(n);
+   if(isAPI(n,'$log'))return `console.log(${n.arguments.map(a=>a.type==='SpreadElement'?'...'+render(a.argument):render(a)).join(', ')})`;
    if(isAPI(n,'$task','fetch'))return http(n.arguments[0],null,true).code+`.catch(error => {throw {error: String(error.message ?? error)};})`;
    if(n.callee.type==='MemberExpression'&&(free(n.callee.object,'$prefs')||free(n.callee.object,'$persistentStore'))){
     const m=property(n.callee),a=n.arguments,keyIndex=['write','setValueForKey'].includes(m)?1:0;

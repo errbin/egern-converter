@@ -59,6 +59,7 @@ const decode=b=>decodeURIComponent(escape(String.fromCharCode(...new Uint8Array(
 globalThis.TextEncoder=class{encode(s){return encode(s);}};
 globalThis.TextDecoder=class{decode(b){return decode(b);}};
 globalThis.console={log(){},warn(){},error(){},info(){},debug(){}};
+globalThis.$log=()=>{};
 const bytes=v=>v instanceof ArrayBuffer?Array.from(new Uint8Array(v)):ArrayBuffer.isView(v)?Array.from(new Uint8Array(v.buffer,v.byteOffset,v.byteLength)):v;
 const Headers = ${FixtureHeaders.toString()};
 globalThis.Headers=Headers;

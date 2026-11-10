@@ -45,7 +45,7 @@ while(pending.length) {
 }
 
 function bound(name,scope){for(let s=scope;s;s=s.parent)if(s.names.has(name))return true;return false;}
-const allowed=new Set(['$request','$response','$done','$notification','$argument','$notify','$task','$httpClient','$persistentStore','$prefs','$utils','$script','$network','$cronexp','$environment',...(options.nativeBundle?['$native']:[])]);
+const allowed=new Set(['$request','$response','$done','$notification','$argument','$notify','$log','$task','$httpClient','$persistentStore','$prefs','$utils','$script','$network','$cronexp','$environment',...(options.nativeBundle?['$native']:[])]);
 const forbidden=new Set(['eval','Function','require','setTimeout','setInterval','fetch','globalThis','global','window','module','exports','process']);
 let done=false, asynchronous=false;
 const apis=new Set();
@@ -73,6 +73,10 @@ for(const {node:n,parent:p,key} of nodes) {
     if(bound(n.name,scopes.get(n)))continue;
     if(p?.type==='UnaryExpression' && p.operator==='typeof')continue;
     if(n.name.startsWith('$'))apis.add(n.name);
+    // $log 是纯日志观察，返回值不参与业务。只允许它作为独立语句直接调用，
+    // 以免把无法观察的返回值误当成可确定的结果。
+    if(n.name==='$log'&&!(p?.type==='CallExpression'&&p.callee===n&&parents.get(p)?.type==='ExpressionStatement'&&parents.get(p).expression===p))
+      reasons.add('$log 仅支持作为独立语句直接调用');
     if(n.name==='Promise')asynchronous=true;
     if(n.name.startsWith('$')&&!allowed.has(n.name))reasons.add('未适配 API：'+n.name);
     const standardGlobal=options.nativeStandardGlobals&&n.name==='globalThis'&&p?.type==='MemberExpression'&&p.object===n&&standardGlobals.has(staticProperty(p));
