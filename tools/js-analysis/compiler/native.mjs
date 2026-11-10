@@ -120,7 +120,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const fresh=base=>{let n=base,i=2;while(names.has(n))n=base+i++;names.add(n);return n;};
  const context=fresh('ctx');
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
- const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),prefix=[],dynamicMethods=new WeakMap();
+ const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
@@ -697,6 +697,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return '{body: '+render(n)+'}';
   }
   if(!reference&&free(n,'$response')){
+   if(bodyWrites.has('response:body'))fail(n,'响应正文重绑后不能整体传递响应对象，无法证明状态与头部更新');
    if(nested)fail(n,'响应对象不能嵌套为请求阶段的合成响应');
    if(format==='qx')fail(n,'QX 整体响应的 statusCode/bodyBytes 字段需要显式映射');
    const body=readBody('$response','body');
@@ -1534,7 +1535,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    if(free(o,'$request')||free(o,'$response')){
     const parent=parents.get(n);
-    if(parent?.type==='AssignmentExpression'&&parent.left===n||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')fail(n,'请求 / 响应字段被直接修改，需要先确定完成结果的数据流');
+    if(parent?.type==='AssignmentExpression'&&parent.left===n){
+     if(free(o,'$response')&&k==='body'&&!options.binary){bodyWrites.add('response:body');return readBody(o.name,k);}
+     fail(n,'请求 / 响应字段被直接修改，需要先确定完成结果的数据流');
+    }
+    if(parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')fail(n,'请求 / 响应字段被直接修改，需要先确定完成结果的数据流');
     if(['body','bodyBytes'].includes(k))return readBody(o.name,k);
     if(free(o,'$response')&&k==='statusCode')return context+'.response.status';
     if(!['url','method','status','headers'].includes(k))fail(n,'未知请求 / 响应字段');
@@ -1697,9 +1702,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const reads=[];
  for(const type of ['request','response']){
   const a=bodyReads.get(type+':body'),b=bodyReads.get(type+':bodyBytes');if(!a&&!b)continue;
-  const msg=`${context}.${type}`,buffer=fresh(type+'Buffer');
-  if(b||options.binary){reads.push(`const ${buffer} = ${msg}?.body == null ? undefined : await ${msg}.arrayBuffer();`);if(b)reads.push(`const ${b} = ${buffer} === undefined ? undefined : ${folded.qx?'':`new Uint8Array(`}${buffer}${folded.qx?'':')'};`);if(a)reads.push(`const ${a} = ${buffer} === undefined ? undefined : ${options.binary&&!folded.qx?`new Uint8Array(${buffer})`:`new TextDecoder().decode(${buffer})`};`);}
-  else reads.push(`const ${a} = ${msg}?.body == null ? undefined : await ${msg}.text();`);
+  const msg=`${context}.${type}`,buffer=fresh(type+'Buffer'),declaration=bodyWrites.has(type+':body')?'let':'const';
+  if(b||options.binary){reads.push(`const ${buffer} = ${msg}?.body == null ? undefined : await ${msg}.arrayBuffer();`);if(b)reads.push(`const ${b} = ${buffer} === undefined ? undefined : ${folded.qx?'':`new Uint8Array(`}${buffer}${folded.qx?'':')'};`);if(a)reads.push(`${declaration} ${a} = ${buffer} === undefined ? undefined : ${options.binary&&!folded.qx?`new Uint8Array(${buffer})`:`new TextDecoder().decode(${buffer})`};`);}
+  else reads.push(`${declaration} ${a} = ${msg}?.body == null ? undefined : await ${msg}.text();`);
  }
  const guard=options.enabled_env?`if (${context}.env._hub_enabled === 'false') return;\n`:'';
  // Egern scheduled scripts may finish by returning from the default function;
