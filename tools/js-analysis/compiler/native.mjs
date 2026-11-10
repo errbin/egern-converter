@@ -820,8 +820,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const p=parents.get(ref),a=parents.get(p);
      if(p?.type==='MemberExpression'&&p.object===ref){
       if(property(p)===undefined)fail(p,'完成结果包含动态字段');
+      if(a?.type==='UnaryExpression'&&a.operator==='delete'&&a.argument===p)fail(p,'完成结果字段被直接删除，需要先确定完成结果的数据流');
       if(a?.type==='AssignmentExpression'&&a.left===p)mergeShape(fields,new Map([[property(p),a.right]]),seen);
      }else if(p?.type==='IfStatement'&&p.test===ref&&b.refs.some(other=>completionTruthyGuard(other,b)===ref))continue;
+      else if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
      else if(!(p?.type==='CallExpression'&&isDone(p))&&!(p?.type==='CallExpression'&&target(p.callee)&&complete.has(target(p.callee))))fail(ref,'完成结果对象逃逸，无法追溯所有字段修改');
     }
     return fields;
