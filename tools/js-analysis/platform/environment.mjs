@@ -749,3 +749,296 @@ function pruneUnusedClosedClassMethods(source){
  }
  return renderTree(source,tree,node=>remove.has(node)?{direct:true,value:''}:null);
 }
+
+// 多平台 Env 有两种常见形态：工厂返回 class，或"构造器 + 原型方法赋值"。后者与
+// class 语义等价（构造器体 = constructor，原型方法 = 实例方法），先把这种形态归一
+// 化成 class，让已有的 isNode/getEnv 折叠与不可达分支裁剪对两种写法同时生效。
+// 只处理能证明封闭的情形：构造器绑定的全部引用要么是 new，要么是
+// Env.prototype.name = function(){} 安装；出现箭头函数方法、原型被整体传递/枚举、
+// 重复方法名或 constructor 覆盖时整份跳过，保持原样。
+export function normalizePrototypeEnv(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,bindings,owners}=ix,edits=[];
+ const slice=n=>source.slice(n.start,n.end);
+ for(const fn of nodes){
+  if(fn.type!=='FunctionDeclaration'&&fn.type!=='FunctionExpression')continue;
+  if(fn.async||fn.generator||fn.body?.type!=='BlockStatement')continue;
+  const syntax=parents.get(fn);
+  const id=fn.type==='FunctionDeclaration'?fn.id
+   :syntax?.type==='VariableDeclarator'&&syntax.init===fn&&syntax.id.type==='Identifier'?syntax.id:null;
+  if(!id?.name)continue;
+  const binding=bindings.get(id);
+  if(!binding||binding.writes.length||!binding.refs.length)continue;
+  const methods=[],removals=[],constructions=[];let valid=true;
+  for(const ref of binding.refs){
+   const p=parents.get(ref),q=parents.get(p);
+   if(p?.type==='NewExpression'&&p.callee===ref){constructions.push(p);continue;}
+   if(p?.type==='MemberExpression'&&p.object===ref&&property(p)==='prototype'&&q?.type==='MemberExpression'&&q.object===p){
+    const name=property(q),assignment=parents.get(q);
+    if(typeof name!=='string'||name==='constructor'||assignment?.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.left!==q)  {valid=false;break;}
+    const method=assignment.right;
+    if(!method||method.type!=='FunctionExpression'||method.async||method.generator||method.body?.type!=='BlockStatement'){valid=false;break;}
+    if(methods.some(item=>item.name===name)){valid=false;break;}
+    const statement=parents.get(assignment);
+    if(statement?.type!=='ExpressionStatement'){valid=false;break;}
+    methods.push({name,method});removals.push(statement);continue;
+   }
+   valid=false;break;
+  }
+  if(!valid||!constructions.length||!methods.length)continue;
+  const methodNames=new Set(methods.map(item=>item.name));
+  for(const construction of constructions){
+   const declarator=parents.get(construction),declaration=parents.get(declarator);
+   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1){valid=false;break;}
+   const instance=bindings.get(declarator.id);
+   if(!instance||!instance.refs.length||instance.writes.length){valid=false;break;}
+   for(const ref of instance.refs){
+    const member=parents.get(ref);
+    if(member?.type!=='MemberExpression'||member.object!==ref||member.optional){valid=false;break;}
+    const name=property(member);
+    if(typeof name!=='string'||['constructor','prototype','__proto__'].includes(name)){valid=false;break;}
+    const use=parents.get(member);
+    if(methodNames.has(name)){
+     if(use?.type!=='CallExpression'||use.callee!==member||use.optional){valid=false;break;}
+     continue;
+    }
+    if(use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'){valid=false;break;}
+   }
+   if(!valid)break;
+  }
+  if(!valid)continue;
+  const params=n=>n.params.map(slice).join(', ');
+  if(nodes.some(n=>(n.start>=fn.start&&n.end<=fn.end&&owners.get(n)===fn&&n.type==='ReturnStatement')||
+    ((n.start>=fn.start&&n.end<=fn.end)&&n.type==='MemberExpression'&&n.object.type==='Identifier'&&n.object.name==='arguments'&&['callee','caller'].includes(property(n)))))continue;
+  const methodsText=methods.map(item=>item.name+'('+params(item.method)+')'+slice(item.method.body)).join('');
+  // 保持原函数作为工厂：类构造器接收同一组参数，并继续由原调用点 new。
+  // 外层不再重复声明参数，避免默认值在两层各求值一次。
+  const factoryText='function '+id.name+'(){return new class{constructor('+params(fn)+')'+slice(fn.body)+methodsText+'}(...arguments);}';
+  edits.push({start:fn.start,end:fn.end,text:factoryText});
+  for(const statement of removals)edits.push({start:statement.start,end:statement.end,text:''});
+ }
+ if(!edits.length)return {source,normalized:0};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.text+output.slice(edit.end);
+ try{parse(output,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});}
+ catch{return {source,normalized:0};}
+ return {source:output,normalized:edits.filter(edit=>edit.text).length};
+}
+
+// 多平台 Env 的平台探测方法（getEnv/isNode/isSurge/...）在 Egern 产物里不能折成
+// "哪个旧平台都不是"：那样会落到 default 分支，存储读回 null 等静默错误。这里按
+// 结构识别"纯平台探测"的 Env，把它折到本项目能原生降级的那一支（Surge 风格的
+// $persistentStore/$notification/$httpClient），折叠后由常量 if/switch 裁剪删除
+// 不可达的 Node/其它平台分支。识别只看方法体结构，不依赖实现哈希，也不按作者或
+// 文件名放行；实例引用必须封闭（只能是 new 与方法调用）。
+const PLATFORM_NAMES=new Set(['Surge','Loon','Quantumult X','Stash','Shadowrocket','Node.js','Worker','Egern']);
+const FOLDED_PLATFORM='Surge';
+const PLATFORM_ROOTS=new Set(['$environment','$task','$loon','$rocket','$prefs','$persistentStore','$notification','$httpClient','module','globalThis','global','window','process','require']);
+const PROBE_BINARY=new Set(['===','==','!==','!=']);
+// 平台探测体只能是 typeof、平台根对象成员和字符串字面量的组合。返回值必须包含
+// 目标平台 Surge，不能调用任何函数，也不能读取任意本地绑定。这样折叠只依赖探测
+// 表达式本身，不需要执行原文。
+function platformProbe(method,ix){
+ if(!method||method.kind!=='method'||method.value.params.length||method.value.async||method.value.generator)return false;
+ const body=method.value.body?.body;
+ if(body?.length!==1||body[0].type!=='ReturnStatement'||!body[0].argument)return false;
+ let valid=true,sawTypeof=false,sawTarget=false;
+ const walk=(n,parent)=>{
+  if(!valid||!n)return;
+  if(Array.isArray(n)){for(const child of n)walk(child,parent);return;}
+  switch(n.type){
+   case 'ConditionalExpression':walk(n.test,n);walk(n.consequent,n);walk(n.alternate,n);return;
+   case 'LogicalExpression':
+    if(!['&&','||'].includes(n.operator)){valid=false;return;}
+    walk(n.left,n);walk(n.right,n);return;
+   case 'BinaryExpression':
+    if(!PROBE_BINARY.has(n.operator)){valid=false;return;}
+    walk(n.left,n);walk(n.right,n);return;
+   case 'UnaryExpression':
+    if(!['typeof','!','void'].includes(n.operator)){valid=false;return;}
+    if(n.operator==='void'&&n.argument?.type!=='Literal'){valid=false;return;}
+    if(n.operator==='typeof')sawTypeof=true;
+    walk(n.argument,n);return;
+   case 'MemberExpression':
+    if(n.optional){valid=false;return;}
+    if(n.computed){
+     if(n.property?.type!=='Literal'||typeof n.property.value!=='string'){valid=false;return;}
+    }else if(!n.property?.name){valid=false;return;}
+    walk(n.object,n);return;
+   case 'Literal':
+    if(typeof n.value==='string'){
+     if(!PLATFORM_NAMES.has(n.value)&&n.value!=='undefined'){valid=false;return;}
+     if(n.value===FOLDED_PLATFORM)sawTarget=true;
+    }else if(typeof n.value!=='boolean'&&typeof n.value!=='number'&&n.value!==null){valid=false;}
+    return;
+   case 'Identifier':
+    if(parent?.type==='UnaryExpression'&&parent.operator==='typeof'&&parent.argument===n)return;
+    if(parent?.type==='MemberExpression'&&parent.object===n&&PLATFORM_ROOTS.has(n.name))return;
+    if(n.name==='undefined'&&ix.free(n))return;
+    valid=false;return;
+   default:valid=false;
+  }
+ };
+ walk(body[0].argument,null);
+ return valid&&sawTypeof&&sawTarget;
+}
+// 识别"工厂返回封闭 class 实例"的多平台 Env：实例只能通过静态成员访问，不能整体
+// 传递、枚举或改绑；平台探测方法必须唯一且可静态验证；class 内不允许动态 this 成员。
+// 任一条件不成立即跳过整个候选，保持原文并让后续分析继续拒绝。
+function multiPlatformEnv(ix,source){
+ const {nodes,parents,bindings}=ix,candidates=[];
+ for(const factory of nodes){
+  if(factory.type!=='FunctionDeclaration'&&factory.type!=='FunctionExpression')continue;
+  const body=factory.body?.body;
+  if(!Array.isArray(body)||body.at(-1)?.type!=='ReturnStatement')continue;
+  const returns=body.filter(n=>n.type==='ReturnStatement');
+  if(returns.length!==1)continue;
+  const returned=returns[0].argument;
+  if(returned?.type!=='NewExpression'||returned.callee.type!=='ClassExpression')continue;
+  const cls=returned.callee;
+  if(cls.superClass)continue;
+  let valid=true;const methods=new Map(),methodList=[];
+  for(const element of cls.body.body){
+   if(element.type!=='MethodDefinition'||element.static||element.computed||element.key?.type==='PrivateIdentifier'||!['method','constructor'].includes(element.kind)){valid=false;break;}
+   const name=key(element);
+   if(typeof name!=='string'||name==='__proto__'){valid=false;break;}
+   if(element.kind==='method'){
+    if(methods.has(name)){valid=false;break;}
+    methods.set(name,element);
+   }
+   methodList.push(element);
+  }
+  if(!valid||!methodList.length)continue;
+  const probes=[...methods].filter(([,method])=>platformProbe(method,ix));
+  if(probes.length!==1)continue;
+  const [probeName,probeMethod]=probes[0];
+  const predicates=new Map();
+  for(const [name,method] of methods){
+   if(method===probeMethod)continue;
+   const statements=method.value.body?.body;
+   if(statements?.length!==1||statements[0].type!=='ReturnStatement')continue;
+   const expression=statements[0].argument;
+   if(expression?.type!=='BinaryExpression'||!PROBE_BINARY.has(expression.operator))continue;
+   for(const [literalSide,callSide] of [[expression.left,expression.right],[expression.right,expression.left]]){
+    const platform=literalSide?.type==='Literal'&&typeof literalSide.value==='string'?literalSide.value:null;
+    if(!platform||!PLATFORM_NAMES.has(platform))continue;
+    if(callSide?.type!=='CallExpression'||callSide.arguments.length||callSide.callee?.type!=='MemberExpression'||callSide.callee.object.type!=='ThisExpression'||property(callSide.callee)!==probeName)continue;
+    const positive=expression.operator==='==='||expression.operator==='==';
+    predicates.set(name,positive?platform===FOLDED_PLATFORM:platform!==FOLDED_PLATFORM);
+   }
+  }
+  for(const method of methodList)for(const n of nodes){
+   if(n.start<method.value.start||n.end>method.value.end)continue;
+   if(n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&(n.computed||property(n)===undefined)){valid=false;break;}
+   if(!valid)break;
+  }
+  if(!valid)continue;
+  const syntax=parents.get(factory);
+  const id=factory.type==='FunctionDeclaration'?factory.id
+   :syntax?.type==='VariableDeclarator'&&syntax.init===factory&&syntax.id.type==='Identifier'?syntax.id:null;
+  if(!id?.name)continue;
+  const binding=bindings.get(id);
+  if(!binding||binding.writes.length||!binding.refs.length)continue;
+  const roots=new Set(),instances=[];
+  for(const ref of binding.refs){
+   const construction=parents.get(ref);
+   if(construction?.type!=='NewExpression'||construction.callee!==ref){valid=false;break;}
+   const declarator=parents.get(construction),declaration=parents.get(declarator);
+   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1){valid=false;break;}
+   const instance=bindings.get(declarator.id);
+   if(!instance||!instance.refs.length||instance.writes.length){valid=false;break;}
+   for(const use of instance.refs){
+    const member=parents.get(use);
+    if(member?.type!=='MemberExpression'||member.object!==use||member.optional){valid=false;break;}
+    const name=property(member);
+    if(typeof name!=='string'||['constructor','prototype','__proto__'].includes(name)){valid=false;break;}
+    const useParent=parents.get(member);
+    if(useParent?.type==='AssignmentExpression'&&useParent.left===member){
+     if(useParent.operator!=='='||methods.has(name)){valid=false;break;}
+     continue;
+    }
+    if(useParent?.type==='UpdateExpression'||useParent?.type==='UnaryExpression'&&useParent.operator==='delete'){valid=false;break;}
+    if(methods.has(name))roots.add(name);
+   }
+   if(!valid)break;
+   instances.push(declarator);
+  }
+  if(!valid||!instances.length)continue;
+  candidates.push({factory,cls,methods,methodList,probeName,probeMethod,predicates,roots,instances});
+ }
+ return candidates;
+}
+export function foldMultiPlatformProbes(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,owners,parents}=ix,edits=[];
+ for(const candidate of multiPlatformEnv(ix,source)){
+  const local=[];
+  let valid=true;
+  for(const method of candidate.methodList){
+   const fn=method.value;
+   for(const n of nodes){
+    if(n.start<fn.start||n.end>fn.end||n.type!=='CallExpression'||n.optional)continue;
+    const callee=n.callee;
+    if(callee?.type!=='MemberExpression'||callee.object.type!=='ThisExpression'||callee.optional)continue;
+    const name=property(callee);
+    if(name!==candidate.probeName&&!candidate.predicates.has(name))continue;
+    if(n.arguments.length){valid=false;break;}
+    // 只处理词法 this 仍属于当前方法的调用；普通嵌套函数里的 this 不是 Env 实例。
+    let owner=owners.get(n);
+    while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));
+    if(owner!==fn){valid=false;break;}
+    if(name===candidate.probeName)local.push({start:n.start,end:n.end,text:JSON.stringify(FOLDED_PLATFORM)});
+    else local.push({start:n.start,end:n.end,text:String(candidate.predicates.get(name))});
+   }
+   if(!valid)break;
+  }
+  if(valid)edits.push(...local);
+ }
+ if(!edits.length)return {source,folded:0};
+ let output=source;
+ const unique=[...new Map(edits.map(edit=>[edit.start+':'+edit.end,edit])).values()];
+ for(const edit of unique.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.text+output.slice(edit.end);
+ try{parse(output,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});}
+ catch{return {source,folded:0};}
+ return {source:output,folded:unique.length};
+}
+
+// 折叠与常量裁剪之后，多平台 Env 里只剩 Node 用法的实例方法（如 initGotEnv）已经
+// 没有任何调用点。这里按结构识别的 Env 类删除这些不可达方法，避免残留 require 等
+// Node 宿主引用；constructor 恒保留，仍被任何成员访问引用的方法也保留。
+export function pruneUnusedEnvMethods(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents}=ix,edits=[];
+ let removedCompletion=false;
+ for(const candidate of multiPlatformEnv(ix,source)){
+  const methods=candidate.methods;
+  const reachable=new Set(['constructor']),queue=['constructor'];
+  // toString/valueOf/toJSON 可能被隐式调用，不能按静态成员引用判定为死代码。
+  for(const implicit of ['toString','valueOf','toJSON'])if(methods.has(implicit)){reachable.add(implicit);queue.push(implicit);}
+  for(const name of candidate.roots)if(!reachable.has(name)){reachable.add(name);queue.push(name);}
+  const calls=new Map([...methods.keys(),'constructor'].map(name=>[name,new Set()]));
+  for(const method of candidate.methodList){
+   for(const n of nodes){
+    if(n.start<method.value.start||n.end>method.value.end||n.type!=='MemberExpression'||n.object.type!=='ThisExpression')continue;
+    const name=property(n);
+    if(typeof name==='string'&&calls.has(name))calls.get(key(method)).add(name);
+   }
+  }
+  while(queue.length){
+   const name=queue.shift();
+   for(const next of calls.get(name)??[])if(!reachable.has(next)){reachable.add(next);queue.push(next);}
+  }
+  for(const [name,method] of methods){
+   if(reachable.has(name))continue;
+   const body=source.slice(method.value.start,method.value.end);
+   if(/\$done\b/.test(body))removedCompletion=true;
+   edits.push({start:method.start,end:method.end,text:''});
+  }
+ }
+ if(!edits.length)return {source,pruned:0,completionRemoved:false};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.text+output.slice(edit.end);
+ try{parse(output,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});}
+ catch{return {source,pruned:0,completionRemoved:false};}
+ return {source:output,pruned:edits.length,completionRemoved:removedCompletion&&!/\$done\b/.test(output)};
+}

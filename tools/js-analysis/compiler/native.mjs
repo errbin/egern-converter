@@ -5,7 +5,7 @@ import {rewriteUsageComments,copyrightDocumentation,formatNative,compactNative,s
 import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/clients.mjs';
 import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
-import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv} from '../platform/environment.mjs';
+import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
@@ -27,11 +27,11 @@ function compileNative(source,format,options){
   // embedded libraries. No input body is evaluated during this reduction.
   const functionSource=lowerFunctionConstructorSource(source);
   libraries=protectLibraries(functionSource.source);
-  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),scopeThis=lowerSloppyThis(decoded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
+  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
-  return {...compile(functionSource.source,format,{...options,device,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
+  return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
    static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[]};}
 }
@@ -109,7 +109,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const compressionFallback=lowerCompressionFallbacks(source);
  source=compressionFallback.source;
  libraries.transformations.push(...compressionFallback.transformations);
- const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper});
+ const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper,allowNoCompletion:options.allowNoCompletion});
  if(report.errors.length)throw Error(report.errors.join('；'));
  const comments=[];
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree);
