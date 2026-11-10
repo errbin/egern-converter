@@ -17,9 +17,12 @@ def source_items():
     items = {item['id']: item for item in resources + scripts}
     for manifest in (ROOT/'catalog').glob('*.json'):
         data = json.loads(manifest.read_text())
-        if 'discovery' not in data or data['discovery'].get('type') == 'telegram':
+        # Only repository discovery has a Git ref and raw-file overrides.
+        # Local, release and channel sources use their catalog entries instead.
+        discovery = data.get('discovery')
+        if not discovery or discovery.get('type', 'repository') != 'repository':
             continue
-        prefix = 'https://raw.githubusercontent.com/' + data['repository'].removeprefix('https://github.com/') + '/' + data['discovery']['ref'] + '/'
+        prefix = 'https://raw.githubusercontent.com/' + data['repository'].removeprefix('https://github.com/') + '/' + discovery['ref'] + '/'
         for overrides in ['overrides', 'script_overrides']:
             for path, value in data.get(overrides,{}).items():
                 if 'id' in value:
