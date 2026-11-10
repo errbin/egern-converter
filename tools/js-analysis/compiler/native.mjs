@@ -527,8 +527,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  function closedMethodCalls(method){
   if(method?.type!=='MethodDefinition')return null;
   const cls=parents.get(parents.get(method)),name=key(method);
-  if(!cls||!immutableClass(cls))return null;
-  const calls=nodes.filter(c=>{
+  if(!cls)return null;
+  const collect=()=>nodes.filter(c=>{
    if(c.type!=='CallExpression'||c.optional||c.callee.type!=='MemberExpression'||c.callee.optional||property(c.callee)!==name||c.arguments.some(a=>a.type==='SpreadElement'))return false;
    const receiver=resolve(c.callee.object),classReceiver=['ClassExpression','ClassDeclaration'].includes(receiver?.type);
    if(classOf(receiver)===cls&&method.static===classReceiver)return true;
@@ -536,6 +536,19 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const owner=owners.get(c.callee.object),ownerMethod=parents.get(owner);
    return ownerMethod?.type==='MethodDefinition'&&!ownerMethod.static&&parents.get(parents.get(ownerMethod))===cls;
   });
+  if(!immutableClass(cls)){
+   // 有些已审查工厂会先创建实例，随后把同名标识符用于无关的隐式全局。
+   // 这种整体标识符赋值不改变方法解析；但仍要求接收者的成员访问可静态
+   // 枚举，且没有成员写入覆盖该方法。
+   if(nodes.some(n=>{
+    if(n.type!=='AssignmentExpression'&&n.type!=='UpdateExpression'&&!(n.type==='UnaryExpression'&&n.operator==='delete'))return false;
+    const left=n.left??n.argument;
+    return left?.type==='MemberExpression'&&classOf(resolve(left.object))===cls&&(property(left)===undefined||property(left)===name);
+   }))return null;
+   if(nodes.some(n=>n.type==='MemberExpression'&&classOf(resolve(n.object))===cls&&property(n)===undefined))return null;
+   const calls=collect();return calls.length?calls:null;
+  }
+  const calls=collect();
   return calls.length?calls:null;
  }
  // 只有回调形参本身及其所有调用点都闭合时，才允许把响应快照原样转交。
@@ -746,7 +759,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  }
  function object(n,label){
   const b=n?.type==='Identifier'?bindings.get(n):null;
-  if(b)for(const ref of b.refs){const p=parents.get(ref),a=parents.get(p);if(p?.type==='MemberExpression'&&p.object===ref&&(a?.type==='AssignmentExpression'&&a.left===p||a?.type==='UpdateExpression'||a?.type==='UnaryExpression'&&a.operator==='delete'))fail(p,label+' 在声明后被修改，需要先确定字段的数据流');}
+  if(b){
+   if(b.writes.length)fail(n,label+' 在声明后被整体重绑，需要先确定字段的数据流');
+   for(const ref of b.refs){
+    const p=parents.get(ref),a=parents.get(p);
+    if(p?.type==='MemberExpression'&&p.object===ref&&(a?.type==='AssignmentExpression'&&a.left===p||a?.type==='UpdateExpression'||a?.type==='UnaryExpression'&&a.operator==='delete'))fail(p,label+' 在声明后被修改，需要先确定字段的数据流');
+    if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='Identifier')fail(ref,label+' 的别名复制无法证明对象身份不逃逸');
+   }
+  }
   n=resolve(n);if(n?.type!=='ObjectExpression')fail(n??tree,label+' 必须是可静态追溯的对象');
   const fields=new Map();for(const p of n.properties){if(p.type!=='Property'||p.kind!=='init'||p.computed&&key(p)===undefined)fail(p,label+' 含动态字段或展开，无法证明可原生转换');fields.set(String(key(p)),p.value);}return fields;
  }
@@ -1300,39 +1320,207 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   let f;if(stringValue(input))f=new Map([['url',input]]);else{
    f=forwardedHTTPFields(input);
-   // 闭合的本地请求对象：字段可静态枚举、唯一派发、且只允许"派发前的 url 追加"这一种
-   // 变异，其它变异或派发后的写入仍然拒绝。走与 $argument 相同的实时字段路径，发送时
-   // 读取更新后的 url，不把 += 折叠成表达式。
+   // 闭合的实时请求记录：字段可静态枚举、唯一派发，所有字段修改都发生在派发之前，
+   // 且请求对象的身份没有被别名复制或交给其它函数。请求参数可以在入口重绑一次为
+   // 新的展开快照；此后只允许读取或改写已知字段。走与 $argument 相同的实时字段
+   // 路径，发送时读取更新后的字段，不把修改折叠成表达式。
    const liveLocalRequest=()=>{
     if(input?.type!=='Identifier')return false;
     const binding=bindings.get(input);
-    if(!binding||!binding.init||binding.writes.length)return false;
-    const base=resolve(input);
-    if(base?.type!=='ObjectExpression')return false;
-    const fields=['url','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'];
-    for(const property of base.properties){
-     if(property.type!=='Property'||property.kind!=='init'||property.method||key(property)===undefined||!fields.includes(String(key(property))))return false;
+    if(!binding||!binding.refs.length)return false;
+    const parameter=nodes.some(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
+    const fields=['url','method','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'];
+    const sameBinding=ref=>bindings.get(ref)===binding;
+    const parameterCallSites=target=>{
+     const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===target));
+     const fnParent=parents.get(fn),id=fn?.id??(fnParent?.type==='VariableDeclarator'?fnParent.id:null),fnBinding=id?.type==='Identifier'?bindings.get(id):null;
+     const position=fn?.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===target);
+     if(!fn||position<0)return null;
+     let calls;
+     if(fnParent?.type==='MethodDefinition')calls=closedMethodCalls(fnParent);
+     else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[fnParent];
+     else{
+      if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
+      calls=fnBinding.refs.map(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')?call:null;});
+     }
+     return calls?.length&&calls.every(Boolean)?{fn,position,calls}:null;
+    };
+    // 记录字段集合必须可以静态枚举。展开来源同样要递归证明；唯一例外是
+    // 参数入口的一次自我快照（如 t={...defaults,...t}），此时旧字段集合
+    // 必须由所有调用点的闭合实参共同证明。
+    const recordFields=(node,seen=new Set(),selfFields=null)=>{
+     node=resolve(node,seen);
+     if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
+     if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
+     if(node?.type==='Identifier'){
+      if(sameBinding(node))return selfFields?new Set(selfFields):null;
+      const source=bindings.get(node);
+      if(!source||source.writes.length||seen.has(source))return null;
+      if(!source.init){
+       // 参数默认值只有在每个调用点都省略该实参时才会生效；此时字段集合
+       // 由默认对象本身稳定决定，混入任一显式实参即拒绝。
+       const site=parameterCallSites(source),formal=site?.fn.params[site.position];
+       if(!site||formal?.type!=='AssignmentPattern'||site.calls.some(call=>call.arguments.length>site.position&&!free(call.arguments[site.position],'undefined')))return null;
+       return recordFields(formal.right,new Set(seen).add(source),null);
+      }
+      return recordFields(source.init,new Set(seen).add(source),null);
+     }
+     if(node?.type!=='ObjectExpression')return null;
+     const result=new Set();
+     for(const entry of node.properties){
+      if(entry.type==='SpreadElement'){
+       const argument=entry.argument;
+       if(argument.type==='Identifier'&&sameBinding(argument)){
+        if(!selfFields)return null;
+        for(const name of selfFields)result.add(name);
+        continue;
+       }
+       const spread=recordFields(argument,new Set(seen),null);
+       if(!spread)return null;
+       for(const name of spread)result.add(name);
+       continue;
+      }
+      if(entry.type!=='Property'||entry.kind!=='init'||entry.method||key(entry)===undefined||!fields.includes(String(key(entry))))return null;
+      result.add(String(key(entry)));
+     }
+     return result;
+    };
+    const parameterRecords=()=>{
+     if(!parameter)return null;
+     const site=parameterCallSites(binding);
+     if(!site)return null;
+     return site.calls.map(call=>{
+      let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+      if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void'&&actual.argument.type==='Literal')actual=formal?.type==='AssignmentPattern'?formal.right:null;
+      const record=actual?recordFields(actual,new Set(),null):null;
+      return record;
+     });
+    };
+    const sourceRecords=parameter?parameterRecords():null;
+    if(parameter&&(!sourceRecords||sourceRecords.some(record=>!record)))return false;
+    const selfFields=sourceRecords?new Set(sourceRecords.flatMap(record=>[...record])):null;
+    const baseFields=parameter?selfFields:binding.init&&recordFields(binding.init);
+    let finalFields=null;
+    if(!parameter){
+     if(!binding.init||binding.writes.length)return false;
+     finalFields=recordFields(input);
+     if(!finalFields)return false;
+    }else{
+     if(binding.writes.length>1)return false;
+     if(binding.writes.length){
+      const write=binding.writes[0];
+      if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='Identifier'||!sameBinding(write.left))return false;
+      finalFields=recordFields(write.right,new Set(),selfFields);
+      if(!finalFields)return false;
+     }
     }
-    const dispatches=binding.refs.filter(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.arguments.includes(ref)&&call.callee.type==='MemberExpression'&&free(call.callee.object,'$httpClient');});
+    const dispatchOf=ref=>{
+     const call=parents.get(ref);
+     if(call?.type!=='CallExpression'||!call.arguments.includes(ref)||call.callee.type!=='MemberExpression')return null;
+     if(free(call.callee.object,'$httpClient'))return call;
+     if(free(call.callee.object,'$task')&&property(call.callee)==='fetch')return call;
+     return null;
+    };
+    const dispatches=binding.refs.map(dispatchOf).filter(Boolean);
     if(dispatches.length!==1)return false;
     const dispatch=dispatches[0];
+    if(parameter&&binding.writes.length&&binding.writes[0].end>=dispatch.start)return false;
+    const observing=ref=>{
+     const p=parents.get(ref);
+     if(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))return true;
+     if(p?.type==='BinaryExpression'&&['===','!==','==','!='].includes(p.operator))return true;
+     if(p?.type==='LogicalExpression'&&p.left===ref||p?.type==='LogicalExpression'&&p.right===ref)return true;
+     if(['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===ref)return true;
+     if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref)return true;
+     return p?.type==='ExpressionStatement';
+    };
+    const conditionalWrite=node=>{
+     for(let child=node,parent=parents.get(child);parent&&!functions.has(parent.type);child=parent,parent=parents.get(child)){
+      if(parent.type==='IfStatement'&&(parent.consequent===child||parent.alternate===child))return true;
+      if(parent.type==='ConditionalExpression'&&(parent.consequent===child||parent.alternate===child))return true;
+      if(parent.type==='LogicalExpression'&&parent.right===child)return true;
+      if(['WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchCase','TryStatement'].includes(parent.type))return true;
+     }
+     return false;
+    };
+    const transportFlag=field=>['binary-mode','full-header-mode','auto-redirect','auto-cookie','insecure'].includes(field);
     for(const ref of binding.refs){
      const p=parents.get(ref),q=parents.get(p);
      if(p===dispatch)continue;
+     if(parameter&&binding.writes.length&&ref.start>=binding.writes[0].right.start&&ref.end<=binding.writes[0].right.end){
+      let child=ref,parent=parents.get(child);
+      while(parent&&child!==binding.writes[0].right){
+       if(['CallExpression','NewExpression','ReturnStatement'].includes(parent.type))break;
+       child=parent;parent=parents.get(child);
+      }
+      if(child===binding.writes[0].right||parent===binding.writes[0].right)continue;
+     }
+     if(p?.type==='AssignmentExpression'&&p.left===ref){
+      if(!parameter||binding.writes.length!==1||binding.writes[0]!==p)return false;
+      continue;
+     }
      if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return false;
      const field=String(property(p));
      if(!fields.includes(field))return false;
+     if(q?.type==='MemberExpression'&&q.object===p){
+      const nested=property(q);
+      if(nested===undefined)return false;
+      if(field==='headers'||field==='header'){
+       const use=parents.get(q);
+       if(use?.type==='AssignmentExpression'&&use.left===q){if(use.operator!=='='||!(use.end<dispatch.start))return false;}
+       else if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===q){if(!(use.end<dispatch.start))return false;}
+       else if(use?.type==='CallExpression'&&use.callee===q)return false;
+       continue;
+      }
+      if(field==='method'&&['toLocaleLowerCase','toLowerCase'].includes(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)continue;
+      return false;
+     }
      if(q?.type==='AssignmentExpression'&&q.left===p){
-      if(q.operator!=='+='||field!=='url')return false;
-      if(owners.get(q)!==owners.get(dispatch)||!(q.end<dispatch.start))return false;
+      if(q.operator!=='='&&!(q.operator==='+='&&field==='url'))return false;
+      if(!(q.end<dispatch.start))return false;
+      if(transportFlag(field)){
+       const value=resolve(q.right);
+       if(baseFields?.has(field)&&(conditionalWrite(q)||value?.type!=='Literal'||typeof value.value!=='boolean'))return false;
+      }
       continue;
      }
-     if(q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete')return false;
-     if(q?.type==='AssignmentExpression')return false;
+     if(q?.type==='UpdateExpression')return false;
+     if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<dispatch.start))return false;continue;}
+     if(q?.type==='CallExpression'&&q.arguments.includes(p)){
+      if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<dispatch.start))return false;continue;}
+      if(['url','method','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'].includes(field))continue;
+      return false;
+     }
+     if(q?.type==='CallExpression'&&q.callee===p)return false;
+     if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='Identifier')return false;
+     if(q?.type==='SpreadElement')return false;
+     if(observing(ref))continue;
     }
+    const assignsField=(node,name)=>{
+     if(!node||functions.has(node.type))return false;
+     if(node.type==='AssignmentExpression')return node.operator==='='&&node.left.type==='MemberExpression'&&sameBinding(node.left.object)&&property(node.left)===name;
+     if(node.type==='IfStatement')return assignsField(node.test,name)||assignsField(node.consequent,name)&&assignsField(node.alternate,name);
+     if(node.type==='ConditionalExpression')return assignsField(node.test,name)||assignsField(node.consequent,name)&&assignsField(node.alternate,name);
+     if(node.type==='ExpressionStatement')return assignsField(node.expression,name);
+     if(['BlockStatement','Program'].includes(node.type))return node.body.some(statement=>assignsField(statement,name));
+     if(node.type==='SequenceExpression')return node.expressions.some(expression=>assignsField(expression,name));
+     return false;
+    };
+    const assignedBefore=name=>{
+     for(let child=dispatch,parent=parents.get(child);parent&&!functions.has(parent.type);child=parent,parent=parents.get(child)){
+      if(['BlockStatement','Program'].includes(parent.type)){
+       const position=parent.body.indexOf(child);
+       if(position>=0&&parent.body.slice(0,position).some(statement=>assignsField(statement,name)))return true;
+      }
+     }
+     return false;
+    };
+    const urlDefinite=finalFields?.has('url')||!parameter&&sourceRecords?.every(record=>record.has('url'))||assignedBefore('url');
+    if(!urlDefinite)return false;
     return true;
    };
-   if(!f&&(free(input,'$argument')||liveLocalRequest())&&!qx){
+   const live=liveLocalRequest();
+   if(!f&&(free(input,'$argument')&&!qx||live)){
     // 静的可见记录不允许把传输标志留到运行期判断：只能静态证明未启用才放行。
     // $argument 派生记录本身是运行期输入，沿用既有运行期守卫，不在本单元改动范围内。
     if(!free(input,'$argument')){
@@ -1344,11 +1532,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(!(value?.type==='Literal'&&value.value===false))fail(input,'HTTP 请求的 '+name+' 必须静态证明未启用');
      }
     }
-    const request=fresh('httpRequest'),dynamicMethod=!!method?.expression,selector=dynamicMethod?fresh('httpMethod'):null;
-    const callee=dynamicMethod?`((${selector}) => {if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${render(method.expression)}.toLowerCase()).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
+    const request=fresh('httpRequest'),dynamicMethod=!!method?.expression||qx&&live&&!method,selector=dynamicMethod?fresh('httpMethod'):null;
+    const methodValue=method?.expression?render(method.expression):`${request}?.method`;
+    const callee=dynamicMethod?`((${selector}) => {${selector}=String(${selector} ?? 'get').toLowerCase();if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${methodValue}).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
     const url=`typeof ${request} === 'string' ? ${request} : ${request}.url`;
-    const headers=`${request}.headers ?? ${request}.header`,body=`${request}.bodyBytes ?? ${request}.body`,policy=`${request}.policy ?? ${request}.node`;
-    const options=`{...(${headers} === undefined ? {} : {headers: ${headers}}), ...(${body} === undefined ? {} : {body: ${body}}), timeout: ${request}.timeout === undefined ? 5000 : ${request}.timeout * ${format==='loon'?1:1000}, ...(${policy} === undefined ? {} : {policy: ${policy}}), ...(${request}["policy-descriptor"] === undefined ? {} : {policyDescriptor: ${request}["policy-descriptor"]}), redirect: ${request}["auto-redirect"] === undefined || ${request}["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}["auto-cookie"] === false ? 'omit' : 'include', ...(${request}.insecure === undefined ? {} : {insecureTls: ${request}.insecure})}`;
+    const headers=`${request}?.headers ?? ${request}?.header`,body=`${request}?.bodyBytes ?? ${request}?.body`,policy=`${request}?.policy ?? ${request}?.node`;
+    const options=qx
+     ?`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), timeout: ${request}?.timeout === undefined ? 5000 : ${request}.timeout, ...((${policy}) === undefined ? {} : {policy: ${policy}}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] ? 'include' : 'omit', insecureTls: ${request}?.insecure === true}`
+     :`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), timeout: ${request}?.timeout === undefined ? 5000 : ${request}.timeout * ${format==='loon'?1:1000}, ...((${policy}) === undefined ? {} : {policy: ${policy}}), ...(${request}?.["policy-descriptor"] === undefined ? {} : {policyDescriptor: ${request}["policy-descriptor"]}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] === false ? 'omit' : 'include', ...(${request}?.insecure === undefined ? {} : {insecureTls: ${request}.insecure})}`;
     const call=`${callee}(${url}, ${options})`,code=`((${request}) => {if (${request} && typeof ${request} === 'object' && (${request}["binary-mode"] === true || ${request}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');return ${call};})(${render(input)})`;
     return {code,url,options,callee,dynamic:dynamicMethod,binary:false,full:false};
    }
@@ -1523,7 +1714,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    for(const r of binding.refs){
     const p=parents.get(r),q=parents.get(p);
     if(p?.type==='AssignmentExpression'&&p.left===r){
-     if(p.operator!=='='||p.right.type!=='ObjectExpression'||p.right.properties.some(x=>x.type!=='SpreadElement'&&!(x.type==='Property'&&x.kind==='init'&&key(x)!==undefined&&allowed.has(String(key(x))))))return null;
+     if(p.operator!=='='||p.right.type!=='ObjectExpression')return null;
+     for(const entry of p.right.properties){
+      if(entry.type==='Property'){
+       if(entry.kind!=='init'||key(entry)===undefined||!allowed.has(String(key(entry))))return null;
+       continue;
+      }
+      if(entry.type!=='SpreadElement'||entry.argument.type!=='Identifier'||bindings.get(entry.argument)!==binding)return null;
+     }
      continue;
     }
     if(p?.type==='SpreadElement'&&q?.type==='ObjectExpression')continue;

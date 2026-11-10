@@ -37,6 +37,42 @@ url.url+='record';$httpClient.get(url,(e,r,b)=>$done({body:b}));'''
 send({url:'https://example.test/path',params:'a=1'});'''
         self.check(source,'', 'path?a=1')
 
+    def test_closed_parameter_snapshot_and_default_spread_before_dispatch(self):
+        # 参数在入口可以重绑一次为新的展开快照；所有调用点省略默认参数，且自我展开
+        # 的旧字段来自闭合实参时，字段集合仍然可枚举。
+        source='''function send(t,defaults={}){t={...defaults,...t};t.method=t.method||'GET';t.url+='?snapshot=1';
+$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+send({url:'https://example.test/path'});'''
+        self.check(source,'','path?snapshot=1')
+
+    def test_host_request_fields_forwarded_to_closed_helper(self):
+        # 宿主请求可以作为闭合 helper 的来源；helper 只读取已列出的宿主字段，
+        # 并在唯一派发前构造新的封闭请求记录。
+        source='''function send(req){const options={url:req.url,headers:{...req.headers}};
+options.url+='?from=request';$httpClient.get(options,(e,r,b)=>$done({body:b}))}
+send($request);'''
+        self.check(source,'','record.js?from=request')
+
+    def test_live_projection_preserves_request_headers(self):
+        # 优先级必须保证 headers 的 ?? 先求值，否则请求会被错误地投影为空头。
+        source='''const options={url:'https://example.test/path',headers:{Y:'base'}};
+options.url+='?h=1';$httpClient.get(options,(e,r,b)=>$done({body:b}));'''
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        case={'name':'live headers','request':{'url':URL},
+              'http':[{'url':'https://example.test/path?h=1','body':'ok'}],
+              'expected':{'result':{'body':'ok'},
+                          'events':{'requests':[{'url':'https://example.test/path?h=1','headers':{'y':'base'}}]}}}
+        result=compare(source,output,'loon',URL,case)
+        self.assertEqual(result['status'],'passed',result)
+
+    def test_qx_live_timeout_remains_in_milliseconds(self):
+        # QX 请求 helper 已把秒归一为毫秒，实时投影不能再乘 1000。
+        source='''function send(t){t={...t};$task.fetch(t).then(r=>$done({body:r.body}))}
+send({url:'https://example.test/',timeout:5000});'''
+        output=convert_script(source,'Fixture',URL,'',source_format='qx')
+        self.assertIn('timeout:',output)
+        self.assertNotIn('.timeout * 1000',output)
+
     def test_closed_local_record_url_append_before_dispatch(self):
         # 闭合的本地请求对象：字段静态可枚举、唯一派发、追加发生在派发之前，走实时
         # 字段路径，发送时读取更新后的 url。
@@ -77,6 +113,27 @@ $httpClient.get(options,(e,r,b)=>$done({body:b}));'''
             source=("const options={url:'https://example.test/base',"+flag+":$argument};"
                     "$httpClient.get(options,(e,r,b)=>$done({body:b}));")
             with self.subTest(flag=flag),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='loon')
+
+    def test_unknown_spread_or_rebind_after_dispatch_is_rejected(self):
+        # 未知展开来源使字段集合不再可枚举；派发后的整体重绑也不能倒推发送时字段。
+        for source in [
+            '''function send(t){t={...t,...$argument};$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+send({url:'https://example.test/base'});''',
+            '''function send(t){$httpClient.get(t,(e,r,b)=>$done({body:b}));
+t={...t,url:'https://example.test/later'}}send({url:'https://example.test/base'});''',
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='loon')
+
+    def test_dynamic_member_or_alias_escape_is_rejected(self):
+        for source in [
+            '''const options={url:'https://example.test/base'};const key=$argument;
+options[key]='https://example.test/later';$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
+            '''const options={url:'https://example.test/base'};const copy=options;
+copy.url+='?copy';$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'',source_format='loon')
 
     def test_external_call_or_await_between_global_write_and_request_invalidates_shape(self):
