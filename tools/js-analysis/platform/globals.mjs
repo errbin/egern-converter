@@ -75,7 +75,7 @@ function fold(source,format,options,qxHint){
   // Egern's native script runtime is neither Node.js nor a browser. These
   // free host globals therefore cannot select compatibility-only branches;
   // lexical declarations with the same names remain untouched by ix.free.
-  module:'undefined',process:'undefined',require:'undefined',global:'undefined',window:'undefined'};
+  module:'undefined',process:'undefined',require:'undefined',global:'undefined'};
  for(const [name,type] of Object.entries(types))if((type==='object'||type==='function')&&!PRESENT_GLOBALS.has(name))PRESENT_GLOBALS.set(name,Symbol('present:'+name));
  const presentGlobalNames=new Map([...PRESENT_GLOBALS].map(([name,marker])=>[marker,name]));
  // Some bundled SDKs detect their host through an isolated enumerable-key
@@ -137,7 +137,7 @@ function fold(source,format,options,qxHint){
    const frame=stack.at(-1),n=frame.node;
    if(frame.state==='start'){
     if(n.type==='UnaryExpression'){
-     if(n.operator==='typeof'&&['global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete('undefined');continue;}
+     if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete('undefined');continue;}
      if(n.operator==='typeof'&&ix.free(n.argument,'globalThis')){complete('object');continue;}
      if(n.operator==='typeof'&&n.argument.type==='ChainExpression'){frame.argument=n.argument.expression;}
      else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip'){complete('function');continue;}
@@ -280,7 +280,7 @@ function fold(source,format,options,qxHint){
    }
   }
   if(n.type==='UnaryExpression'){
-   if(n.operator==='typeof'&&['global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name)))return 'undefined';
+   if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name)))return 'undefined';
    if(n.operator==='typeof'&&ix.free(n.argument,'globalThis'))return 'object';
    if(n.operator==='typeof'&&n.argument.type==='ChainExpression')return value({...n,argument:n.argument.expression},seen);
    if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip')return 'function';
@@ -352,6 +352,32 @@ function fold(source,format,options,qxHint){
   if(n.type==='VariableDeclaration')return n.declarations.every(d=>d.id.type==='Identifier'&&inert(d.init));
   return false;
  }
+ // 仅用于折叠 `左值 && false` / `左值 || true`：左侧读取不得触发用户代码。
+ // 裸 window 不进入 types，只有 typeof 探测可按目标宿主缺少该全局折叠。
+ function safeBindingRead(n){
+  const b=ix.bindings.get(n);
+  if(!b||ix.free(n))return false;
+  const owner=ix.owners.get(n);
+  if(functions.has(owner?.type)&&owner.params.some(p=>p.type==='Identifier'&&ix.bindings.get(p)===b))return true;
+  for(const declaration of ix.nodes){
+   if(declaration.type==='FunctionDeclaration'&&ix.bindings.get(declaration.id)===b)return true;
+   if(declaration.type==='CatchClause'&&declaration.param?.type==='Identifier'&&ix.bindings.get(declaration.param)===b)return true;
+   if(declaration.type!=='VariableDeclarator'||ix.bindings.get(declaration.id)!==b)continue;
+   const statement=ix.parents.get(declaration);
+   return statement?.kind==='var'||!!statement&&initializedAfter(ix,statement,n);
+  }
+  return false;
+ }
+ function pureRead(n){
+  if(!n)return true;
+  if(n.type==='Literal'||functions.has(n.type))return true;
+  if(n.type==='Identifier')return safeBindingRead(n);
+  if(n.type==='UnaryExpression')return n.operator==='typeof'&&(n.argument.type==='Identifier'||pureRead(n.argument))||['!','void'].includes(n.operator)&&pureRead(n.argument);
+  if(n.type==='BinaryExpression')return ['===','!=='].includes(n.operator)&&pureRead(n.left)&&pureRead(n.right);
+  if(n.type==='LogicalExpression')return pureRead(n.left)&&pureRead(n.right);
+  if(n.type==='ConditionalExpression')return pureRead(n.test)&&pureRead(n.consequent)&&pureRead(n.alternate);
+  return false;
+ }
  function dominates(binding,ref){
   const declaration=ix.parents.get(binding.init),statement=ix.parents.get(declaration),block=ix.parents.get(statement);
   if(declaration?.type!=='VariableDeclarator'||statement?.type!=='VariableDeclaration'||!['Program','BlockStatement'].includes(block?.type))return false;
@@ -418,6 +444,9 @@ function fold(source,format,options,qxHint){
   if(n.type==='BinaryExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string','number'].includes(typeof v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
   if(n.type==='LogicalExpression'){
    const a=value(n.left);
+   const b=value(n.right);
+   if(n.operator==='&&'&&b===false&&pureRead(n.left))return {direct:true,value:'false'};
+   if(n.operator==='||'&&b===true&&pureRead(n.left))return {direct:true,value:'true'};
    if(a===PRESENT_VERSION&&n.operator==='&&')return {children:[n.right],render:child=>'('+child(n.right)+')'};
    if(a!==UNKNOWN&&a!==PRESENT_VERSION){
     const branch=n.operator==='&&'?a?n.right:n.left:n.operator==='||'?a?n.left:n.right:n.operator==='??'?a==null?n.right:n.left:null;
