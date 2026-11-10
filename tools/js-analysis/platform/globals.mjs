@@ -83,13 +83,37 @@ function fold(source,format,options,qxHint){
  // global object or discard an escaped/mutated array.
  const globalMembership=new WeakMap(),keySnapshots=new WeakSet();
  const markers=new Map(['$task','$loon','$rocket','$environment'].map(name=>[name,false]));markers.set('Egern',true);
+ // 只有可能改变 globalThis 成员关系（自身属性、原型链或 Object.keys/Array.includes
+  // 契约）的写入才否定探针。普通库函数改写自己的 prototype 不影响宿主全局。
+ const written=n=>{const p=ix.parents.get(n);return p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete';};
+ const prototypeChain=n=>{
+  for(let o=n;o?.type==='MemberExpression';o=o.object)if(property(o)==='prototype'&&(ix.free(o.object,'Object')||ix.free(o.object,'Array')))return true;
+  return false;
+ };
  const probeBuiltinsStable=!ix.nodes.some(n=>{
-  if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&ix.free(n.callee.object,'Object')&&['assign','defineProperty','defineProperties','setPrototypeOf'].includes(property(n.callee)))return n.arguments.some(a=>ix.free(a,'globalThis'))||['defineProperty','defineProperties','setPrototypeOf'].includes(property(n.callee));
-  if(n.type==='MemberExpression'&&['keys','includes','prototype'].includes(property(n))){const p=ix.parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete')return true;}
-  if(n.type==='Identifier'&&markers.has(n.name)&&ix.free(n)){const p=ix.parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete')return true;}
-  if(n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&(property(n)===undefined||markers.has(property(n)))){const p=ix.parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete')return true;}
+  if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&ix.free(n.callee.object,'Object')&&['assign','defineProperty','defineProperties','setPrototypeOf'].includes(property(n.callee))){
+   const target=n.arguments[0];
+   return n.arguments.some(a=>ix.free(a,'globalThis'))||target&&(ix.free(target,'globalThis')||prototypeChain(target));
+  }
+  if(n.type==='MemberExpression'&&written(n)){
+   if(property(n)==='keys'&&ix.free(n.object,'Object'))return true;
+   if(property(n)==='includes'&&n.object.type==='MemberExpression'&&property(n.object)==='prototype'&&ix.free(n.object.object,'Array'))return true;
+   if(prototypeChain(n))return true;
+  }
+  if(n.type==='Identifier'&&markers.has(n.name)&&ix.free(n)&&written(n))return true;
+  if(n.type==='Identifier'&&ix.free(n,'globalThis')&&written(n))return true;
+  if(n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&(property(n)===undefined||markers.has(property(n)))&&written(n))return true;
   return false;
  });
+ // 只折叠对已知平台标记的 `'name' in globalThis` 查询。未知名称仍保持未知，
+ // 避免把“当前没有观测到”误当成宿主全局一定不存在。
+ function membershipProbe(n,seen){
+  if(!probeBuiltinsStable||n?.type!=='BinaryExpression'||n.operator!=='in')return UNKNOWN;
+  if(!ix.free(n.right,'globalThis'))return UNKNOWN;
+  const name=value(n.left,new Set(seen));
+  if(typeof name!=='string')return UNKNOWN;
+  return markers.has(name)?markers.get(name):UNKNOWN;
+ }
  if(probeBuiltinsStable)for(const d of ix.nodes)if(d.type==='VariableDeclarator'&&d.id.type==='Identifier'){
   const call=d.init,b=ix.bindings.get(d.id);
   if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==1||!ix.free(call.arguments[0],'globalThis')||call.callee.type!=='MemberExpression'||!ix.free(call.callee.object,'Object')||property(call.callee)!=='keys'||!b?.refs.length||b.writes.length||declarationCounts.get(b)!==1)continue;
@@ -111,7 +135,11 @@ function fold(source,format,options,qxHint){
      else if(n.operator==='typeof'&&ix.free(n.argument)&&n.argument.name.startsWith('$')){complete(Object.hasOwn(types,n.argument.name)?types[n.argument.name]:UNKNOWN);continue;}
      frame.state='unary';stack.push({node:frame.argument??n.argument,state:'start'});continue;
     }
-    if(n.type==='BinaryExpression'){frame.state='binary-left';stack.push({node:n.left,state:'start'});continue;}
+    if(n.type==='BinaryExpression'){
+     const membership=membershipProbe(n,seen);
+     if(membership!==UNKNOWN){complete(membership);continue;}
+     frame.state='binary-left';stack.push({node:n.left,state:'start'});continue;
+    }
     if(n.type==='LogicalExpression'){frame.state='logical-left';stack.push({node:n.left,state:'start'});continue;}
     if(n.type==='ConditionalExpression'){frame.state='conditional-test';stack.push({node:n.test,state:'start'});continue;}
     complete(valueImpl(n,seen));continue;
@@ -252,6 +280,7 @@ function fold(source,format,options,qxHint){
    if(n.operator==='!')return !v;if(n.operator==='typeof')return typeof v;if(n.operator==='+')return +v;if(n.operator==='-')return -v;if(n.operator==='void')return undefined;
   }
   if(n.type==='BinaryExpression'){
+   const membership=membershipProbe(n,seen);if(membership!==UNKNOWN)return membership;
    const a=value(n.left,seen),b=value(n.right,seen);if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION)return UNKNOWN;
    const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
    if(presentA||presentB){
@@ -289,14 +318,14 @@ function fold(source,format,options,qxHint){
    for(let i=start;i<n.cases.length;i++)for(const statement of n.cases[i].consequent){
     if(statement.type==='ReturnStatement')return statement.argument?value(statement.argument,seen):undefined;
     if(statement.type==='BreakStatement')return NO_RETURN;
-    if(statement.type==='EmptyStatement')continue;
-    if(statement.type==='VariableDeclaration'&&statement.declarations.every(d=>d.id.type==='Identifier'&&d.init&&value(d.init,new Set(seen))!==UNKNOWN))continue;
+    if(statement.type==='EmptyStatement'||statement.type==='FunctionDeclaration')continue;
+    if(statement.type==='VariableDeclaration'&&statement.declarations.every(d=>d.id.type==='Identifier'&&d.init&&(functions.has(d.init.type)||value(d.init,new Set(seen))!==UNKNOWN)))continue;
     return UNKNOWN;
    }
    return NO_RETURN;
   }
-  if(n.type==='EmptyStatement')return NO_RETURN;
-  if(n.type==='VariableDeclaration'&&n.declarations.every(d=>d.id.type==='Identifier'&&d.init&&value(d.init,new Set(seen))!==UNKNOWN))return NO_RETURN;
+  if(n.type==='EmptyStatement'||n.type==='FunctionDeclaration')return NO_RETURN;
+  if(n.type==='VariableDeclaration'&&n.declarations.every(d=>d.id.type==='Identifier'&&d.init&&(functions.has(d.init.type)||value(d.init,new Set(seen))!==UNKNOWN)))return NO_RETURN;
   return UNKNOWN;
  }
  // A captured program constant is safe only when the entire prefix before its
