@@ -1,4 +1,5 @@
 """Keep converter extensions inside the fixed functional modules."""
+CI_DOMAIN = 'site'
 import json
 from pathlib import Path
 import subprocess

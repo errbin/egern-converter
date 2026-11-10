@@ -5,6 +5,8 @@
 ```sh
 # 构建时对所有成功编译的脚本运行差分验证
 .venv/bin/python build.py --offline --verify
+# 发布可用内容，同时排除验证失败脚本及依赖模块（Actions 使用此模式）
+.venv/bin/python build.py --offline --verify --isolate-script-failures
 # 检查已有站点产物
 .venv/bin/python -m tools.egern_hub.verify
 # 要求每个脚本都触发可观测行为
@@ -33,5 +35,7 @@
 脚本报告记录 `coverage.attempted`、`completed`、`effective` 和 `complete_branch_coverage`。`complete_branch_coverage` 始终为 `false`；自动探针不是全输入等价证明，也不是 Egern 真机测试。`--require-covered` 只接受 `probe_passed`，其他状态返回非零。
 
 原生模块正文保持原样，不纳入转换脚本差分验证。JavaScript 和 Python 正则语法不完全相同，候选 URL 与字段值只是探针，不代表真实流量分布。真实接口结构、线上状态、设备运行时和异步时序仍可能超出模拟宿主覆盖；报告不得表述成“全部功能验证通过”。
+
+Actions 的网站门禁与转换器回归分开。转换失败或差分状态为 `failed` 的脚本及依赖它的整个模块不进入站点，其他资源可继续发布；失败记录仍保留，不能算作验证通过。没有定位到具体脚本的验证器异常、网站检查失败与发布错误仍会停止发布。转换器回归在网站发布后独立运行，失败会出现在日志和步骤结果中，不阻止已通过网站检查的内容上线。默认 `--verify` 的严格模式保持不变。
 
 验证宿主分别运行原脚本与转换脚本，不导入转换器实现，也不依赖 Script-Hub 或 NSNanoCat/util。每个执行使用独立 VM 上下文；禁用外部导入和 WebAssembly，不注入宿主可调用对象，不传递环境密钥，也不访问真实 HTTP、存储或通知。单次 VM 执行超时 500ms，子进程超时 5 秒，堆限制 128 MiB。

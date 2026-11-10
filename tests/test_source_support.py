@@ -1,4 +1,5 @@
 """Source snapshot lookup respects each catalog discovery contract."""
+CI_DOMAIN = 'site'
 import json
 import importlib.util
 from pathlib import Path
