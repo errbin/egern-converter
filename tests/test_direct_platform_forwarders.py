@@ -76,3 +76,28 @@ class DirectPlatformForwarderTests(unittest.TestCase):
         ]:
             with self.subTest(source=source),self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'')
+
+    def test_forwarder_escape_matters_only_when_it_can_precede_the_call(self):
+        self.check("const h={done:function(f,v){return f(v)}};h.other=1;h.done($done,{body:'ok'});")
+        source = ("const h={done:function(f,v){return f(v)}};"
+                  "if($request.url.includes('x')){h.done($done,{body:'ok'});}"
+                  "else{unknown(h);$done({});}")
+        output = convert_script(source, 'Fixture', URL, '')
+        case = {'name': 'later escape', 'request': {'url': URL + '/x'},
+                'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'surge', URL, case)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_forwarder_escape_before_call_or_repeated_by_loop_is_rejected(self):
+        for source in [
+            "const h={done:function(f,v){return f(v)}};unknown(h);h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};h[$request.url]=1;h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};h.done=function(){};h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};mutate();h.done($done,{body:'ok'});"
+            "function mutate(){unknown(h);}",
+            "const h={done:function(f,v){return f(v)}};"
+            "for(let i=0;i<1;i++){h.done($done,{body:'ok'});}unknown(h);",
+        ]:
+            with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '平台 API 作为值传递'):
+                convert_script(source, 'Fixture', URL, '')
+

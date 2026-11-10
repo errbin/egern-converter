@@ -114,18 +114,38 @@ function lowerDirectPlatformForwarders(source){
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
  catch{return {source,transformations:[]};}
  const {nodes,parents,bindings,free}=ix;
- const writesMember=(object,prop)=>{
+ // 调用点之后发生的普通逃逸不会改写已经在调用点取到的成员值；只有提升函数
+ // 声明可能提前执行，或调用点处于循环中会进入下一轮时，后续节点才仍然相关。
+ const loops=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
+ const enclosingFunction=node=>{let parent=parents.get(node);while(parent&&!functions.has(parent.type))parent=parents.get(parent);return parent??null;};
+ const insideLoop=node=>{for(let parent=parents.get(node);parent&&!functions.has(parent.type);parent=parents.get(parent))if(loops.has(parent.type))return true;return false;};
+ // 只有同一函数内、调用点之后的直写，或调用点之后才创建且不提升的函数体，
+ // 才不可能在调用前执行。
+ const canAffectCall=(node,call)=>{
+  if(node.start<call.start)return true;
+  if(insideLoop(call))return true;
+  const callFn=enclosingFunction(call);
+  let fn=enclosingFunction(node);
+  while(fn&&fn!==callFn){
+   if(fn.start>call.start)return fn.type==='FunctionDeclaration';
+   return true;
+  }
+  return false;
+ };
+ const writesMember=(object,prop,call)=>{
   for(const n of nodes){
+   if(call&&!canAffectCall(n,call))continue;
    if(n.type!=='AssignmentExpression'&&n.type!=='UpdateExpression'&&!(n.type==='UnaryExpression'&&n.operator==='delete'))continue;
    let target=n.type==='AssignmentExpression'?n.left:n.type==='UpdateExpression'?n.argument:n.argument;
    if(target?.type!=='MemberExpression')continue;
-   let cursor=target;
-   while(cursor?.type==='MemberExpression')cursor=cursor.object;
-   const binding=cursor?.type==='Identifier'?bindings.get(cursor):null;
-   if(binding!==object)continue;
+   // 找到以该绑定为根的成员链最外层，检查被写入的是哪个属性。
    let member=target;
-   while(member?.type==='MemberExpression'&&member.object!==object&&member.object?.type==='MemberExpression')member=member.object;
-   const name=member?.type==='MemberExpression'&&member.object===object?propertyOf(member):undefined;
+   while(member.object?.type==='MemberExpression')member=member.object;
+   const base=member.object;
+   const baseBinding=base?.type==='Identifier'?bindings.get(base):null;
+   if(baseBinding!==object)continue;
+   const name=propertyOf(member);
+   // 动态键可能命中目标方法，必须拒绝；写入其它已知成员不影响方法值。
    if(name===undefined||name===prop)return true;
   }
   return false;
@@ -143,7 +163,7 @@ function lowerDirectPlatformForwarders(source){
   if(node?.type==='ObjectExpression')return {object:node,binding:null};
   return null;
  };
- const functionAt=callee=>{
+ const functionAt=(callee,call)=>{
   if(callee.type==='Identifier'){
    const b=bindings.get(callee);if(!b||b.writes.length)return null;
    const fn=b.fn??b.init;return fn&&functions.has(fn.type)?{fn,binding:null}:null;
@@ -156,10 +176,12 @@ function lowerDirectPlatformForwarders(source){
   if(entries.length!==1)return null;
   const fn=entries[0].value;if(!functions.has(fn.type))return null;
   if(resolved.binding){
-   if(writesMember(resolved.binding,name))return null;
+   if(writesMember(resolved.binding,name,call))return null;
    // 对象可以整体传入本地辅助函数，但必须证明该函数只读取参数。
-   // 成员写入、动态属性写入、别名逃逸或未知调用都会让目标方法失去证明。
+   // 成员写入、动态属性写入、别名逃逸或未知调用都会让目标方法失去证明；
+   // 只审查可能影响本次调用点的引用。
    for(const ref of resolved.binding.refs){
+    if(!canAffectCall(ref,call))continue;
     const parent=parents.get(ref);
     if(parent?.type==='MemberExpression'&&parent.object===ref&&property(parent)!==undefined)continue;
     if(!readOnlyEscape(ref,new Set()))return null;
@@ -238,7 +260,7 @@ function lowerDirectPlatformForwarders(source){
   const apis=call.arguments.filter(isPlatformValue);
   if(apis.length!==1)continue;
   const api=apis[0].name;
-  const target=functionAt(call.callee);if(!target)continue;
+  const target=functionAt(call.callee,call);if(!target)continue;
   const fn=target.fn;
   if(fn.async||fn.generator||fn.params.length!==call.arguments.length)continue;
   const apiParam=fn.params[0];if(apiParam.type!=='Identifier')continue;
@@ -814,20 +836,21 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     // 完成值在 $done 调用点按当时的绑定值取快照；读取点之后的普通赋值不会
     // 改变已经提交的完成结果。这里只合并读取点之前能静态求形的赋值，同时排除
     // 提升函数声明可能在读取点前被调用的写入。
-    const hoistedRisk=node=>{
-     let fn=owners.get(node);
-     while(fn&&fn!==owners.get(n)){
-      if(fn.type==='FunctionDeclaration'&&fn.start>n.start)return true;
-      if(fn.type!=='FunctionDeclaration'&&fn.start>n.start)return false;
-      fn=owners.get(fn);
+    const loopTypes=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
+    const enclosingFunction=node=>{let parent=parents.get(node);while(parent&&!functions.has(parent.type))parent=parents.get(parent);return parent??null;};
+    const completionFn=enclosingFunction(n);
+    for(let parent=parents.get(n);parent&&!functions.has(parent.type);parent=parents.get(parent))
+     if(loopTypes.has(parent.type))fail(n,'完成结果变量被重新赋值，无法确定字段');
+    const canReachRead=ref=>{
+     if(ref.start<n.start)return true;
+     const fn=enclosingFunction(ref);
+     while(fn&&fn!==completionFn){
+      if(fn.start>n.start)return fn.type==='FunctionDeclaration';
+      return true;
      }
      return false;
     };
-    if([...b.writes,...b.refs].some(ref=>ref.start>=n.start&&hoistedRisk(ref)))fail(n,'完成结果变量被重新赋值，无法确定字段');
-    // 循环可能让读取点之后的写入进入下一轮读取，无法按单次源码顺序排除。
-    const loopTypes=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
-    for(let parent=parents.get(n);parent&&!functions.has(parent.type);parent=parents.get(parent))
-     if(loopTypes.has(parent.type))fail(n,'完成结果变量被重新赋值，无法确定字段');
+    if([...b.writes,...b.refs].some(ref=>ref.start>=n.start&&canReachRead(ref)))fail(n,'完成结果变量被重新赋值，无法确定字段');
     const relevantWrites=b.writes.filter(w=>w.end<=n.start);
     if(!b.init&&!relevantWrites.length)fail(n,'完成结果形状无法静态确定');
     const fields=b.init?shape(b.init,new Set(seen)):new Map();
