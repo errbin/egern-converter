@@ -121,6 +121,15 @@ function fold(source,format,options,qxHint){
   if(queries.some(c=>!c)||b.refs.some(r=>!dominates(b,r)))continue;
   keySnapshots.add(call);for(const query of queries)globalMembership.set(query,markers.get(query.arguments[0].value));
  }
+ // 平台版本成员的存在性只保证宿主给出了版本字符串，具体版本值仍然未知。
+ // 脚本常以字符串 "undefined" 作为缺失哨兵；存在性已证时，该哨兵不可能等于
+ // 版本值。除此之外的任何字符串比较都必须继续保持未知，不能按名称猜测。
+ function presentVersionComparison(operator,a,b){
+  if(!['===','!==','==','!='].includes(operator)||a!==PRESENT_VERSION&&b!==PRESENT_VERSION||a===PRESENT_VERSION&&b===PRESENT_VERSION)return undefined;
+  const other=a===PRESENT_VERSION?b:a;
+  if(other!=='undefined')return undefined;
+  return ['===','=='].includes(operator)?false:true;
+ }
  function valueExpression(root,seen){
   const stack=[{node:root,state:'start'}];let result=UNKNOWN;
   function complete(value){const frame=stack.pop(),parent=stack.at(-1);if(parent){parent.child=value;parent.hasChild=true;}else result=value;}
@@ -156,7 +165,9 @@ function fold(source,format,options,qxHint){
     frame.left=frame.child;frame.state='binary-right';stack.push({node:n.right,state:'start'});continue;
    }
    if(frame.state==='binary-right'){
-    const a=frame.left,b=frame.child;if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION){complete(UNKNOWN);continue;}
+    const a=frame.left,b=frame.child,presence=presentVersionComparison(n.operator,a,b);
+    if(presence!==undefined){complete(presence);continue;}
+    if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION){complete(UNKNOWN);continue;}
     const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
     if(presentA||presentB){
      if(['===','!==','==','!='].includes(n.operator)){
@@ -281,7 +292,9 @@ function fold(source,format,options,qxHint){
   }
   if(n.type==='BinaryExpression'){
    const membership=membershipProbe(n,seen);if(membership!==UNKNOWN)return membership;
-   const a=value(n.left,seen),b=value(n.right,seen);if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION)return UNKNOWN;
+   const a=value(n.left,seen),b=value(n.right,seen),presence=presentVersionComparison(n.operator,a,b);
+   if(presence!==undefined)return presence;
+   if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION)return UNKNOWN;
    const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
    if(presentA||presentB){
     if(['===','!==','==','!='].includes(n.operator)){
