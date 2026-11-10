@@ -518,6 +518,151 @@ function cachedRotationShape(call,ix,tableBinding){
  const scan=ix.nodes.filter(n=>n.start>=def.start&&n.end<=def.end);
  return scan.some(n=>n.type==='WhileStatement')&&scan.some(n=>n.type==='TryStatement');
 }
+// 嵌套 IIFE 轮转的结构判据：外层把起始计数与目标值闭包进来，内层再通过
+// 形参接收“表工厂 + 目标值 + 字符串反转器”。结构匹配只负责收敛候选，
+// 轮转步数仍必须由逐轮校验和的数值复算唯一确定。
+const inside=(node,range)=>!!node&&!!range&&node.start>=range.start&&node.end<=range.end;
+function sameIdentifier(ix,left,right){return left?.type==='Identifier'&&right?.type==='Identifier'&&ix.bindings.get(left)&&ix.bindings.get(left)===ix.bindings.get(right);}
+function resolvesTo(node,ix,binding,hops=4){
+ let current=ix.bindings.get(node);
+ for(let hop=0;hop<=hops&&current;hop++){
+  if(current===binding)return true;
+  const next=current.fn??current.init;
+  current=next?.type==='Identifier'?ix.bindings.get(next):null;
+ }
+ return false;
+}
+// 轮转器只允许对已确认的本地字符串表做反向器给出的方法调用。
+function validatorString(fn,inputs,ix){
+ if(fn?.type!=='FunctionExpression'||fn.async||fn.generator||fn.params.some(p=>p.type!=='Identifier'))fail('轮转校验器不是封闭的本地函数');
+ const body=fn.body.body;
+ if(body.length!==1||body[0].type!=='ReturnStatement'||!body[0].argument)fail('轮转校验器必须只返回一个闭合表达式');
+ const allowed=new Set([...fn.params.map(p=>p.name),'arguments','undefined','NaN','Infinity','String','Number','Array','parseInt']);
+ for(const node of ix.nodes){
+  if(!inside(node,fn)||node.type!=='Identifier'||!ix.free(node))continue;
+  if(!allowed.has(node.name))fail('轮转校验器读取了未审查的全局标识符：'+node.name);
+ }
+ const state={env:new Map(),steps:0};
+ fn.params.forEach((param,index)=>state.env.set(param.name,inputs[index]));
+ state.env.set('arguments',shellArray(inputs));
+ try{return shellString(shellEvaluate(body[0].argument,state));}
+ catch{fail('轮转校验器不是已审查的字符串反转');}
+}
+// 证明轮转初始化语句只包含本地表操作。表达式语句允许保留版本哨兵赋值，
+// 但该赋值目标不得再被业务读取；条件语句只允许空分支。
+function rotationStatementShape(statement,outer,ix,decoder,tableFactory,wrappers){
+ const outside=ix.nodes.filter(node=>inside(node,statement)&&!inside(node,outer));
+ if(statement.type==='IfStatement'){
+  if(statement.alternate||statement.consequent?.type!=='BlockStatement'||statement.consequent.body.length)fail('轮转初始化语句包含业务分支');
+ }else if(statement.type!=='ExpressionStatement')fail('轮转初始化语句不是闭合表达式');
+ if(outside.some(node=>['NewExpression','AwaitExpression','YieldExpression','ThisExpression','Super'].includes(node.type)))fail('轮转初始化语句包含未审查的调用或副作用');
+ for(const node of outside){
+  if(node.type==='CallExpression'){
+   if(!resolveCallable(node.callee,ix,wrappers)||node.arguments.some(arg=>arg.type!=='Literal'&&arg.type!=='TemplateLiteral'))fail('轮转初始化语句包含未审查的调用或副作用');
+   continue;
+  }
+  if(node.type!=='AssignmentExpression')continue;
+  const literal=node.right.type==='Literal'?node.right.value:node.right.type==='TemplateLiteral'&&!node.right.expressions.length?node.right.quasis[0].value.cooked:undefined;
+  const factoryAlias=node.right.type==='Identifier'&&ix.bindings.get(node.right)===ix.bindings.get(tableFactory.id);
+  const decoded=node.right.type==='CallExpression'&&!!resolveCallable(node.right.callee,ix,wrappers)&&node.right.arguments.every(arg=>arg.type==='Literal'||arg.type==='TemplateLiteral');
+  const closed=literal!==undefined&&['string','number','boolean'].includes(typeof literal)||factoryAlias||decoded;
+  if(node.operator!=='='||node.left.type!=='Identifier'||!closed)fail('轮转初始化语句包含未审查的赋值');
+  const binding=ix.bindings.get(node.left);
+  if(!binding||binding.refs.some(ref=>!inside(ref,statement)&&!inside(ref,decoder)&&!inside(ref,tableFactory)))fail('轮转初始化改写了仍被业务读取的变量');
+ }
+}
+function nestedRotationShape(call,ix,tableFactory,decoder){
+ if(call?.type!=='CallExpression'||call.arguments.length!==3)return null;
+ const inner=call.callee;
+ if(!inner||(inner.type!=='FunctionExpression'&&inner.type!=='FunctionDeclaration')||inner.async||inner.generator||inner.params.length!==5||inner.params.some(p=>p.type!=='Identifier'))return null;
+ if(call.arguments[2]?.type!=='FunctionExpression'||call.arguments[2].async||call.arguments[2].generator)return null;
+ const scan=ix.nodes.filter(node=>inside(node,inner));
+ if(!scan.some(node=>node.type==='WhileStatement')||!scan.some(node=>node.type==='TryStatement'))return null;
+ let outer=null;
+ for(let parent=ix.parents.get(call);parent;parent=ix.parents.get(parent)){
+  if(parent.type==='CallExpression'&&functions.has(parent.callee.type)&&inside(call,parent.callee)){outer=parent;break;}
+ }
+ if(!outer||outer===call||outer.callee.params.length!==7||outer.arguments.length!==4)return null;
+ const params=inner.params,args=call.arguments,[x,y,z,w,v]=params;
+ const tableIndex=outer.callee.params.findIndex(param=>sameIdentifier(ix,param,args[0]));
+ const targetIndex=outer.callee.params.findIndex(param=>sameIdentifier(ix,param,args[1]));
+ if(tableIndex<0||targetIndex<0)return null;
+ const factoryArg=outer.arguments[tableIndex],targetArg=outer.arguments[targetIndex];
+ if(factoryArg?.type!=='Identifier'||ix.bindings.get(factoryArg)!==ix.bindings.get(tableFactory.id))fail('嵌套轮转使用的表工厂不是唯一静态来源');
+ let target;
+ try{target=number(targetArg);}catch{fail('嵌套轮转目标不是常量');}
+ if(!Number.isFinite(target))fail('嵌套轮转目标不是常量');
+ const outerBody=outer.callee.body;
+ if(outerBody.type!=='BlockStatement'||outerBody.body.length!==1)fail('嵌套轮转外层不是单一返回');
+ const returned=outerBody.body[0];
+ if(returned.type!=='ReturnStatement'||returned.argument?.type!=='SequenceExpression'||returned.argument.expressions.length!==4)fail('嵌套轮转外层返回结构不匹配');
+ const [shiftStatement,outerF,outerG,innerCall]=returned.argument.expressions;
+ if(innerCall!==call)fail('嵌套轮转外层没有返回内层调用');
+ if(shiftStatement.type!=='AssignmentExpression'||shiftStatement.operator!=='='||!sameIdentifier(ix,shiftStatement.left,outer.callee.params[0])||shiftStatement.right.type!=='BinaryExpression'||shiftStatement.right.operator!=='>>'||!sameIdentifier(ix,shiftStatement.right.left,outer.callee.params[0])||shiftStatement.right.right.type!=='Literal'||!Number.isInteger(shiftStatement.right.right.value))fail('嵌套轮转的起始位移不是常量');
+ if(outerF.type!=='AssignmentExpression'||outerF.operator!=='='||!sameIdentifier(ix,outerF.left,outer.callee.params[5])||outerF.right.type!=='Literal'||outerF.right.value!=='hs')fail('嵌套轮转的方法名初值不匹配');
+ if(outerG.type!=='AssignmentExpression'||outerG.operator!=='='||!sameIdentifier(ix,outerG.left,outer.callee.params[6])||outerG.right.type!=='Literal'||outerG.right.value!=='hs')fail('嵌套轮转的方法名初值不匹配');
+ const initial=number(outer.arguments[0]),start=number(outer.arguments[3]),shift=shiftStatement.right.right.value,a=initial>>shift;
+ if(!Number.isFinite(initial)||!Number.isFinite(start)||!Number.isInteger(shift)||shift<0||shift>31)fail('嵌套轮转的边界参数不是常量');
+ if(start-a!==2)fail('嵌套轮转的起始窗口不是两条哨兵项');
+ const body=inner.body.body;
+ if(body.length!==4||body[0].type!=='VariableDeclaration'||body[0].declarations.length!==1||body[1].type!=='ExpressionStatement'||body[2].type!=='VariableDeclaration'||body[2].declarations.length!==1||body[3].type!=='WhileStatement')fail('嵌套轮转内层结构不匹配');
+ const decoderAlias=body[0].declarations[0];
+ if(decoderAlias.id.type!=='Identifier'||!resolvesTo(decoderAlias.init,ix,ix.bindings.get(decoder.id)))fail('轮转校验和没有指向已审查解码器');
+ const assignments=body[1].expression;
+ if(assignments.type!=='SequenceExpression'||assignments.expressions.length!==7)fail('嵌套轮转的方法名构造不匹配');
+ const [setWord,setShift,setUnit,setPush,resolveShift,resolvePush,clearValidator]=assignments.expressions;
+ if(setWord.type!=='AssignmentExpression'||setWord.operator!=='='||!sameIdentifier(ix,setWord.left,w)||setWord.right.type!=='Literal'||typeof setWord.right.value!=='string')fail('嵌套轮转缺少方法名字面量');
+ if(setShift.type!=='AssignmentExpression'||setShift.operator!=='='||!sameIdentifier(ix,setShift.left,outer.callee.params[5])||setShift.right.type!=='BinaryExpression'||setShift.right.operator!=='+'||!sameIdentifier(ix,setShift.right.left,w)||!sameIdentifier(ix,setShift.right.right,outer.callee.params[5]))fail('嵌套轮转的 shift 方法名不是本地拼接');
+ if(setUnit.type!=='AssignmentExpression'||setUnit.operator!=='='||!sameIdentifier(ix,setUnit.left,v)||setUnit.right.type!=='Literal'||typeof setUnit.right.value!=='string')fail('嵌套轮转缺少 push 方法名字面量');
+ if(setPush.type!=='AssignmentExpression'||setPush.operator!=='+='||!sameIdentifier(ix,setPush.left,outer.callee.params[6])||!sameIdentifier(ix,setPush.right,v))fail('嵌套轮转的 push 方法名不是本地拼接');
+ if(resolveShift.type!=='AssignmentExpression'||resolveShift.operator!=='='||!sameIdentifier(ix,resolveShift.left,outer.callee.params[5])||resolveShift.right.type!=='CallExpression'||!sameIdentifier(ix,resolveShift.right.callee,z)||resolveShift.right.arguments.length!==1||!sameIdentifier(ix,resolveShift.right.arguments[0],outer.callee.params[5]))fail('嵌套轮转没有用反转器解析 shift');
+ if(resolvePush.type!=='AssignmentExpression'||resolvePush.operator!=='='||!sameIdentifier(ix,resolvePush.left,outer.callee.params[6])||resolvePush.right.type!=='CallExpression'||!sameIdentifier(ix,resolvePush.right.callee,z)||resolvePush.right.arguments.length!==1||!sameIdentifier(ix,resolvePush.right.arguments[0],outer.callee.params[6]))fail('嵌套轮转没有用反转器解析 push');
+ if(clearValidator.type!=='AssignmentExpression'||clearValidator.operator!=='='||!sameIdentifier(ix,clearValidator.left,z)||clearValidator.right.type!=='Literal'||clearValidator.right.value!==0)fail('嵌套轮转没有清空反转器绑定');
+ const tableAlias=body[2].declarations[0];
+ if(tableAlias.id.type!=='Identifier'||tableAlias.init.type!=='CallExpression'||tableAlias.init.arguments.length||!sameIdentifier(ix,tableAlias.init.callee,x))fail('嵌套轮转的表实例不是本地工厂调用');
+ const tableBinding=ix.bindings.get(tableAlias.id);
+ if(!tableBinding||tableBinding.writes.length)fail('嵌套轮转的本地字符串表被改写');
+ const loop=body[3];
+ if(loop.test.type!=='LogicalExpression'||loop.test.operator!=='&&'||loop.test.left.type!=='UnaryExpression'||loop.test.left.operator!=='!'||loop.test.left.argument.type!=='UnaryExpression'||loop.test.left.argument.operator!=='!'||loop.test.left.argument.argument.type!=='ArrayExpression'||loop.test.left.argument.argument.elements.length||loop.test.right.type!=='BinaryExpression'||loop.test.right.operator!=='+')fail('嵌套轮转的 while 条件不匹配');
+ const decrement=loop.test.right.left,targetSide=loop.test.right.right;
+ if(decrement.type!=='UpdateExpression'||decrement.operator!=='--'||!decrement.prefix||!sameIdentifier(ix,decrement.argument,outer.callee.params[3])||!sameIdentifier(ix,targetSide,y))fail('嵌套轮转的递减计数不匹配');
+ if(loop.body.type!=='BlockStatement'||loop.body.body.length!==1||loop.body.body[0].type!=='TryStatement')fail('嵌套轮转的循环体不是单一 try');
+ const tried=loop.body.body[0];
+ if(tried.block.body.length!==1||tried.block.body[0].type!=='ExpressionStatement'||tried.block.body[0].expression.type!=='AssignmentExpression'||tried.block.body[0].expression.operator!=='='||!sameIdentifier(ix,tried.block.body[0].expression.left,w))fail('嵌套轮转的校验和表达式不匹配');
+ const checksum=tried.block.body[0].expression.right;
+ if(!tried.handler||tried.handler.body.body.length!==1||tried.handler.body.body[0].type!=='ExpressionStatement'||tried.handler.body.body[0].expression.type!=='AssignmentExpression'||tried.handler.body.body[0].expression.operator!=='='||!sameIdentifier(ix,tried.handler.body.body[0].expression.left,w)||!sameIdentifier(ix,tried.handler.body.body[0].expression.right,z))fail('嵌套轮转的异常兜底不匹配');
+ if(!tried.finalizer||tried.finalizer.body.length!==2)fail('嵌套轮转的 finally 结构不匹配');
+ const [shiftValue,branch]=tried.finalizer.body;
+ if(shiftValue.type!=='ExpressionStatement'||shiftValue.expression.type!=='AssignmentExpression'||shiftValue.expression.operator!=='='||!sameIdentifier(ix,shiftValue.expression.left,v)||shiftValue.expression.right.type!=='CallExpression'||shiftValue.expression.right.arguments.length||shiftValue.expression.right.callee.type!=='MemberExpression'||!sameIdentifier(ix,shiftValue.expression.right.callee.object,tableAlias.id))fail('嵌套轮转没有从本地表取出单个元素');
+ const shiftName=shiftValue.expression.right.callee.property;
+ if(shiftName.type!=='Identifier')fail('嵌套轮转的 shift 方法名不是本地绑定');
+ if(branch.type!=='IfStatement'||branch.test.type!=='BinaryExpression'||branch.test.operator!=='<='||!sameIdentifier(ix,branch.test.left,outer.callee.params[0])||!sameIdentifier(ix,branch.test.right,outer.callee.params[3])||branch.consequent.type!=='ExpressionStatement'||branch.consequent.expression.type!=='ConditionalExpression'||!sameIdentifier(ix,branch.consequent.expression.test,z)||branch.consequent.expression.consequent.type!=='ConditionalExpression'||!sameIdentifier(ix,branch.consequent.expression.consequent.test,outer.callee.params[4])||branch.alternate.type!=='BlockStatement'||branch.alternate.body.length!==1)fail('嵌套轮转的起始窗口分支不匹配');
+ const window=branch.consequent.expression;
+ if(window.consequent.consequent.type!=='AssignmentExpression'||window.consequent.consequent.operator!=='='||!sameIdentifier(ix,window.consequent.consequent.left,w)||!sameIdentifier(ix,window.consequent.consequent.right,v)||window.consequent.alternate.type!=='AssignmentExpression'||window.consequent.alternate.operator!=='='||!sameIdentifier(ix,window.consequent.alternate.left,outer.callee.params[4])||!sameIdentifier(ix,window.consequent.alternate.right,v)||window.alternate.type!=='AssignmentExpression'||window.alternate.operator!=='='||!sameIdentifier(ix,window.alternate.left,z)||!sameIdentifier(ix,window.alternate.right,v))fail('嵌套轮转的前两项缓存不匹配');
+ const marker=branch.alternate.body[0];
+ if(marker.type!=='IfStatement'||marker.test.type!=='BinaryExpression'||marker.test.operator!=='=='||!sameIdentifier(ix,marker.test.left,z)||marker.test.right.type!=='CallExpression'||marker.test.right.arguments.length!==2||marker.test.right.callee.type!=='MemberExpression'||property(marker.test.right.callee)!=='replace'||!sameIdentifier(ix,marker.test.right.callee.object,outer.callee.params[4])||marker.test.right.arguments[1].type!=='Literal'||marker.test.right.arguments[1].value!=='')fail('嵌套轮转的版本自检不匹配');
+ const regexNode=marker.test.right.arguments[0];
+ if(regexNode.type!=='Literal'||!regexNode.regex||regexNode.regex.flags!=='g')fail('嵌套轮转的版本自检正则不唯一');
+ let regex;try{regex=new RegExp(regexNode.regex.pattern,regexNode.regex.flags);}catch{fail('嵌套轮转的版本自检正则无效');}
+ if(marker.consequent.type!=='BlockStatement'||marker.consequent.body.length!==2)fail('嵌套轮转的匹配分支不匹配');
+ const matched=marker.consequent.body[0];
+ if(matched.type!=='IfStatement'||matched.test.type!=='BinaryExpression'||matched.test.operator!=='==='||!sameIdentifier(ix,matched.test.left,w)||!sameIdentifier(ix,matched.test.right,y)||matched.consequent.type!=='BlockStatement'||matched.consequent.body.length!==2)fail('嵌套轮转没有用数值校验和终止');
+ const unshift=matched.consequent.body[0];
+ if(unshift.type!=='ExpressionStatement'||unshift.expression.type!=='CallExpression'||unshift.expression.arguments.length!==1||!sameIdentifier(ix,unshift.expression.arguments[0],v)||unshift.expression.callee.type!=='MemberExpression'||!sameIdentifier(ix,unshift.expression.callee.object,tableAlias.id)||unshift.expression.callee.property.type!=='BinaryExpression'||unshift.expression.callee.property.operator!=='+'||unshift.expression.callee.property.left.type!=='Literal'||unshift.expression.callee.property.left.value!=='un'||!sameIdentifier(ix,unshift.expression.callee.property.right,shiftName))fail('嵌套轮转的匹配分支没有恢复单个元素');
+ if(matched.consequent.body[1].type!=='BreakStatement'||matched.consequent.body[1].label)fail('嵌套轮转的匹配分支没有唯一终止');
+ const pushed=marker.consequent.body[1];
+ if(pushed.type!=='ExpressionStatement'||pushed.expression.type!=='CallExpression'||pushed.expression.arguments.length!==1||!sameIdentifier(ix,pushed.expression.arguments[0],v)||pushed.expression.callee.type!=='MemberExpression'||!sameIdentifier(ix,pushed.expression.callee.object,tableAlias.id)||pushed.expression.callee.property.type!=='Identifier')fail('嵌套轮转的未匹配分支没有回填本地表');
+ const shiftMethod=validatorString(call.arguments[2],[setWord.right.value+'hs'],ix),pushMethod=validatorString(call.arguments[2],['hs'+setUnit.right.value],ix);
+ if(shiftMethod!=='shift'||pushMethod!=='push'||!sameIdentifier(ix,shiftName,outer.callee.params[5])||!sameIdentifier(ix,pushed.expression.callee.property,outer.callee.params[6]))fail('嵌套轮转的方法名没有经过已审查的反转器');
+ const allowedObjects=new Set([shiftValue.expression.right.callee.object,unshift.expression.callee.object,pushed.expression.callee.object]);
+ if(tableBinding.refs.some(ref=>!allowedObjects.has(ref)))fail('嵌套轮转只允许操作本地表');
+ const tree=ix.nodes[0];
+ const statement=topStatement(outer,ix.parents,tree);
+ rotationStatementShape(statement,outer,ix,decoder,tableFactory,decoderWrappers(ix,decoder));
+ const factoryBinding=ix.bindings.get(tableFactory.id);
+ if(factoryBinding.refs.some(ref=>!inside(ref,tableFactory)&&!inside(ref,decoder)&&!inside(ref,statement)))fail('字符串表工厂在轮转初始化之外仍被引用');
+ return {call,inner,outer,statement,checksum,target,regex,factoryArg};
+}
 function collect(source,variant,only){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),{nodes,parents,bindings}=ix;
  const decoderHash=variant==='ks'?KS_DECODER:PDD_DECODER;
@@ -534,15 +679,29 @@ function collect(source,variant,only){
   const inner=assignment?.type==='AssignmentExpression'?assignment.right:null,sub=inner?.type==='FunctionExpression'?inner.body.body[0]?.expression:null;
   if(sub?.type!=='AssignmentExpression'||sub.operator!=='='||sub.right.type!=='BinaryExpression'||sub.right.operator!=='-'||sub.right.left.type!=='Identifier')fail('解码器索引没有固定偏移');
   offset=number(sub.right.right);if(!Number.isInteger(offset))fail('解码器偏移不是常量');
-  const matches=nodes.filter(n=>n.type==='CallExpression'&&functions.has(n.callee.type)&&(methodContract(n.callee,new Set([decoder.id.name,tableFactory.id.name]))===KS_ROTATION||cachedRotationShape(n,ix,tableBinding)));
-  if(matches.length!==1)fail('字符串表轮转语法数量不唯一');
-  rotationCall=matches[0];rotationFn=rotationCall.callee;
-  if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
-  rotationStatement=topStatement(rotationCall,parents,tree);
+  const roles=new Set([decoder.id.name,tableFactory.id.name]);
+  const direct=nodes.filter(n=>n.type==='CallExpression'&&functions.has(n.callee.type)&&(methodContract(n.callee,roles)===KS_ROTATION||cachedRotationShape(n,ix,tableBinding)));
+  const nested=[];
+  for(const node of nodes){
+   if(node.type!=='CallExpression'||!functions.has(node.callee.type)||node.arguments.length!==3||node.arguments[2]?.type!=='FunctionExpression')continue;
+   const shape=nestedRotationShape(node,ix,tableFactory,decoder);
+   if(shape)nested.push(shape);
+  }
+  if(direct.length+nested.length!==1)fail('字符串表轮转语法数量不唯一');
   alphabet=decoderAlphabet(decoder);
   // 共用同一表工厂的同形外壳（如 a0d 与 a0e）共享偏移与表，按解码器身份求值
   shells=new Set(nodes.filter(n=>n!==decoder&&functions.has(n.type)&&!n.async&&!n.generator&&cachedDecoderShape(n,ix)&&tableFactoryName(n,ix)===tableFactory?.id?.name));
-  rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells);
+  if(nested.length){
+   const shape=nested[0];
+   rotationCall=shape.call;rotationFn=shape.inner;rotationStatement=shape.statement;
+   const rotated=rotateNested(shape,values,decoder,offset,ix,alphabet,shells);
+   values=rotated.values;rotationSteps=rotated.steps;
+  }else{
+   rotationCall=direct[0];rotationFn=rotationCall.callee;
+   if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
+   rotationStatement=topStatement(rotationCall,parents,tree);
+   rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells);
+  }
  }else{
   if(!source.includes('jsjiami.com.v6'))fail('缺少 jsjiami v6 哨兵');
   const d=decoder.body.body.find(n=>n.type==='VariableDeclaration'&&n.declarations.some(x=>x.id.name==='_0x20ec07'))?.declarations.find(x=>x.id.name==='_0x20ec07');
@@ -560,6 +719,13 @@ function collect(source,variant,only){
  }
  if(values.length<3||values.length>LIMIT||values.some(v=>typeof v!=='string')||values.reduce((n,v)=>n+v.length,0)>1048576)fail('字符串表为空或超过静态边界');
  return {tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationCall,rotationFn,rotationStatement,rotationSteps,variant,alphabet,shells};
+}
+
+// 只读诊断入口：验证嵌套 IIFE 轮转的结构与数值校验和，不展开业务调用，
+// 也不检查自防御壳契约。用于定向回归，不改变正常转换路径的拒收条件。
+export function inspectNestedRotation(source,only){
+ const data=collect(source,'ks',only);
+ return {factory:data.tableFactory?.id?.name??null,values:data.values,steps:data.rotationSteps};
 }
 
 function literalArray(array,ix,source){
@@ -694,6 +860,30 @@ function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
   values.push(values.shift());
  }
  fail('js-obfuscator 轮转校验在一轮内没有匹配');
+}
+
+// 嵌套 IIFE 轮转按原循环语义先去表头两条哨兵，再在密文项上逐轮左移并复算
+// 校验和。结构判据已证明循环只有这一条终止路径；这里仍要求数值匹配唯一。
+function rotateNested(shape,values,decoder,offset,ix,alphabet,shells){
+ const version=values[0],marker=values[1];
+ if(typeof version!=='string'||!/^jsjiami\.(?:com|cn)\.v7$/.test(version))fail('字符串表版本哨兵不匹配');
+ if(typeof marker!=='string'||marker.replace(shape.regex,'')!==version)fail('字符串表版本自检不匹配');
+ const cipher=values.slice(2);
+ if(cipher.length<1)fail('字符串表轮转没有可证明的密文项');
+ const wrappers=decoderWrappers(ix,decoder);
+ if(shells)for(const shell of shells)wrappers.add(shell);
+ const matches=[];
+ for(let r=0;r<cipher.length;r++){
+  const rotated=cipher.slice(r).concat(cipher.slice(0,r));
+  try{
+   const value=evaluate(shape.checksum,new Map(),{ix,values:rotated,offset,decoder,wrappers,variant:'ks',alphabet,shells});
+   if(value===shape.target)matches.push(r);
+  }catch{}
+ }
+ if(!matches.length)fail('js-obfuscator 轮转校验在一轮内没有匹配');
+ if(matches.length!==1)fail('轮转校验和存在多个静态匹配，结果不唯一');
+ const steps=matches[0];
+ return {values:cipher.slice(steps).concat(cipher.slice(0,steps)),steps};
 }
 
 function rotatePdd(fn,values,ix,source){
