@@ -327,6 +327,28 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   });
   return calls.length?calls:null;
  }
+ // 只有回调形参本身及其所有调用点都闭合时，才允许把响应快照原样转交。
+ // 形参不得逃逸；每次传参都必须是可追溯的本地函数或默认函数。
+ function closedCallbackParameter(n){
+  if(n?.type!=='Identifier')return false;
+  const binding=bindings.get(n);
+  if(!binding||binding.writes.length||!binding.refs.length)return false;
+  if(!binding.refs.every(ref=>{const p=parents.get(ref);return p?.type==='CallExpression'&&p.callee===ref;}))
+   return false;
+  const formals=nodes.filter(fn=>functions.has(fn.type)&&fn.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
+  if(formals.length!==1)return false;
+  const fn=formals[0],position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding);
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fb=id?.type==='Identifier'?bindings.get(id):null;
+  let calls;
+  if(parent?.type==='MethodDefinition')calls=closedMethodCalls(parent);
+  else if(fb&&!fb.writes.length)calls=fb.refs.map(ref=>parents.get(ref));
+  else return false;
+  if(!calls?.length||calls.some((call,i)=>call?.type!=='CallExpression'||call.optional||call.arguments.some(a=>a.type==='SpreadElement')||parent?.type!=='MethodDefinition'&&call.callee!==fb.refs[i]))return false;
+  return calls.every(call=>{
+   const parameter=fn.params[position],actual=call.arguments[position]??(parameter?.type==='AssignmentPattern'?parameter.right:null);
+   return !!actual&&!!target(actual);
+  });
+ }
  const compressionNames={ungzip:'gunzip'};
  function compressionMethod(n,seen=new Set()){
   if(n?.type==='MemberExpression'&&free(n.object,'$utils'))return compressionNames[property(n)]??null;
@@ -1441,7 +1463,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     let snapshot=false;
     for(const ref of binding.refs){const parent=parents.get(ref),use=parents.get(parent);if(parent?.type==='MemberExpression'&&parent.object===ref){const name=property(parent),assigned=use?.type==='AssignmentExpression'&&use.left===parent&&use.operator==='=';const prototypeKey=['__proto__','constructor','prototype','toString','toLocaleString','valueOf','hasOwnProperty','isPrototypeOf','propertyIsEnumerable','__defineGetter__','__defineSetter__','__lookupGetter__','__lookupSetter__'].includes(name);if(!['status','statusCode','headers','body'].includes(name)&&(!assigned||prototypeKey))fail(parent,'未知 HTTP 回调响应字段');if(name==='body'||assigned||use?.operator==='delete')snapshot=true;}
      else if(parent?.type==='TemplateLiteral')snapshot=true;
-     else if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){const safeStringify=parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify';if(!target(parent.callee)&&!safeStringify&&!promiseResolver(parent.callee))fail(ref,'HTTP 回调响应对象传入了未知函数：'+source.slice(parent.start,parent.end).slice(0,160));snapshot=true;}}
+     else if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){const safeStringify=parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify';if(!target(parent.callee)&&!closedCallbackParameter(parent.callee)&&!safeStringify&&!promiseResolver(parent.callee))fail(ref,'HTTP 回调响应对象传入了未知函数：'+source.slice(parent.start,parent.end).slice(0,160));snapshot=true;}}
     httpReplies.set(binding,{uses:new Set(),body:null,bytes:null,full:h.full,snapshot});
    }
   }
