@@ -104,6 +104,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   }
   if(n.type==='Identifier'&&ix.reference(n)&&targets(n).some(fn=>done.has(fn)||asyncAdded.has(fn))){
    const p=parents.get(n);
+   if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
    if(p?.type==='CallExpression'&&p.callee===n||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n)continue;
    if(p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee)))continue;
    if(p?.type==='CallExpression'&&closedCallback(p,n))continue;

@@ -250,3 +250,11 @@ return saved == null ? fallback() : finish();
 9. 目标条件调用回调且条件不可证。
 
 因此本轮内联完成函数族保持原拒绝边界；不把“换角度可证明”写成已完成能力。
+
+## 第十四轮：HTTP 响应包装器后的复验（2026-11-11）
+
+本轮为 `ins.js` 与两个内容相同的 `mxy.js` 增加了通用“完整 HTTP 响应包装记录”判据：响应只能写入局部记录的 `response` 键，记录只能经封闭转发函数交给同一 Promise resolver，`response` 读取只能是真值观察或已投影的 `status / statusCode / headers`。同时把完成函数的 `typeof` 存在性检查与真实回调逃逸分开。
+
+判据落地后，`ins.js` 和三平台 `mxy.js` 的首阻塞均推进到同一条 `内联完成函数传给未知回调`：完成所在函数是 `wrap(function(...){ ... }, ...)` 的 regenerator 状态机正文。让状态机正文成为普通回调仍缺少本文件前文列出的 CFG、保存槽、恰好一次、异常/`finally` 和外部驱动证明；因此本轮没有放行 `.wrap`，目标脚本也没有产生可 compare 的成功转换。
+
+保持拒绝的双向回归位于 `tests/test_http_callback_records.py`：封闭包装器的直接 resolver、转发函数和对象字面量可转换并 compare passed；读取 `response.body`、未知字段、建立别名或把包装记录交给未知函数仍拒绝。

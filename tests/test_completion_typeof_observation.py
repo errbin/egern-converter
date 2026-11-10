@@ -9,6 +9,17 @@ URL = 'https://example.test/typeof-completion.js'
 
 
 class CompletionTypeofObservationTests(unittest.TestCase):
+    def test_typeof_guard_does_not_escape_a_completion_function(self):
+        source="function finish(value){$done(value)}if(typeof finish==='function')finish({body:'ok'});"
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        result=compare(source,output,'loon',URL,{'name':'typeof completion call','request':{'url':URL}})
+        self.assertEqual(result['status'],'passed',result)
+
+    def test_unknown_use_of_a_typeof_observed_completion_function_still_rejects(self):
+        source="function finish(value){$done(value)}if(typeof finish==='function')unknown(finish);finish({body:'ok'});"
+        with self.assertRaises(ConversionError):
+            convert_script(source,'Fixture',URL,'',source_format='loon')
+
     def test_typeof_guard_does_not_escape_a_closed_completion_object(self):
         source = '''const value = {body: 'changed'};
 if (typeof value === 'object') $done(value);'''

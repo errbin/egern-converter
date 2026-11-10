@@ -705,6 +705,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='Identifier'&&ix.reference(n)&&complete.has(target(n))){
    const p=parents.get(n);
+   if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
    const direct=p?.type==='CallExpression'&&p.callee===n;
    const alias=p?.type==='VariableDeclarator'&&p.init===n;
    const callback=p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch'].includes(property(p.callee))||p?.type==='CallExpression'&&(clientMethod(p.callee)&&p.arguments[1]===n||closedCompletionCallback(p,n));
@@ -1813,11 +1814,118 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const projected=new Map([...origin].map(([k,value])=>{if(origin.runtimeRequest){if(origin.optional?.has(k))optionalHTTPFields.add(value);return [k,value];}const node={type:'Identifier',name:'httpField',start:input.start,end:input.end};fieldValues.set(node,value);if(origin.optional?.has(k))optionalHTTPFields.add(node);generated.set(node,`${render(input)}[${JSON.stringify(k)}]`);return [k,node];}));
   projected.runtimeRequest=origin.runtimeRequest?{...origin.runtimeRequest,expression:input}:undefined;return projected;
  }
+ // 回调可能把完整响应放进局部包装记录的 response 键，再由封闭 Promise
+ // 执行器解析。只有该记录不再外传、且 response 键只做真值/存在性观察或读取
+ // 已投影的 status / statusCode / headers 时才成立；其他字段仍拒绝。
+ function isPromiseResolver(ref){
+  if(ref?.type!=='Identifier')return false;
+  const resolver=bindings.get(ref);
+  if(!resolver||resolver.writes.length||!resolver.refs.length)return false;
+  const executor=nodes.find(fn=>functions.has(fn.type)&&bindings.get(fn.params[0])===resolver);
+  const construction=parents.get(executor);
+  return !!executor&&!executor.async&&!executor.generator&&construction?.type==='NewExpression'&&free(construction.callee,'Promise')&&construction.arguments[0]===executor;
+ }
+ function forwardsToResolver(call,value,seen=new Set(),substitutions=new Map()){
+  if(!call||call.type!=='CallExpression'||call.optional||call.arguments.some(a=>a.type==='SpreadElement'))return false;
+  const actual=node=>{
+   if(node?.type!=='Identifier')return node;
+   const binding=bindings.get(node),replacement=binding&&substitutions.get(binding);
+   return replacement&&replacement!==node?actual(replacement):node;
+  };
+  const resolvedValue=actual(value),positions=call.arguments.map((arg,i)=>actual(arg)===resolvedValue?i:-1).filter(i=>i>=0);
+  if(positions.length!==1)return false;
+  const callee=actual(call.callee);
+  if(isPromiseResolver(callee))return call.arguments.length===1;
+  const fn=target(callee);
+  if(!fn||fn.async||fn.generator||seen.has(fn))return false;
+  const next=new Set(seen);next.add(fn);
+  const statements=fn.body?.type==='BlockStatement'?fn.body.body:null;
+  if(statements?.length!==1||statements[0].type!=='ReturnStatement'||statements[0].argument?.type!=='CallExpression')return false;
+  const parameter=fn.params[positions[0]];
+  if(parameter?.type!=='Identifier')return false;
+  const binding=bindings.get(parameter);
+  if(!binding||binding.writes.length)return false;
+  const returned=statements[0].argument,uses=returned.arguments.filter(arg=>arg.type==='Identifier'&&bindings.get(arg)===binding);
+  if(uses.length!==1||binding.refs.length!==1||binding.refs[0]!==uses[0])return false;
+  const mapped=new Map(substitutions);
+  fn.params.forEach((formal,index)=>{
+   if(formal.type!=='Identifier')return;
+   const targetBinding=bindings.get(formal);
+   if(targetBinding&&call.arguments[index])mapped.set(targetBinding,actual(call.arguments[index]));
+  });
+  return forwardsToResolver(returned,uses[0],next,mapped);
+ }
+ function closedResponseRecord(record){
+  if(record?.type==='ObjectExpression'){
+   const call=parents.get(record);
+   return call?.type==='CallExpression'&&forwardsToResolver(call,record)?record:null;
+  }
+  if(record?.type!=='Identifier')return null;
+  const binding=bindings.get(record);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  let responseWrites=0;
+  for(const ref of binding.refs){
+   const parent=parents.get(ref),use=parents.get(parent);
+   if(parent?.type==='MemberExpression'&&parent.object===ref){
+    const name=property(parent);
+    if(name===undefined||parent.computed&&parent.property.type!=='Literal')return null;
+    if(use?.type!=='AssignmentExpression'||use.left!==parent||use.operator!=='=')return null;
+    if(name==='response')responseWrites++;
+    continue;
+   }
+   if(parent?.type==='CallExpression'&&forwardsToResolver(parent,ref))continue;
+   return null;
+  }
+  return responseWrites===1?record:null;
+ }
+ function responseReadObserved(node){
+  for(let current=node;;){
+   const parent=parents.get(current);
+   if(parent?.type==='MemberExpression'&&parent.object===current){
+    return ['status','statusCode','headers'].includes(property(parent));
+   }
+   if(parent?.type==='SequenceExpression'&&parent.expressions.includes(current)){
+    if(parent.expressions.at(-1)!==current)return true;
+    current=parent;continue;
+   }
+   if(parent?.type==='ExpressionStatement'&&parent.expression===current)return true;
+   if(parent?.type==='UnaryExpression'&&['!','typeof','void'].includes(parent.operator))return true;
+   if(['IfStatement','WhileStatement','DoWhileStatement'].includes(parent?.type)&&parent.test===current)return true;
+   if(parent?.type==='ConditionalExpression'&&parent.test===current)return true;
+   if(parent?.type==='LogicalExpression'&&parent.left===current)return true;
+   if(parent?.type==='BinaryExpression'&&['==','===','!=','!=='].includes(parent.operator)&&
+      (parent.left===current&&parent.right.type==='Literal'&&parent.right.value===null||parent.right===current&&parent.left.type==='Literal'&&parent.left.value===null))return true;
+   return false;
+  }
+ }
+ let responseReadsProven=null;
+ function closedResponseReads(){
+  if(responseReadsProven!==null)return responseReadsProven;
+  responseReadsProven=nodes.every(node=>{
+   if(node.type!=='MemberExpression'||property(node)!=='response')return true;
+   const parent=parents.get(node);
+   if(parent?.type==='AssignmentExpression'&&parent.left===node)return true;
+   if(parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return true;
+   return responseReadObserved(node);
+  });
+  return responseReadsProven;
+ }
+ const closedResponseUses=new WeakSet();
+ function closedWholeResponseUse(ref){
+  if(closedResponseUses.has(ref))return true;
+  const parent=parents.get(ref);
+  let record=null;
+  if(parent?.type==='AssignmentExpression'&&parent.operator==='='&&parent.right===ref&&parent.left.type==='MemberExpression'&&property(parent.left)==='response')record=parent.left.object;
+  else if(parent?.type==='Property'&&parent.value===ref&&key(parent)==='response')record=parents.get(parent);
+  if(!record||!closedResponseRecord(record)||!closedResponseReads())return false;
+  closedResponseUses.add(ref);return true;
+ }
  function reply(binding,fn=null){
   const refs=binding?.refs??[],uses=new Set();for(const ref of refs){const p=parents.get(ref);
    if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='ObjectPattern'){
     for(const entry of p.id.properties){const name=entry.type==='Property'?key(entry):null;if(!['body','bodyBytes','status','statusCode','headers'].includes(name))fail(entry,'未知 HTTP 响应解构字段');uses.add(name);}continue;
    }
+   if(closedWholeResponseUse(ref))continue;
    if(p?.type!=='MemberExpression'||p.object!==ref)fail(ref,'HTTP 响应整体传递无法静态转换');const k=property(p);if(!['body','bodyBytes','status','statusCode','headers'].includes(k))fail(p,'未知 HTTP 响应字段');uses.add(k);}
   const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
  }
@@ -1834,18 +1942,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const fn=target(n.arguments[1]),p=fn?.params[1];
    if(p?.type==='Identifier'){
     const binding=bindings.get(p),h=http(n.arguments[0],clientMethod(n.callee),false);
-    const promiseResolver=ref=>{
-     if(ref?.type!=='Identifier')return false;
-     const resolver=bindings.get(ref);
-     if(!resolver||resolver.writes.length||!resolver.refs.every(r=>{const call=parents.get(r);return call?.type==='CallExpression'&&call.callee===r;}))return false;
-     const executor=nodes.find(fn=>functions.has(fn.type)&&bindings.get(fn.params[0])===resolver);
-     const construction=parents.get(executor);
-     return !!executor&&!executor.async&&!executor.generator&&construction?.type==='NewExpression'&&free(construction.callee,'Promise')&&construction.arguments[0]===executor;
-    };
     let snapshot=false;
     for(const ref of binding.refs){const parent=parents.get(ref),use=parents.get(parent);if(parent?.type==='MemberExpression'&&parent.object===ref){const name=property(parent),assigned=use?.type==='AssignmentExpression'&&use.left===parent&&use.operator==='=';const prototypeKey=['__proto__','constructor','prototype','toString','toLocaleString','valueOf','hasOwnProperty','isPrototypeOf','propertyIsEnumerable','__defineGetter__','__defineSetter__','__lookupGetter__','__lookupSetter__'].includes(name);if(!['status','statusCode','headers','body'].includes(name)&&(!assigned||prototypeKey))fail(parent,'未知 HTTP 回调响应字段');if(name==='body'||assigned||use?.operator==='delete')snapshot=true;}
      else if(parent?.type==='TemplateLiteral')snapshot=true;
-     else if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){const safeStringify=parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify';if(!target(parent.callee)&&!closedCallbackParameter(parent.callee)&&!safeStringify&&!promiseResolver(parent.callee))fail(ref,'HTTP 回调响应对象传入了未知函数：'+source.slice(parent.start,parent.end).slice(0,160));snapshot=true;}}
+     else if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){const safeStringify=parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify';if(!target(parent.callee)&&!closedCallbackParameter(parent.callee)&&!safeStringify&&!isPromiseResolver(parent.callee))fail(ref,'HTTP 回调响应对象传入了未知函数：'+source.slice(parent.start,parent.end).slice(0,160));snapshot=true;}
+     else if(closedWholeResponseUse(ref))snapshot=true;}
     httpReplies.set(binding,{uses:new Set(),body:null,bytes:null,full:h.full,snapshot});
    }
   }

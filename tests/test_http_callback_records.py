@@ -9,6 +9,31 @@ URL = 'https://example.test/script.js'
 
 
 class HTTPCallbackRecordTests(unittest.TestCase):
+    def test_closed_promise_wrapper_may_observe_an_unused_response_key(self):
+        direct="new Promise(resolve=>{$httpClient.get({url:'https://api.test/'},(error,response,body)=>{if(error)return;const result={};result.response=response;result.body=body;resolve(result);});}).then(result=>{result.response;$done({body:result.body});});"
+        helper="function forward(resolve,value){return resolve(value)}"+direct.replace('resolve(result);','forward(resolve,result);')
+        literal="new Promise(resolve=>{$httpClient.get({url:'https://api.test/'},(error,response,body)=>{if(error)return;resolve({response,body});});}).then(result=>{result.response;$done({body:result.body});});"
+        status=literal.replace('$done({body:result.body});','$done({body:result.response.status+":"+result.body});')
+        for source,expected in [(direct,'payload'),(helper,'payload'),(literal,'payload'),(status,'202:payload')]:
+            with self.subTest(source=source):
+                output=convert_script(source,'Fixture',URL,'',source_format='loon')
+                result=compare(source,output,'loon',URL,{
+                    'name':'closed response wrapper','request':{'url':URL},
+                    'http':[{'url':'https://api.test/','body':'payload','status':202}],
+                    'expected':{'result':{'body':expected}}})
+                self.assertEqual(result['status'],'passed',result)
+
+    def test_wrapped_response_field_reads_and_record_escape_are_rejected(self):
+        prefix="new Promise(resolve=>{$httpClient.get({url:'https://api.test/'},(error,response,body)=>{if(error)return;"
+        for tail in [
+            "const result={};result.response=response;result.body=body;resolve(result);});}).then(result=>{$done({body:result.response.body});});",
+            "const result={};result.response=response;result.body=body;unknown(result);resolve(result);});}).then(result=>{result.response;$done({body:result.body});});",
+            "resolve({response,body});});}).then(result=>{$done({body:unknown(result.response)});});",
+            "resolve({response,body});});}).then(result=>{const alias=result.response;$done({body:result.body});});",
+        ]:
+            with self.subTest(tail=tail),self.assertRaises(ConversionError):
+                convert_script(prefix+tail,'Fixture',URL,'',source_format='loon')
+
     def test_serialization_and_template_logging_keep_the_callback_record(self):
         for value in ['JSON.stringify(r)', '`response: ${r}`']:
             for wrap in [False, True]:
