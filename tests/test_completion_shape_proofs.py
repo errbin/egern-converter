@@ -9,10 +9,12 @@ URL = 'https://example.test/source.js'
 
 
 class CompletionShapeProofTests(unittest.TestCase):
-    def test_guarded_nullable_return_and_promise_resolution_keep_result_shape(self):
+    def test_direct_nullable_return_and_promise_resolution_keep_result_shape(self):
         sources = [
             '''function result(){if($request.url.includes('empty'))return null;return {body:'changed'};}
 const value=result();value?$done(value):$done({});''',
+            '''function result(){if($request.url.includes('empty'))return null;return {body:'changed'};}
+$done(result());''',
             '''async function result(){return {body:'changed'};}
 result().then(value=>$done(value || {body:'fallback'}));''',
         ]
@@ -27,7 +29,9 @@ result().then(value=>$done(value || {body:'fallback'}));''',
 
     def test_unproven_nullable_or_promise_shapes_remain_rejected(self):
         sources = [
-            'function result(){if($request.url)return null;return {body:"changed"}}$done(result());',
+            'function result(){if($request.url)return null;return unknown()}$done(result());',
+            'function result(){if($request.url)return null;return "changed"}$done(result());',
+            'function result(){if($request.url)return null;return {body:"changed"}}const value=result();$done(value);',
             'async function result(){return {body:"changed"}}$done(result());',
             'unknown().then(value=>$done(value));',
             'const obj={then(fn){return {body:"other"}}};(async()=>{$done(await obj.then(value=>({body:"expected"})))})();',

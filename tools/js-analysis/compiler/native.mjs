@@ -871,7 +871,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return `(${context}.response ? {status: ${context}.response.status, headers: ${body} === undefined ? ${context}.response.headers : ${cleanHeaders(context+'.response.headers')}, body: ${body}} : {})`;
   }
   const fields=provenFields??shape(n);for(const k of fields.keys())if(!['url','method','headers','body','bodyBytes','status','response','abort'].includes(k))fail(n,'不支持的完成字段：'+k);
-  if(fields.nullable)fail(n,'完成结果可能为空，不能映射为固定字段');
+  if(fields.nullable){
+   // 被调函数返回 null 时，`$done(value())` 等价于不修改消息；只有所有非空
+   // 返回分支都具备封闭完成形状时才成立。这里只求值一次，其余可空形态仍拒绝。
+   if(reference||!fields.size)fail(n,'完成结果可能为空，不能映射为固定字段');
+   const value=fresh('completionValue');
+   return `((${value}) => ${value} == null ? {} : ${payload(n,false,value,new Map(fields))})(${render(n)})`;
+  }
   if(fields.has('abort')){
    if(fields.size!==1||(fields.abortValues??[fields.get('abort')]).some(v=>resolve(v)?.value!==true))fail(n,'abort 仅支持静态 true');
    return !reference&&n.type==='ObjectExpression'?`${context}.abort()`:`(${reference??render(n)}.abort === undefined ? {} : ${context}.abort())`;
