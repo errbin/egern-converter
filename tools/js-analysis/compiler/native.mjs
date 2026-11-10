@@ -156,13 +156,66 @@ function lowerDirectPlatformForwarders(source){
   const fn=entries[0].value;if(!functions.has(fn.type))return null;
   if(resolved.binding){
    if(writesMember(resolved.binding,name))return null;
-   // 对象只能通过静态成员读取使用；整体逃逸或动态属性都可能改写目标方法。
+   // 对象可以整体传入本地辅助函数，但必须证明该函数只读取参数。
+   // 成员写入、动态属性写入、别名逃逸或未知调用都会让目标方法失去证明。
    for(const ref of resolved.binding.refs){
     const parent=parents.get(ref);
-    if(parent?.type!=='MemberExpression'||parent.object!==ref||property(parent)===undefined)return null;
+    if(parent?.type==='MemberExpression'&&parent.object===ref&&property(parent)!==undefined)continue;
+    if(!readOnlyEscape(ref,new Set()))return null;
    }
   }
   return {fn,binding:resolved.binding,object,name};
+ };
+ const localFunction=callee=>{
+  if(callee.type==='Identifier'){
+   const binding=bindings.get(callee);if(!binding||binding.writes.length)return null;
+   const fn=binding.fn??binding.init;return fn&&functions.has(fn.type)?fn:null;
+  }
+  if(callee.type!=='MemberExpression')return null;
+  const name=property(callee);if(name===undefined)return null;
+  const resolved=resolveObject(callee.object),object=resolved&&closedObject(resolved.object);
+  if(!object)return null;
+  const entries=object.properties.filter(p=>p.type==='Property'&&p.kind==='init'&&String(keyOf(p))===String(name));
+  return entries.length===1&&functions.has(entries[0].value.type)?entries[0].value:null;
+ };
+ const nonCallable=node=>{
+  if(node?.type==='ObjectExpression')return true;
+  if(node?.type!=='Identifier')return false;
+  const binding=bindings.get(node);return !!binding&&!binding.writes.length&&binding.init?.type==='ObjectExpression';
+ };
+ const readOnlyParameter=(parameter,valueIsNonCallable,seen)=>{
+  if(parameter?.type!=='Identifier')return false;
+  const binding=bindings.get(parameter);
+  if(!binding||binding.writes.length||seen.has(binding))return false;
+  const next=new Set(seen);next.add(binding);
+  return binding.refs.every(ref=>{
+   const parent=parents.get(ref),use=parents.get(parent);
+   if(parent?.type==='AssignmentExpression'&&parent.left===ref||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return false;
+   if(parent?.type==='MemberExpression'&&parent.object===ref){
+    if(use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===parent)return false;
+    return true;
+   }
+   // 已知对象字面量不可调用；作为被调值只会先抛错，不会写入原对象。
+   if(parent?.type==='CallExpression'&&parent.callee===ref)return valueIsNonCallable;
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+    if(parent.arguments.filter(arg=>arg===ref).length!==1)return false;
+    const fn=localFunction(parent.callee);
+    if(!fn)return false;
+    const target=fn.params[parent.arguments.indexOf(ref)];
+    return !!target&&readOnlyParameter(target,valueIsNonCallable,next);
+   }
+   if(['BinaryExpression','LogicalExpression','UnaryExpression','ConditionalExpression','IfStatement','TemplateLiteral','SwitchStatement'].includes(parent?.type))return true;
+   return false;
+  });
+ };
+ const readOnlyEscape=(ref,seen)=>{
+  const parent=parents.get(ref);
+  if(parent?.type!=='CallExpression'||!parent.arguments.includes(ref))return false;
+  if(parent.arguments.filter(arg=>arg===ref).length!==1)return false;
+  const fn=localFunction(parent.callee);
+  if(!fn)return false;
+  const parameter=fn.params[parent.arguments.indexOf(ref)];
+  return !!parameter&&readOnlyParameter(parameter,nonCallable(ref),seen);
  };
  const equivalentParameter=(node,fn,position)=>{
   if(node?.type!=='Identifier')return false;

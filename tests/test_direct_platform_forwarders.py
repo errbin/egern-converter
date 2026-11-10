@@ -30,3 +30,22 @@ class DirectPlatformForwarderTests(unittest.TestCase):
         ]:
             with self.subTest(source=source),self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'')
+
+    def test_read_only_object_escape_keeps_the_forwarder_proven(self):
+        self.check(
+            "const h={done:function(f,v){return f(v)},same:function(a,b){return a!==b}};"
+            "h.same(h,{});h.done($done,{body:'ok'});"
+        )
+
+    def test_mutating_or_aliasing_escape_is_rejected(self):
+        for source in [
+            "const h={done:function(f,v){return f(v)},mutate:function(o){o.done=function(){return 1}}};"
+            "h.mutate(h);h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)},mutate:function(o,k){o[k]=function(){return 1}}};"
+            "h.mutate(h,'done');h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};unknown(h);h.done($done,{body:'ok'});",
+            "const h={done:function(f,v){return f(v)}};Object.assign(h,{done:function(){return 1}});"
+            "h.done($done,{body:'ok'});",
+        ]:
+            with self.subTest(source=source),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'')
