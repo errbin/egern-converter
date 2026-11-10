@@ -241,6 +241,83 @@ export function initializedAfter(ix,statement,ref){
  }
  return answer;
 }
+
+// 证明类实例方法的全部引用都是已确认闭合接收者上的直接调用：同类内部的
+// `this.name()`，或由 `new` 创建、从未逃逸或改绑的实例上的 `obj.name()`。
+// 这是调用图闭合证明，不是对任意对象方法的近似推断。封闭工厂返回的匿名类只有
+// 在工厂的每个引用都是直接 `new`、每个实例绑定不可变且实例只做静态成员访问时
+// 才成立；动态键、原型访问、别名、条件逃逸或写入都会否决整份证明。
+export function closedMethodCallers(ix,method){
+ const {nodes,parents,bindings,owners}=ix;
+ if(method?.type!=='MethodDefinition'||method.kind!=='method'||method.static||method.computed)return false;
+ const name=key(method);
+ if(typeof name!=='string'||name==='__proto__')return false;
+ const classBody=parents.get(method),classNode=parents.get(classBody);
+ if(!classBody||!classNode||!['ClassDeclaration','ClassExpression'].includes(classNode.type)||classNode.superClass)return false;
+ let ownerBinding=null;
+ if(classNode.id?.name){
+  ownerBinding=bindings.get(classNode.id);
+ }else{
+  const construction=parents.get(classNode);
+  if(construction?.type!=='NewExpression'||construction.callee!==classNode)return false;
+  const returned=parents.get(construction);
+  if(returned?.type!=='ReturnStatement')return false;
+  const factory=parents.get(returned);
+  if(!factory||!functions.has(factory.type))return false;
+  const syntax=parents.get(factory);
+  const id=factory.type==='FunctionDeclaration'?factory.id
+   :syntax?.type==='VariableDeclarator'&&syntax.init===factory&&syntax.id.type==='Identifier'?syntax.id:null;
+  ownerBinding=id?bindings.get(id):null;
+ }
+ if(!ownerBinding||ownerBinding.writes.length||!ownerBinding.refs.length)return false;
+ const constructions=[];
+ for(const ref of ownerBinding.refs){
+  const construction=parents.get(ref);
+  if(construction?.type!=='NewExpression'||construction.callee!==ref)return false;
+  constructions.push(construction);
+ }
+ if(!constructions.length)return false;
+ const instances=new Set();
+ for(const construction of constructions){
+  const declarator=parents.get(construction),declaration=parents.get(declarator);
+  if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1)return false;
+  const instance=bindings.get(declarator.id);
+  if(!instance||!instance.refs.length||instance.writes.length)return false;
+  for(const ref of instance.refs){
+   const member=parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref||member.optional)return false;
+   const field=property(member);
+   if(typeof field!=='string'||['constructor','prototype','__proto__'].includes(field))return false;
+   const use=parents.get(member);
+   if(use?.type==='AssignmentExpression'&&use.left===member){
+    if(use.operator!=='='||field===name)return false;
+    continue;
+   }
+   if(use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')return false;
+  }
+  instances.add(instance);
+ }
+ let calls=0;
+ for(const n of nodes){
+  if(n.type!=='MemberExpression'||property(n)!==name)continue;
+  const use=parents.get(n),direct=use?.type==='CallExpression'&&use.callee===n&&!use.optional;
+  if(n.object.type==='ThisExpression'){
+   let owner=owners.get(n);
+   while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));
+   if(!owner||parents.get(owner)?.type!=='MethodDefinition'||parents.get(parents.get(owner))!==classBody||!direct)return false;
+   calls++;
+   continue;
+  }
+  if(n.object.type==='Identifier'&&instances.has(bindings.get(n.object))){
+   if(!direct)return false;
+   calls++;
+   continue;
+  }
+  return false;
+ }
+ return calls>0;
+}
+
 // A case label only constrains its body when earlier cases cannot fall through.
 export function isolatedSwitchCase(ix,clause){
  const statement=ix.parents.get(clause);if(statement?.type!=='SwitchStatement')return false;

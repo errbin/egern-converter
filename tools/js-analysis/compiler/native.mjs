@@ -6,11 +6,11 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerDirectGlobalPlatformReceivers} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries} from '../analysis/libraries.mjs';
-import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase} from '../core/ast.mjs';
+import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
@@ -27,12 +27,12 @@ function compileNative(source,format,options){
   // embedded libraries. No input body is evaluated during this reduction.
   const functionSource=lowerFunctionConstructorSource(source);
   libraries=protectLibraries(functionSource.source);
-  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),nodeRequest=lowerNodeRequestClient(decoded.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
+  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),scopeThis=lowerSloppyThis(decoded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
-  return {...compile(functionSource.source,format,{...options,device},libraries),native_evaluation:evaluation,
-   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+  return {...compile(functionSource.source,format,{...options,device,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
+   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[]};}
 }
 function normalizeLegacyNumbers(source){
@@ -109,7 +109,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const compressionFallback=lowerCompressionFallbacks(source);
  source=compressionFallback.source;
  libraries.transformations.push(...compressionFallback.transformations);
- const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts});
+ const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper});
  if(report.errors.length)throw Error(report.errors.join('；'));
  const comments=[];
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree);
@@ -122,6 +122,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
  const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),prefix=[],dynamicMethods=new WeakMap();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
+ if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
  const argumentObject=options.argument_object&&nodes.some(n=>free(n,'$argument'))?fresh('scriptArgument'):null;
  if(argumentObject)prefix.push(`const ${argumentObject} = ${context}.env.argument ? JSON.parse(${context}.env.argument) : ${context}.env.argument;`);
@@ -275,6 +276,31 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(index<0)return false;
    const owner=bindings.get(factory.id);return !!owner&&!owner.writes.length&&owner.refs.every(ref=>{const call=parents.get(ref);return call?.type==='NewExpression'&&call.callee===ref&&call.arguments.length<=index;});
   }
+ // 构造器里的 Object.assign(this, options) 只有 options 是每次调用点的静态对象，
+ // 且键不会覆盖类方法时，才不会改变方法解析。参数只允许用于这次复制。
+ function closedConstructorCopy(cls,call){
+  if(call.arguments.length!==2||call.arguments[0].type!=='ThisExpression')return false;
+  const ctor=cls.body.body.find(m=>m.type==='MethodDefinition'&&m.kind==='constructor');
+  const source=call.arguments[1],position=ctor?.value.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===bindings.get(source));
+  if(!ctor||position<0)return false;
+  const sourceBinding=bindings.get(source);
+  if(!sourceBinding||sourceBinding.refs.length!==1||sourceBinding.refs[0]!==source)return false;
+  const returned=parents.get(cls);
+  if(returned?.type!=='NewExpression'||returned.callee!==cls||parents.get(returned)?.type!=='ReturnStatement')return false;
+  const factory=parents.get(parents.get(parents.get(returned)));
+  if(!functions.has(factory?.type)||factory.type==='ArrowFunctionExpression'||!factory.id?.name)return false;
+  const owner=bindings.get(factory.id);
+  if(!owner||owner.writes.length||!owner.refs.length)return false;
+  const methods=new Set(cls.body.body.filter(m=>m.type==='MethodDefinition').map(key));
+  return owner.refs.every(ref=>{
+   const construction=parents.get(ref);
+   if(construction?.type!=='NewExpression'||construction.callee!==ref)return false;
+   let actual=construction.arguments[position];
+   if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void')actual=ctor.value.params[position]?.type==='AssignmentPattern'?ctor.value.params[position].right:null;
+   if(!actual||actual.type==='Literal'&&actual.value===null)return true;
+   return actual.type==='ObjectExpression'&&actual.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.method&&!p.computed&&typeof key(p)==='string'&&key(p)!=='__proto__'&&!methods.has(key(p)));
+  });
+ }
   return nodes.filter(n=>n.type==='ThisExpression'&&classOf(n)===cls).every(r=>{
    const p=parents.get(r);
    if(p?.type==='MemberExpression'&&p.object===r&&property(p)!==undefined)return true;
@@ -284,7 +310,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     return !!binding&&!binding.writes.length&&binding.refs.every(ref=>{const use=parents.get(ref);return use?.type==='AssignmentExpression'&&use.operator==='='&&use.right===ref&&use.left.type==='MemberExpression'&&use.left.object.type==='ThisExpression'&&property(use.left)!==undefined;});
    }
    if(p?.type==='CallExpression'&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&['call','apply'].includes(property(p.callee))&&resolve(p.callee.object).type==='Identifier')return true;
-   return p?.type==='CallExpression'&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&property(p.callee)==='assign'&&omittedConstructorParameter(p.arguments[1]);
+   return p?.type==='CallExpression'&&p.arguments[0]===r&&p.callee.type==='MemberExpression'&&free(p.callee.object,'Object')&&property(p.callee)==='assign'&&(omittedConstructorParameter(p.arguments[1])||closedConstructorCopy(cls,p));
   });
  }
  function closedMethodCalls(method){
@@ -432,7 +458,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(functions.has(n.type)&&(complete.has(n)||lifted.has(n))){
    const p=parents.get(n);
    if(p?.type==='MethodDefinition'||p?.type==='Property'){
-    if(!nodes.some(c=>c.type==='CallExpression'&&target(c.callee)===n))fail(n,'完成／压缩方法 '+String(key(p))+' 的调用者未能静态解析，需展开对象／继承类工厂与回调传递；这不是不支持 JavaScript 方法语法');
+    if(!nodes.some(c=>c.type==='CallExpression'&&target(c.callee)===n)&&!closedMethodCallers(ix,n))fail(n,'完成／压缩方法 '+String(key(p))+' 的调用者未能静态解析，需展开对象／继承类工厂与回调传递；这不是不支持 JavaScript 方法语法');
    }
   }
   if(functions.has(n.type)&&lifted.has(n)){
