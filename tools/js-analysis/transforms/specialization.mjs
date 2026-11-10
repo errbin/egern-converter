@@ -237,7 +237,7 @@ export function lowerMessageParameters(source){
 export function lowerClosedMessageObjects(source){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
  const {nodes,parents,bindings,free}=ix;
- const fieldsByKind={$request:new Set(['url','method','headers','body']),$response:new Set(['status','statusCode','headers','body'])};
+ const fieldsByKind={$request:new Set(['url','method','headers','body','bodyBytes']),$response:new Set(['status','statusCode','headers','body','bodyBytes'])};
  const nullish=n=>free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void';
  function target(callee){
   if(functions.has(callee?.type))return callee;
@@ -255,14 +255,25 @@ export function lowerClosedMessageObjects(source){
  function objectLiteral(kind,fields){
   return '{'+[...fields].map(field=>JSON.stringify(field)+': '+(field==='headers'?headerValue(kind):`${kind}[${JSON.stringify(field)}]`)).join(', ')+'}';
  }
- function fieldUse(kind,ref,fields,state){
+ function fieldUse(kind,ref,fields,state,local=false){
   const member=parents.get(ref),key=property(member);if(member?.type!=='MemberExpression'||member.object!==ref||key===undefined||!fieldsByKind[kind].has(String(key)))return null;
   fields.add(String(key));
   const outer=parents.get(member);
-  if(outer?.type==='MemberExpression'&&outer.object===member&&String(key)==='headers')return null;
+  if(outer?.type==='MemberExpression'&&outer.object===member&&String(key)==='headers'){
+   // 投影副本的 headers 是普通对象；只放行静态键的普通读取与就地写入，
+   // 方法调用和动态键仍可能依赖原始 Headers 语义，必须拒绝。
+   if(!local||property(outer)===undefined)return null;
+   const nestedUse=parents.get(outer);
+   if(nestedUse?.type==='CallExpression'&&nestedUse.callee===outer)return null;
+   if(nestedUse?.type==='AssignmentExpression'&&nestedUse.left===outer||nestedUse?.type==='UpdateExpression'||nestedUse?.type==='UnaryExpression'&&nestedUse.operator==='delete')state.write=true;
+   return 'used';
+  }
   if(outer?.type==='CallExpression'&&outer.callee===member)return null;
   const write=outer?.type==='AssignmentExpression'&&outer.left===member&&outer.operator==='='||outer?.type==='UpdateExpression'||outer?.type==='UnaryExpression'&&outer.operator==='delete';
-  if(write&&['status','statusCode'].includes(String(key)))return null;
+  // `statusCode` 是旧平台别名，写回后与 `status` 的同步关系无法证明；
+  // 直接写宿主消息对象也会丢失宿主语义。只有 helper 参数上的普通快照
+  // `status` 字段可以按本地对象语义保留。
+  if(write&&String(key)==='statusCode'||write&&String(key)==='status'&&!local)return null;
   if(write)state.write=true;
   return 'used';
  }
@@ -290,7 +301,13 @@ export function lowerClosedMessageObjects(source){
   for(const ref of binding.refs){
    const parent=parents.get(ref);
    if(parent?.type==='ReturnStatement'&&parent.argument===ref||parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===ref&&parents.get(parent)?.type==='ReturnStatement'){returned=true;continue;}
-   if(!fieldUse(kind,ref,fields,state))return false;
+   // 消息对象可以继续传给另一个已静态定位的 helper；只有该 helper 的对应
+   // 参数也能完成同样的字段封闭证明时才放行，未知 callee 仍然拒绝。
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+    const next=target(parent.callee),parameter=next?.params[parent.arguments.indexOf(ref)];
+    if(next&&parameter?.type==='Identifier'&&proveParameter(next,parameter,kind,fields,state,seen))continue;
+   }
+   if(!fieldUse(kind,ref,fields,state,true))return false;
   }
   return !returned||proveReturnedValue(fn,kind,fields,state,seen);
  }

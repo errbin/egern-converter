@@ -41,11 +41,22 @@ const result=snapshot($response);$done({body:JSON.stringify(result.headers)});''
                 result = compare(source, native, 'qx', URL, case)
                 self.assertEqual(result['status'], 'passed', result)
 
+    def test_local_snapshot_status_write_is_differentially_equivalent(self):
+        source = ('function finish(response){response.status=204;return response}'
+                  "const result=finish($response);$done({status:result.status,body:'ok'});")
+        native = self.convert(source)
+        self.assertNotIn('$response', native)
+        fixture = {'name': 'local status write', 'request': {'url': URL},
+                   'response': {'status': 200, 'headers': {}, 'body': 'original'}}
+        result = compare(source, native, 'qx', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
     def test_unknown_dynamic_method_or_status_mutation_still_rejects(self):
         sources = [
             '''const request=$request; $done({body:request.unknown});''',
             '''const request=$request, key=$argument; $done({body:request[key]});''',
             '''const request=$request; $done({body:request.headers.get('x')});''',
+            '''$response.status=204;$done({body:'x'});''',
             '''function finish(response){response.statusCode=204;return response}
 const result=finish($response);$done({status:result.status});''',
         ]
