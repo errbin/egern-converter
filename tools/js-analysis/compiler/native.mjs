@@ -810,10 +810,48 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(resolved)return resolved;
    }
    if(b.writes.length){
-    if(!structured||b.writes.some(w=>w.type!=='AssignmentExpression'||w.operator!=='='||w.right.type!=='ObjectExpression'))fail(n,'完成结果变量被重新赋值，无法确定字段');
-    const fields=shape(b.init,new Set(seen));
-    for(const w of b.writes)mergeShape(fields,shape(w.right,new Set(seen)),seen);
-    for(const ref of b.refs){const p=parents.get(ref);if(p?.type==='AssignmentExpression'&&p.left===ref&&p.operator==='='||p?.type==='CallExpression'&&isDone(p))continue;fail(ref,'可变完成结果对象逃逸，无法确定字段');}
+    if(!structured)fail(n,'完成结果变量被重新赋值，无法确定字段');
+    // 完成值在 $done 调用点按当时的绑定值取快照；读取点之后的普通赋值不会
+    // 改变已经提交的完成结果。这里只合并读取点之前能静态求形的赋值，同时排除
+    // 提升函数声明可能在读取点前被调用的写入。
+    const hoistedRisk=node=>{
+     let fn=owners.get(node);
+     while(fn&&fn!==owners.get(n)){
+      if(fn.type==='FunctionDeclaration'&&fn.start>n.start)return true;
+      if(fn.type!=='FunctionDeclaration'&&fn.start>n.start)return false;
+      fn=owners.get(fn);
+     }
+     return false;
+    };
+    if([...b.writes,...b.refs].some(ref=>ref.start>=n.start&&hoistedRisk(ref)))fail(n,'完成结果变量被重新赋值，无法确定字段');
+    // 循环可能让读取点之后的写入进入下一轮读取，无法按单次源码顺序排除。
+    const loopTypes=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
+    for(let parent=parents.get(n);parent&&!functions.has(parent.type);parent=parents.get(parent))
+     if(loopTypes.has(parent.type))fail(n,'完成结果变量被重新赋值，无法确定字段');
+    const relevantWrites=b.writes.filter(w=>w.end<=n.start);
+    if(!b.init&&!relevantWrites.length)fail(n,'完成结果形状无法静态确定');
+    const fields=b.init?shape(b.init,new Set(seen)):new Map();
+    for(const w of relevantWrites){
+     if(w.type!=='AssignmentExpression'||w.operator!=='=')fail(n,'完成结果变量被重新赋值，无法确定字段');
+     mergeShape(fields,shape(w.right,new Set(seen)),seen);
+    }
+    if(fields.nullable){
+     if(!completionTruthyGuard(n,b))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     fields.nullable=false;
+    }
+    for(const ref of b.refs){
+     if(ref.start>=n.start)continue;
+     const p=parents.get(ref),a=parents.get(p);
+     // 绑定自身的重新赋值由上面的 relevantWrites 统一求形，不再按逃逸处理。
+     if(p?.type==='AssignmentExpression'&&p.left===ref&&p.operator==='=')continue;
+     if(p?.type==='MemberExpression'&&p.object===ref){
+      if(property(p)===undefined)fail(p,'完成结果包含动态字段');
+      if(a?.type==='UnaryExpression'&&a.operator==='delete'&&a.argument===p)fail(p,'完成结果字段被直接删除，需要先确定完成结果的数据流');
+      if(a?.type==='AssignmentExpression'&&a.left===p)mergeShape(fields,new Map([[property(p),a.right]]),seen);
+     }else if(p?.type==='IfStatement'&&p.test===ref&&b.refs.some(other=>completionTruthyGuard(other,b)===ref))continue;
+      else if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
+     else if(!(p?.type==='CallExpression'&&isDone(p))&&!(p?.type==='CallExpression'&&target(p.callee)&&complete.has(target(p.callee))))fail(ref,'可变完成结果对象逃逸，无法确定字段');
+    }
     return fields;
    }
    if(b.init){
