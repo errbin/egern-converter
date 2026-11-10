@@ -149,6 +149,18 @@ export function renderTree(source,root,resolve=()=>null){
 // Prove that entering a closed function/reference cannot precede a root
 // initializer. Function expressions exist only after their creation point;
 // hoisted declarations require every incoming reference to be dominated.
+// 同一作用域内重复的 function 声明在实例化时由最后一个覆盖，绑定仍从作用域
+// 入口起可用。只有所有声明都是 hoisted function 时才能沿共同调用点继续证明；
+// 混入变量声明或写入时仍保持未知。
+const hoistedFunctionBindings=new WeakMap();
+function hoistedFunctionBinding(ix,binding){
+ let answer=hoistedFunctionBindings.get(binding);
+ if(answer!==undefined)return answer;
+ const declarations=ix.nodes.filter(n=>(n.type==='FunctionDeclaration'||n.type==='VariableDeclarator')&&ix.bindings.get(n.id)===binding);
+ answer=!!declarations.length&&declarations.every(n=>n.type==='FunctionDeclaration'&&(ix.parents.get(n)?.type==='Program'||ix.parents.get(n)?.type==='BlockStatement'&&functions.has(ix.parents.get(ix.parents.get(n))?.type)));
+ hoistedFunctionBindings.set(binding,answer);
+ return answer;
+}
 export function initializedAfter(ix,statement,ref){
  const {parents,owners,bindings,nodes}=ix,tree=nodes[0];
  function followsInContainingBlock(n){
@@ -162,7 +174,7 @@ export function initializedAfter(ix,statement,ref){
   const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),b=bindings.get(id);
   if(!b||b.writes.length)return null;
   const refs=[...b.refs,...(ix.evaluationReferences?.get(b)??[])];
-  if(!refs.length||ix.functionAndVariableDeclarations.get(b)!==1)return null;
+  if(!refs.length||ix.functionAndVariableDeclarations.get(b)!==1&&!hoistedFunctionBinding(ix,b))return null;
   return refs;
  }
  // Follow the closed call graph with explicit frames. Large bundled scripts
