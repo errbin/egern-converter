@@ -323,6 +323,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
  const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
+ let hostRequestSnapshot=null,hostRequestInitializers=[];
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
  const argumentObject=options.argument_object&&nodes.some(n=>free(n,'$argument'))?fresh('scriptArgument'):null;
@@ -1540,8 +1541,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const options=qx
      ?`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), timeout: ${request}?.timeout === undefined ? 5000 : ${request}.timeout, ...((${policy}) === undefined ? {} : {policy: ${policy}}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] ? 'include' : 'omit', insecureTls: ${request}?.insecure === true}`
      :`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), timeout: ${request}?.timeout === undefined ? 5000 : ${request}.timeout * ${format==='loon'?1:1000}, ...((${policy}) === undefined ? {} : {policy: ${policy}}), ...(${request}?.["policy-descriptor"] === undefined ? {} : {policyDescriptor: ${request}["policy-descriptor"]}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] === false ? 'omit' : 'include', ...(${request}?.insecure === undefined ? {} : {insecureTls: ${request}.insecure})}`;
-    const call=`${callee}(${url}, ${options})`,code=`((${request}) => {if (${request} && typeof ${request} === 'object' && (${request}["binary-mode"] === true || ${request}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');return ${call};})(${render(input)})`;
-    return {code,url,options,callee,dynamic:dynamicMethod,binary:false,full:false};
+    const call=`${callee}(${url}, ${options})`,guard=`if (${request} && typeof ${request} === 'object' && (${request}["binary-mode"] === true || ${request}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');`,code=`((${request}) => {${guard}return ${call};})(${render(input)})`;
+    return {code,url,options,callee,dynamic:dynamicMethod,binary:false,full:false,runtimeRequest:{name:request,expression:input,binaryGuard:true}};
    }
    if(!f)f=object(input,'HTTP 请求');
   }
@@ -2181,6 +2182,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
   }
   if(n.type==='Identifier'&&free(n)){
+   if(n.name==='$request'&&hostRequestSnapshot)return hostRequestSnapshot;
    if(guardedImplicit.has(n.name)){
     const p=parents.get(n);
     if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UnaryExpression'&&p.operator==='typeof')return n.name;
@@ -2198,6 +2200,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='MemberExpression'){
    const k=property(n),o=n.object;
+   if(hostRequestSnapshot&&free(o,'$request')){
+    if(k===undefined)fail(n,'宿主请求字段必须是静态成员');
+    return hostRequestSnapshot+'['+JSON.stringify(k)+']';
+   }
    if(o.type==='MemberExpression'&&free(o.object,'$network')&&['v4','v6'].includes(property(o))){const fields={primaryAddress:'address',primaryInterface:'interface',primaryRouter:'gateway'};if(!fields[k])fail(n,'未知网络地址字段');return `${context}.device.${property(o)==='v4'?'ipv4':'ipv6'}.${fields[k]}`;}
    if(free(o,'$httpClient')){
     const m=clientMethod(n);let alias=n;
@@ -2374,6 +2380,69 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return `{let ${e} = null, ${r} = null, ${b} = null;\ntry {${r} = await ${h.code}; ${b} = ${h.binary?`new Uint8Array(await ${r}.arrayBuffer())`:`await ${r}.text()`};} catch (${caught}) {${e} = String(${caught}.message ?? ${caught}); ${r} = null;}\n${completionGuard?'':'return '}await (${render(n.arguments[1])})(${e}, ${responseValue}, ${b});${completionGuard??''}}`;
  }
+ // 宿主请求只有经过闭合 helper 的静态字段读写时，才降为一次本地快照。快照
+ // 保留字段值而不把可变宿主对象交给业务代码；helper 不得复制、转发或返回
+ // 该对象，返回值被忽略方可接受，字段写入只允许静态普通赋值。
+ const proveHostRequestSnapshot=()=>{
+  const stop=()=>null;
+  const parameterProof=targetBinding=>{
+   if(!targetBinding||targetBinding.writes.length)return stop('parameter binding');
+   const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===targetBinding));
+   if(!fn)return stop('parameter function');
+   const read=new Set(),write=new Set();let returnsRequest=false;
+   for(const ref of targetBinding.refs){
+    const p=parents.get(ref),q=parents.get(p);
+    if(p?.type==='ReturnStatement'&&p.argument===ref){returnsRequest=true;continue;}
+    if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref){
+     const statement=parents.get(p);if(statement?.type==='ReturnStatement'&&statement.argument===p){returnsRequest=true;continue;}
+    }
+    if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return stop('parameter use:'+(p?.type??'none'));
+    const field=String(property(p));
+    if(['__proto__','prototype','constructor'].includes(field))return stop('parameter prototype:'+field);
+    if(q?.type==='MemberExpression'&&q.object===p){
+     if(field!=='headers'||property(q)===undefined||['__proto__','prototype','constructor'].includes(String(property(q))))return stop('nested field:'+field);
+     const use=parents.get(q);
+     if(use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===q)return stop('nested mutation:'+field);
+     read.add(field);continue;
+    }
+    if(q?.type==='AssignmentExpression'&&q.left===p){if(q.operator!=='=')return stop('compound field:'+field);write.add(field);continue;}
+    if(q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete'||q?.type==='CallExpression'&&q.callee===p)return stop('field mutation:'+field);
+    read.add(field);
+   }
+   return {read,write,returnsRequest};
+  };
+  const ignored=call=>{let node=call,parent=parents.get(node);while(parent?.type==='AwaitExpression'||parent?.type==='SequenceExpression'){node=parent;parent=parents.get(node);}return parent?.type==='ExpressionStatement';};
+  const directFields=new Set(['url','method','headers','body','bodyBytes']);
+  const reads=new Set(),whole=[];
+  for(const ref of nodes.filter(n=>n.type==='Identifier'&&free(n,'$request'))){
+   const p=parents.get(ref);
+   if(p?.type==='MemberExpression'&&p.object===ref){
+    const field=property(p);
+    if(field===undefined||!directFields.has(field)||parents.get(p)?.type==='MemberExpression')return stop('direct field:'+(field??'dynamic'));
+    const use=parents.get(p);
+    if(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===p)return stop('direct mutation:'+field);
+    reads.add(field);continue;
+   }
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&!p.arguments.some(a=>a.type==='SpreadElement')){
+    const fn=target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params[position];
+    if(!functions.has(fn?.type)||!parameter)return stop('whole target:'+(fn?.type??'unknown')+'/'+(p.callee?.type??'unknown'));
+    const proof=parameterProof(bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter));
+    if(!proof||proof.returnsRequest&&!ignored(p))return stop('whole proof');
+    for(const field of proof.read)reads.add(field);
+    for(const field of proof.write)if(reads.has(field))reads.add(field);
+    whole.push(ref);continue;
+   }
+   return stop('whole use:'+(p?.type??'none'));
+  }
+  if(!whole.length)return null;
+  return reads;
+ };
+ const hostRequestReads=proveHostRequestSnapshot();
+ if(hostRequestReads){
+  hostRequestSnapshot=fresh('hostRequest');
+  const headers=`(() => {const value = ${context}.request.headers;if (value && typeof value.entries === 'function') {const result = {};for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return {...(value ?? {})};})()`;
+  hostRequestInitializers=[`const ${hostRequestSnapshot} = {${[...hostRequestReads].map(field=>field==='body'?`body: ${readBody('$request','body')}`:field==='bodyBytes'?`bodyBytes: ${readBody('$request','bodyBytes')}`:field==='headers'?`headers: ${headers}`:`${JSON.stringify(field)}: ${context}.request[${JSON.stringify(field)}]`).join(', ')}};`];
+ }
  // Only attribution/legal information joins the generated native usage header.
  // Code-local business comments remain in place for readable source layouts.
  const leadingEnd=tree.body[0]?.start??source.length;
@@ -2392,6 +2461,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(b||options.binary){reads.push(`const ${buffer} = ${msg}?.body == null ? undefined : await ${msg}.arrayBuffer();`);if(b)reads.push(`const ${b} = ${buffer} === undefined ? undefined : ${folded.qx?'':`new Uint8Array(`}${buffer}${folded.qx?'':')'};`);if(a)reads.push(`${declaration} ${a} = ${buffer} === undefined ? undefined : ${options.binary&&!folded.qx?`new Uint8Array(${buffer})`:`new TextDecoder().decode(${buffer})`};`);}
   else reads.push(`${declaration} ${a} = ${msg}?.body == null ? undefined : await ${msg}.text();`);
  }
+ if(hostRequestSnapshot)reads.push(...hostRequestInitializers);
  const guard=options.enabled_env?`if (${context}.env._hub_enabled === 'false') return;\n`:'';
  // Egern scheduled scripts may finish by returning from the default function;
  // HTTP, response, and generic entries still need a proven completion value.

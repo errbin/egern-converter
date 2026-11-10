@@ -53,6 +53,41 @@ options.url+='?from=request';$httpClient.get(options,(e,r,b)=>$done({body:b}))}
 send($request);'''
         self.check(source,'','record.js?from=request')
 
+    def test_host_request_is_snapshotted_before_closed_helper_mutations(self):
+        # 宿主请求整体进入闭合 helper 时先复制为本地快照；helper 的 headers、body
+        # 与本地元数据写入只影响快照，后续请求和完成处理读取同一对象身份。
+        source='''function prepare(request){request.headers={...request.headers,'X-Prepared':'yes'};
+request.body='prepared';request.localMeta='meta';return request}
+async function finish(request,response){response.body=response.body+':'+request.localMeta;return response}
+(async()=>{await prepare($request);const options={url:$request.url,method:'POST',headers:$request.headers,body:$request.body};
+const response=await new Promise((resolve,reject)=>{$httpClient.post(options,(error,reply,body)=>{
+if(error)reject(error);else{reply.body=body;resolve(reply)}})});
+const result=await finish($request,response);$done({body:result.body})})();'''
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        self.assertIn('hostRequest',output)
+        case={'name':'host request helper snapshot','request':{'url':URL,'method':'POST','body':'original',
+                                                               'headers':{'X-Test':'yes'}},
+              'http':[{'url':URL,'body':'reply','status':200}],
+              'expected':{'result':{'body':'reply:meta'},
+                          'events':{'requests':[{'url':URL,'method':'POST',
+                                                 'headers':{'x-prepared':'yes'},'body':'prepared'}]}}}
+        result=compare(source,output,'loon',URL,case)
+        self.assertEqual(result['status'],'passed',result)
+
+    def test_host_request_snapshot_rejects_aliases_escapes_and_dynamic_members(self):
+        # 参数复制、交给未知函数或动态字段都会破坏快照身份与字段闭合性，
+        # 必须保持拒绝。
+        for source in [
+            '''function prepare(request){const copy=request;copy.url+='?x';return copy}
+(async()=>{await prepare($request);$done({})})();''',
+            '''function prepare(request){unknown(request)}
+(async()=>{await prepare($request);$done({})})();''',
+            '''function prepare(request){request[$argument]='x';return request}
+(async()=>{await prepare($request);$done({})})();''',
+        ]:
+            with self.subTest(source=source),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='loon')
+
     def test_live_projection_preserves_request_headers(self):
         # 优先级必须保证 headers 的 ?? 先求值，否则请求会被错误地投影为空头。
         source='''const options={url:'https://example.test/path',headers:{Y:'base'}};
