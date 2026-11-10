@@ -2,6 +2,7 @@ import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,property,functions,key,children} from '../core/ast.mjs';
 import {methodContract} from '../platform/clients.mjs';
 import {evaluationBindings} from './evaluation.mjs';
+import {createHash} from 'node:crypto';
 
 // Decode a reviewed jsjiami RC4 string-table grammar without eval, VM execution,
 // or calling an input function. Only literal data and bounded scalar arithmetic
@@ -370,10 +371,30 @@ export function inspectStringTable(source){
 
 export function lowerStringTables(source){
  if(!source.includes('jsjiami.com.v7'))return {source,transformations:[]};
+ const scan=index(parse(source,options)),classes=new Set(scan.nodes.filter(n=>n.type==='FunctionDeclaration'&&n.id).map(n=>n.id.name));
+ // 前置结构折叠可能已删除解码器，只留下已死的版本哨兵变量；此时旧哈希语法
+ // 已无候选，不能再次按旧路径拒绝验证过的产物。哨兵仍被引用或写成非声明
+ // 字面量时，说明这里可能是未识别的混淆变体，必须继续交给旧路径拒绝。
+ if(!scan.nodes.some(n=>n.type==='FunctionDeclaration'&&methodContract(n,classes)===DECODER)
+  &&onlyDeadVersionSentinel(scan))return {source,transformations:[]};
  const result=inspectStringTable(source);
  if(!SHELLS.has(result.contract))stop('已解码，但自防御壳的语义契约尚未匹配 ('+result.contract+')');
  return {source:result.source,transformations:[{name:'jsjiami RC4 literal string table',shell_contract:result.contract,
   removed:'reviewed debugger/timer/console-suppression shell; business AST retained from source'}]};
+}
+
+// 判定版本号是否只以“声明后从未被引用”的死变量形式残留。
+function onlyDeadVersionSentinel(scan){
+ let seen=false;
+ for(const n of scan.nodes){
+  if(n.type!=='Literal'||n.value!=='jsjiami.com.v7')continue;
+  const parent=scan.parents.get(n);
+  if(parent?.type!=='VariableDeclarator'||parent.init!==n||parent.id.type!=='Identifier')return false;
+  const binding=scan.bindings.get(parent.id);
+  if(!binding||binding.refs.length)return false;
+  seen=true;
+ }
+ return seen;
 }
 
 // Resolve literal lookups from a closed string table. Source functions are
@@ -954,10 +975,155 @@ function decoderAlphabet(decoder){
 const CACHED_SHELL_GLOBALS=new Set(['RegExp','Boolean','Math']);
 const CACHED_SHELL_REGEX_A='\\w+ *\\(\\) *{\\w+ *';
 const CACHED_SHELL_REGEX_B='[\'|"].+[\'|"];? *}';
+// 内联缓存式解码器不创建独立外壳，而是在首次调用时把已审查的 Base64/RC4
+// 助手挂到解码器自身，并用 arguments 缓存结果。助手契约按绑定身份归一化，
+// 忽略变量声明种类和随机局部名，但保留自由全局与属性名；任何算法改动都会失配。
+const INLINE_BASE64_CONTRACT='738116205706704e23b01e396d951e90fb9eb431fe0e33985c71003c8dc8fd6b';
+const INLINE_RC4_CONTRACT='6e69838b4752c5191014a652aaf5c7425b586ddd8d336774e5c6264a8ab7bd2f';
 const insideNode=(node,range)=>!!node&&!!range&&node.start>=range.start&&node.end<=range.end;
 const sameNodeBinding=(ix,left,right)=>left?.type==='Identifier'&&right?.type==='Identifier'&&ix.bindings.get(left)&&ix.bindings.get(left)===ix.bindings.get(right);
 const memberKey=node=>node?.type==='MemberExpression'?property(node):undefined;
 const thisKey=(node,key)=>node?.type==='MemberExpression'&&node.object.type==='ThisExpression'&&memberKey(node)===key;
+const bindingIs=(ix,node,binding)=>node?.type==='Identifier'&&!!binding&&ix.bindings.get(node)===binding;
+function inlineHelperContract(node,helperName){
+ const scoped=index(node),ids=new Map();let next=0;
+ function clean(n){
+  if(!n||typeof n!=='object')return typeof n==='bigint'?String(n)+'n':n;
+  if(Array.isArray(n))return n.map(clean);
+  const out={};
+  for(const [name,value]of Object.entries(n)){
+   if(['start','end','loc','raw'].includes(name))continue;
+   if(name==='kind'&&n.type==='VariableDeclaration'){out[name]='var';continue;}
+   if(name==='name'&&n.type==='Identifier'){
+    const parent=scoped.parents.get(n);
+    const label=parent?.type==='MemberExpression'&&parent.property===n&&!parent.computed
+      ||['Property','MethodDefinition','PropertyDefinition'].includes(parent?.type)&&parent.key===n&&!parent.computed;
+    const binding=label?null:scoped.bindings.get(n);
+    if(binding){if(!ids.has(binding))ids.set(binding,'v'+next++);out[name]=ids.get(binding);}
+    else out[name]=!label&&value===helperName?'$helper':value;
+   }else out[name]=clean(value);
+  }
+  return out;
+ }
+ return createHash('sha256').update(JSON.stringify(clean(node))).digest('hex');
+}
+function inlineHelper(fn,helperName,contract){
+ return fn?.type==='FunctionExpression'&&!fn.async&&!fn.generator&&inlineHelperContract(fn,helperName)===contract;
+}
+function inlineDoubleNotArray(node){
+ return node?.type==='UnaryExpression'&&node.operator==='!'&&node.argument?.type==='UnaryExpression'
+  &&node.argument.operator==='!'&&node.argument.argument?.type==='ArrayExpression'&&!node.argument.argument.elements.length;
+}
+// 证明无独立外壳的解码器仍使用已审查的内联自防御结构：首次调用只安装
+// Base64/RC4 助手、保存 arguments 与哨兵；后续命中缓存直接返回，未命中才解码。
+// 所有赋值目标必须是本地参数、本地绑定或解码器自身；任一角色不符即拒绝整族。
+function proveInlineDecoder(decoder,ix){
+ const bad=why=>fail('内联缓存式解码器自防御结构不匹配：'+why);
+ const body=decoder.body?.body;
+ if(body?.length!==2)bad('外层语句数量');
+ const tableDeclaration=body[0];
+ if(tableDeclaration.type!=='VariableDeclaration'||tableDeclaration.declarations.length!==1)bad('表缓存声明');
+ const tableDeclarator=tableDeclaration.declarations[0];
+ if(tableDeclarator.id.type!=='Identifier'||tableDeclarator.init?.type!=='CallExpression')bad('表缓存调用');
+ const tableBinding=ix.bindings.get(tableDeclarator.id),decoderBinding=ix.bindings.get(decoder.id);
+ if(!tableBinding||!decoderBinding)bad('解码器绑定');
+ const returned=body[1];
+ if(returned.type!=='ReturnStatement'||returned.argument?.type!=='SequenceExpression'||returned.argument.expressions.length!==2)bad('返回序列');
+ const [cacheAssignment,recursiveCall]=returned.argument.expressions;
+ if(cacheAssignment.type!=='AssignmentExpression'||cacheAssignment.operator!=='='||!bindingIs(ix,cacheAssignment.left,decoderBinding))bad('解码器自缓存赋值');
+ const inner=cacheAssignment.right;
+ if(inner?.type!=='FunctionExpression'||inner.async||inner.generator)bad('内层函数');
+ if(recursiveCall.type!=='CallExpression'||!bindingIs(ix,recursiveCall.callee,decoderBinding)||recursiveCall.arguments.length!==2
+  ||!bindingIs(ix,recursiveCall.arguments[0],ix.bindings.get(decoder.params[0]))||!bindingIs(ix,recursiveCall.arguments[1],ix.bindings.get(decoder.params[1])))bad('首次递归调用');
+ const statements=inner.body?.body;
+ if(statements?.length!==5)bad('内层语句数量');
+ const [offset,tableRead,install,cache,result]=statements,param=ix.bindings.get(inner.params[0]),key=ix.bindings.get(inner.params[1]);
+ const cacheObject=ix.bindings.get(decoder.params[0]);
+ if(!param||!key||!cacheObject)bad('内层参数');
+ if(offset.type!=='ExpressionStatement'||offset.expression.type!=='AssignmentExpression'||offset.expression.operator!=='='
+  ||!bindingIs(ix,offset.expression.left,param)||offset.expression.right.type!=='BinaryExpression'||offset.expression.right.operator!=='-'
+  ||!bindingIs(ix,offset.expression.right.left,param)||offset.expression.right.right.type!=='Literal'||!Number.isInteger(offset.expression.right.right.value))bad('索引偏移');
+ if(tableRead.type!=='VariableDeclaration'||tableRead.declarations.length!==1)bad('表读取声明');
+ const tableValue=tableRead.declarations[0];
+ if(tableValue.id.type!=='Identifier'||tableValue.init?.type!=='MemberExpression'||!tableValue.init.computed
+  ||!bindingIs(ix,tableValue.init.object,tableBinding)||!bindingIs(ix,tableValue.init.property,param))bad('表读取来源');
+ const valueBinding=ix.bindings.get(tableValue.id);
+ if(!valueBinding)bad('表值绑定');
+ if(install.type!=='IfStatement'||install.alternate||install.test.type!=='BinaryExpression'||install.test.operator!=='==='||install.test.left.type!=='MemberExpression'
+  ||!bindingIs(ix,install.test.left.object,decoderBinding)||typeof memberKey(install.test.left)!=='string'||!ix.free(install.test.right,'undefined')||install.consequent.type!=='BlockStatement')bad('首次安装分支');
+ const installBody=install.consequent.body;
+ if(installBody.length!==2&&installBody.length!==3)bad('助手安装数量');
+ const base64Declaration=installBody[0];
+ if(base64Declaration.type!=='VariableDeclaration'||base64Declaration.declarations.length!==1||base64Declaration.declarations[0].id.type!=='Identifier')bad('Base64 助手声明');
+ const base64=base64Declaration.declarations[0].init;
+ if(!inlineHelper(base64,null,INLINE_BASE64_CONTRACT))bad('Base64 助手契约');
+ let rc4=null;
+ if(installBody.length===3){
+  const rc4Declaration=installBody[1];
+  if(rc4Declaration.type!=='VariableDeclaration'||rc4Declaration.declarations.length!==1||rc4Declaration.declarations[0].id.type!=='Identifier')bad('RC4 助手声明');
+  rc4=rc4Declaration.declarations[0].init;
+  if(!inlineHelper(rc4,base64Declaration.declarations[0].id.name,INLINE_RC4_CONTRACT))bad('RC4 助手契约');
+ }
+ const installSequence=installBody.at(-1);
+ if(installSequence.type!=='ExpressionStatement'||installSequence.expression.type!=='SequenceExpression'||installSequence.expression.expressions.length!==3)bad('首次安装序列');
+ const [helperAssignment,argumentsAssignment,sentinelAssignment]=installSequence.expression.expressions;
+ if(helperAssignment.type!=='AssignmentExpression'||helperAssignment.operator!=='='||helperAssignment.left.type!=='MemberExpression'
+  ||!bindingIs(ix,helperAssignment.left.object,decoderBinding)||typeof memberKey(helperAssignment.left)!=='string'
+  ||!bindingIs(ix,helperAssignment.right,ix.bindings.get(installBody[installBody.length-2].declarations[0].id)))bad('助手挂载');
+ const decodeKey=memberKey(helperAssignment.left);
+ if(argumentsAssignment.type!=='AssignmentExpression'||argumentsAssignment.operator!=='='||!bindingIs(ix,argumentsAssignment.left,cacheObject)
+  ||!ix.free(argumentsAssignment.right,'arguments'))bad('arguments 缓存别名');
+ if(sentinelAssignment.type!=='AssignmentExpression'||sentinelAssignment.operator!=='='||sentinelAssignment.left.type!=='MemberExpression'
+  ||!bindingIs(ix,sentinelAssignment.left.object,decoderBinding)||typeof memberKey(sentinelAssignment.left)!=='string'
+  ||!inlineDoubleNotArray(sentinelAssignment.right))bad('安装哨兵');
+ const sentinelKey=memberKey(sentinelAssignment.left);
+ if(sentinelKey===decodeKey)bad('安装角色重复');
+ if(cache.type!=='VariableDeclaration'||cache.declarations.length!==3)bad('缓存键声明');
+ const [cacheKey,cacheIndex,cachedValue]=cache.declarations;
+ if(cacheKey.id.type!=='Identifier'||cacheKey.init?.type!=='MemberExpression'||!cacheKey.init.computed
+  ||!bindingIs(ix,cacheKey.init.object,tableBinding)||cacheKey.init.property.type!=='Literal'||cacheKey.init.property.value!==0)bad('缓存键来源');
+ if(cacheIndex.id.type!=='Identifier'||cacheIndex.init?.type!=='BinaryExpression'||cacheIndex.init.operator!=='+'
+  ||!bindingIs(ix,cacheIndex.init.left,param)||!bindingIs(ix,cacheIndex.init.right,ix.bindings.get(cacheKey.id)))bad('缓存索引');
+ if(cachedValue.id.type!=='Identifier'||cachedValue.init?.type!=='MemberExpression'||!cachedValue.init.computed
+  ||!bindingIs(ix,cachedValue.init.object,cacheObject)||!bindingIs(ix,cachedValue.init.property,ix.bindings.get(cacheIndex.id)))bad('缓存读取');
+ if(result.type!=='ReturnStatement'||result.argument?.type!=='SequenceExpression'||result.argument.expressions.length!==2)bad('返回表达式');
+ const selected=result.argument.expressions[0];
+ if(selected.type!=='ConditionalExpression'||selected.test.type!=='UnaryExpression'||selected.test.operator!=='!'
+  ||!bindingIs(ix,selected.test.argument,ix.bindings.get(cachedValue.id)))bad('缓存命中判断');
+ if(selected.alternate.type!=='AssignmentExpression'||selected.alternate.operator!=='='||!bindingIs(ix,selected.alternate.left,valueBinding)
+  ||!bindingIs(ix,selected.alternate.right,ix.bindings.get(cachedValue.id)))bad('缓存命中返回');
+ if(selected.consequent.type!=='SequenceExpression'||selected.consequent.expressions.length!==(rc4?3:2))bad('缓存未命中分支');
+ const decodeExpressions=selected.consequent.expressions;
+ if(rc4){
+  const guard=decodeExpressions[0];
+  if(guard.type!=='LogicalExpression'||guard.operator!=='&&'||guard.left.type!=='BinaryExpression'||guard.left.operator!=='==='
+   ||guard.left.left.type!=='MemberExpression'||!bindingIs(ix,guard.left.left.object,decoderBinding)||typeof memberKey(guard.left.left)!=='string'
+   ||!ix.free(guard.left.right,'undefined')||guard.right.type!=='AssignmentExpression'||guard.right.operator!=='='
+   ||guard.right.left.type!=='MemberExpression'||!bindingIs(ix,guard.right.left.object,decoderBinding)
+   ||memberKey(guard.right.left)!==memberKey(guard.left.left)||memberKey(guard.right.left)===decodeKey
+   ||memberKey(guard.right.left)===sentinelKey
+   ||!inlineDoubleNotArray(guard.right.right))bad('解码哨兵分支');
+ }
+ const decodeAssignment=decodeExpressions[rc4?1:0],writeback=decodeExpressions[rc4?2:1];
+ if(decodeAssignment.type!=='AssignmentExpression'||decodeAssignment.operator!=='='||!bindingIs(ix,decodeAssignment.left,valueBinding)
+  ||decodeAssignment.right.type!=='CallExpression')bad('解码结果赋值');
+ const decodeCall=decodeAssignment.right;
+ if(decodeCall.callee.type!=='MemberExpression'||!bindingIs(ix,decodeCall.callee.object,decoderBinding)||memberKey(decodeCall.callee)!==decodeKey)bad('解码调用');
+ if(rc4){
+  if(decodeCall.arguments.length!==2||!bindingIs(ix,decodeCall.arguments[0],valueBinding)||!bindingIs(ix,decodeCall.arguments[1],key))bad('RC4 解码参数');
+ }else{
+  if(decodeCall.arguments.length!==1||!bindingIs(ix,decodeCall.arguments[0],valueBinding))bad('Base64 解码参数');
+ }
+ if(writeback.type!=='AssignmentExpression'||writeback.operator!=='='||writeback.left.type!=='MemberExpression'||!writeback.left.computed
+  ||!bindingIs(ix,writeback.left.object,cacheObject)||!bindingIs(ix,writeback.left.property,ix.bindings.get(cacheIndex.id))
+  ||!bindingIs(ix,writeback.right,valueBinding))bad('解码缓存回写');
+ if(!bindingIs(ix,result.argument.expressions[1],valueBinding))bad('返回值来源');
+ return {base64:true,rc4:!!rc4};
+}
+function proveInlineDecoderFamily(decoders,ix){
+ for(const decoder of decoders)proveInlineDecoder(decoder,ix);
+ return true;
+}
 function literalSample(fn){
  if(fn?.type!=='FunctionExpression'||fn.async||fn.generator||fn.params.length||fn.body.type!=='BlockStatement'||fn.body.body.length!==1)return false;
  const statement=fn.body.body[0];
@@ -1329,7 +1495,13 @@ function foldObfuscatedTables(source,only){
    mark(shell);mark(child);mark(shellCall);
   }else{
    family=[decoder,...shells].filter(fn=>fn.type==='FunctionDeclaration');
-   if(!proveEmbeddedShellFamily(family,source,ix))fail('js-obfuscator 自防御壳与已审查契约不同');
+   // 同族必须统一：任一解码器带独立外壳时按整族外壳证明；全部不带外壳时
+   // 按内联自防御结构证明。混用两种形态会因数量或角色不符而整体拒绝。
+   if(family.some(fn=>shellSites(fn,ix).length)){
+    if(!proveEmbeddedShellFamily(family,source,ix))fail('js-obfuscator 自防御壳与已审查契约不同');
+   }else if(!proveInlineDecoderFamily(family,ix)){
+    fail('js-obfuscator 自防御壳与已审查契约不同');
+   }
    for(const fn of family)mark(fn);
   }
  }
