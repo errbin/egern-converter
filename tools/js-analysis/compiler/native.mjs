@@ -107,8 +107,8 @@ function compile(original,format,options,libraries){
  }
 }
 // 只内联“本地封闭转发器”：形如 function(f, value){ return f(value); } 的
-// 本地函数/对象属性，调用点把 $done 作为首参传入。必须逐参数证明返回调用
-// 恰好使用同一绑定并按原顺序转发其余实参；否则保持拒绝，不做名称猜测。
+// 本地函数/对象属性，调用点把宿主平台值作为首参传入。必须逐参数证明返回
+// 调用恰好使用同一绑定并按原顺序转发其余实参；否则保持拒绝，不做名称猜测。
 function lowerDirectPlatformForwarders(source){
  let tree,ix;
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
@@ -225,33 +225,39 @@ function lowerDirectPlatformForwarders(source){
   const binding=bindings.get(node);
   return !!binding&&binding===bindings.get(expected)&&!binding.writes.length;
  };
+ // 这些宿主值在直接调用位置都有确定语义。只有转发器被证明恰好执行一次
+ // 直接调用时，才能把值参数还原成同一调用位置的直接调用。
+ const platformValues=new Set(['$done','$notify','setTimeout']);
+ const isPlatformValue=node=>node.type==='Identifier'&&platformValues.has(node.name)&&free(node,node.name);
  const edits=[];
  for(const call of nodes){
   if(call.type!=='CallExpression'||call.optional||call.callee.type==='Super')continue;
   if(call.arguments.some(a=>a.type==='SpreadElement'))continue;
-  const doneIndex=call.arguments.findIndex(a=>a.type==='Identifier'&&free(a,'$done'));
-  if(doneIndex!==0)continue;
-  if(call.arguments.filter(a=>a.type==='Identifier'&&free(a,'$done')).length!==1)continue;
+  const apiIndex=call.arguments.findIndex(isPlatformValue);
+  if(apiIndex!==0)continue;
+  const apis=call.arguments.filter(isPlatformValue);
+  if(apis.length!==1)continue;
+  const api=apis[0].name;
   const target=functionAt(call.callee);if(!target)continue;
   const fn=target.fn;
   if(fn.async||fn.generator||fn.params.length!==call.arguments.length)continue;
-  const doneParam=fn.params[0];if(doneParam.type!=='Identifier')continue;
-  const doneBinding=bindings.get(doneParam);
-  if(!doneBinding||doneBinding.writes.length)continue;
+  const apiParam=fn.params[0];if(apiParam.type!=='Identifier')continue;
+  const apiBinding=bindings.get(apiParam);
+  if(!apiBinding||apiBinding.writes.length)continue;
   const returned=fn.body.type==='BlockStatement'
    ?fn.body.body.length===1&&fn.body.body[0].type==='ReturnStatement'?fn.body.body[0].argument:null
    :fn.body;
   if(returned?.type!=='CallExpression'||returned.optional)continue;
-  if(returned.callee.type!=='Identifier'||bindings.get(returned.callee)!==doneBinding)continue;
-  const refs=doneBinding.refs;
+  if(returned.callee.type!=='Identifier'||bindings.get(returned.callee)!==apiBinding)continue;
+  const refs=apiBinding.refs;
   if(refs.length!==1||refs[0]!==returned.callee)continue;
   const forwarded=call.arguments.slice(1);
   if(returned.arguments.length!==forwarded.length)continue;
   if(!returned.arguments.every((arg,index)=>equivalentParameter(arg,fn,index+1)))continue;
   // 转发器只能做这一次直接调用；出现 this/arguments 或其他语句即拒绝。
   if(nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&(n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n))))continue;
-  const replacement='$done('+forwarded.map(arg=>source.slice(arg.start,arg.end)).join(', ')+')';
-  edits.push({start:call.start,end:call.end,replacement,api:'$done'});
+  const replacement=api+'('+forwarded.map(arg=>source.slice(arg.start,arg.end)).join(', ')+')';
+  edits.push({start:call.start,end:call.end,replacement,api});
  }
  if(!edits.length)return {source,transformations:[]};
  let output=source;

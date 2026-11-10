@@ -37,6 +37,33 @@ class DirectPlatformForwarderTests(unittest.TestCase):
             "h.same(h,{});h.done($done,{body:'ok'});"
         )
 
+    def test_platform_value_forwarders_cover_notify_and_timers(self):
+        notify = "const h={call:function(f,a,b,c,d){return f(a,b,c,d)}};h.call($notify,'t','s','b',{url:'https://example.test/'});$done({body:'ok'});"
+        native = convert_script(notify, 'Fixture', URL, '', source_format='qx')
+        self.assertNotIn('$notify', native)
+        self.assertIn('ctx.notify', native)
+        case = {'name': 'notify forwarder', 'request': {'url': URL},
+                'expected': {'result': {'body': 'ok'}, 'events': {'notifications': [{'title': 't'}]}}}
+        result = compare(notify, native, 'qx', URL, case)
+        self.assertEqual(result['status'], 'passed', result)
+
+        timer = "const h={delay:function(f,cb,ms){return f(cb,ms)}};new Promise(resolve=>h.delay(setTimeout,()=>resolve('ok'),10)).then(v=>$done({body:v}));"
+        for output_format in ['qx', 'surge', 'loon']:
+            with self.subTest(format=output_format):
+                native = convert_script(timer, 'Fixture', URL, '', source_format=output_format)
+                case = {'name': 'timer forwarder', 'request': {'url': URL}, 'event_loop': True,
+                        'expected': {'result': {'body': 'ok'}}}
+                result = compare(timer, native, output_format, URL, case)
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_platform_value_forwarders_still_require_exact_argument_order(self):
+        for source in [
+            "const h={call:function(f,a,b){return f(b,a)}};h.call($notify,'t','s');$done({});",
+            "const h={delay:function(f,cb,ms){return f(ms,cb)}};h.delay(setTimeout,()=>{},10);$done({});",
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '')
+
     def test_mutating_or_aliasing_escape_is_rejected(self):
         for source in [
             "const h={done:function(f,v){return f(v)},mutate:function(o){o.done=function(){return 1}}};"
