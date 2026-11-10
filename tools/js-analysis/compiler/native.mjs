@@ -966,6 +966,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   let returned=a[3]?.type==='CallExpression'?notificationReturnedFields(a[3]):null;
   if(a[3]?.type==='Identifier'){
    const b=bindings.get(a[3]),w=b?.writes[0];
+   if(b&&!b.writes.length&&b.init?.type==='CallExpression'&&owners.get(a[3])===owners.get(b.init)&&b.refs.every(ref=>{
+    if(ref===a[3])return true;
+    const p=parents.get(ref);
+    return p?.type==='CallExpression'&&p.arguments[0]===ref&&p.callee.type==='MemberExpression'&&free(p.callee.object,'JSON')&&property(p.callee)==='stringify'||p?.type==='UnaryExpression'&&p.operator==='typeof';
+   }))returned=notificationReturnedFields(b.init);
    if(b?.writes.length===1&&w.type==='AssignmentExpression'&&w.operator==='='&&w.left.type==='Identifier'&&bindings.get(w.left)===b&&w.right.type==='CallExpression'&&owners.get(w)===owners.get(n)){
     let expression=w;while(parents.get(expression)?.type==='SequenceExpression')expression=parents.get(expression);
     const p=parents.get(expression);let dominated=false;
@@ -1025,7 +1030,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(position<0)return null;
    const callers=callSites(owner);if(!callers)return null;
    const output=[];
-   for(const caller of callers){const records=actualRecords(caller.arguments[position],owners.get(caller),seen);if(!records)return null;output.push(...records);}
+   for(const caller of callers){
+    let argument=caller.arguments[position],parameter=owner.params[position];
+    if((!argument||free(argument,'undefined'))&&parameter.type==='AssignmentPattern')argument=parameter.right;
+    const records=actualRecords(argument,owners.get(caller),seen);if(!records)return null;output.push(...records);
+   }
    return output.length?output:null;
   }
   const inputField=n=>{
