@@ -116,6 +116,34 @@ class CompletionForwarderChainTests(unittest.TestCase):
         self.assertEqual(len(lowered['transformations']), 1, lowered)
         self.check(source)
 
+    def test_identity_wrapper_table_escape_in_a_closed_dead_branch_is_ignored(self):
+        source = ("const A={},flags={enabled:true};"
+                  "function same(left,right){return left===right}"
+                  "A.mark=function(fn){if(same(flags.enabled,true))return fn;else return function(){};};"
+                  "if(flags.enabled===false)unknown(flags);"
+                  "setTimeout(A.mark(()=>$done({body:'ok'})),0);")
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        fixture = {'name': 'dead identity table escape', 'event_loop': True,
+                   'request': {'url': URL}, 'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'loon', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_live_unknown_or_written_identity_table_escapes_remain_rejected(self):
+        prefix = ("const A={},flags={enabled:true};"
+                  "function same(left,right){return left===right}"
+                  "A.mark=function(fn){if(same(flags.enabled,true))return fn;else return function(){};};")
+        suffix = "setTimeout(A.mark(()=>$done({body:'ok'})),0);"
+        for source in [
+            prefix + "if(flags.enabled===true)unknown(flags);" + suffix,
+            prefix + "if($argument==='dead')unknown(flags);" + suffix,
+            ("const A={},flags={enabled:true};flags.enabled=false;"
+             "function same(left,right){return left===right}"
+             "A.mark=function(fn){if(same(flags.enabled,true))return fn;else return function(){};};"
+             "if(flags.enabled===false)unknown(flags);" + suffix),
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')
+
     def test_live_unknown_and_written_forwarder_table_escapes_remain_rejected(self):
         prefix = "const table={forward:function(f,v){return f(v)}};function dispatch(f,v){return table.forward(f,v)}"
         for source in [

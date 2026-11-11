@@ -34,22 +34,39 @@ export function closedIdentityMethodCall(ix,call,arg){
  const same=n=>n?.type==='Identifier'&&bindings.get(n)===parameter;
  const objectBuiltin=n=>n?.type==='MemberExpression'&&free(n.object,'Object')&&['setPrototypeOf','create','defineProperty','getPrototypeOf'].includes(property(n));
  const unknown=Symbol('unknown');
- // 闭合字面量表只能通过静态成员读取；整体传递、写入或删除都会让后续
- // 谓词的求值不再确定，因此返回 null 让调用方保守拒绝。
+ // 闭合字面量表只能通过静态成员读取；整体引用只有在可证死分支里才可忽略，
+ // 成员写入、更新或删除都会让谓词求值不再确定。递归校验同一张表时跳过重复
+ // 扫描，由外层完成一次完整引用检查。
+ const checkingObjects=new Set();
  const closedObject=n=>{
   let object=n;
   if(n?.type==='Identifier'){
    const binding=bindings.get(n);
    if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
-   for(const ref of binding.refs){
-    const use=parents.get(ref);
-    if(use?.type!=='MemberExpression'||use.object!==ref||property(use)===undefined)return null;
-    const parent=parents.get(use);
-    if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return null;
+   if(!checkingObjects.has(binding)){
+    checkingObjects.add(binding);
+    for(const ref of binding.refs){
+     const use=parents.get(ref);
+     if(use?.type==='MemberExpression'&&use.object===ref&&property(use)!==undefined){
+      const parent=parents.get(use);
+      if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete'){checkingObjects.delete(binding);return null;}
+      continue;
+     }
+     if(deadReference(ref))continue;
+     checkingObjects.delete(binding);return null;
+    }
+    checkingObjects.delete(binding);
    }
    object=binding.init;
   }
   return object?.type==='ObjectExpression'?object:null;
+ };
+ const closedProperty=n=>{
+  if(n?.type!=='MemberExpression')return null;
+  const object=closedObject(n.object),name=property(n);
+  if(!object||name===undefined)return null;
+  const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+  return entries.length===1&&entries[0].value.type==='Literal'?{value:entries[0].value.value}:null;
  };
  const closedValue=n=>{
   if(n?.type==='Literal')return n.value;
@@ -59,14 +76,33 @@ export function closedIdentityMethodCall(ix,call,arg){
    if(binding&&!binding.writes.length&&binding.init?.type==='Literal')return binding.init.value;
    return unknown;
   }
-  if(n?.type==='MemberExpression'){
-   const object=closedObject(n.object),name=property(n);
-   if(object&&name!==undefined){
-    const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
-    if(entries.length===1&&entries[0].value.type==='Literal')return entries[0].value.value;
+  if(n?.type==='MemberExpression'){const value=closedProperty(n);if(value)return value.value;}
+  return unknown;
+ };
+ const constantBoolean=n=>{
+  if(!n)return null;
+  if(n.type==='Literal')return typeof n.value==='boolean'?n.value:null;
+  if(n.type==='UnaryExpression'&&n.operator==='!'){const value=constantBoolean(n.argument);return value===null?null:!value;}
+  if(n.type==='BinaryExpression'&&['===','==','!==','!='].includes(n.operator)){
+   const left=closedValue(n.left),right=closedValue(n.right);
+   if(left===unknown||right===unknown)return null;
+   const equal=left===right;
+   return ['===','=='].includes(n.operator)?equal:!equal;
+  }
+  return null;
+ };
+ const deadReference=ref=>{
+  for(let child=ref,parent=parents.get(child);parent;child=parent,parent=parents.get(parent)){
+   if(parent.type==='IfStatement'){
+    if(child===parent.consequent&&constantBoolean(parent.test)===false)return true;
+    if(child===parent.alternate&&constantBoolean(parent.test)===true)return true;
+   }
+   if(parent.type==='ConditionalExpression'){
+    if(child===parent.consequent&&constantBoolean(parent.test)===false)return true;
+    if(child===parent.alternate&&constantBoolean(parent.test)===true)return true;
    }
   }
-  return unknown;
+  return false;
  };
  // 只对“单条 return 比较两个形参”的闭合谓词求值；函数来源必须唯一且
  // 不可重绑，实参必须全部是闭合字面量。
