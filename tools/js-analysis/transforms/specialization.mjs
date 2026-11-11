@@ -1,7 +1,7 @@
 import {pathSetterField} from '../http/requests.mjs';
 import {finiteLiteralMember,ordinaryReceivers,regeneratorStateMachine} from '../analysis/values.mjs';
 import {parse} from '../core/syntax.mjs';
-import {index,patch,renderTree,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
+import {index,patch,renderTree,functions,initializedAfter,property,key,isolatedSwitchCase,children} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
 
 // Specialize immutable primitive parameters only when every call is closed and
@@ -1085,6 +1085,15 @@ export function lowerAsyncRegenerator(source){
   }
   return false;
  };
+ // 日志只作为保序观察保留；console 本身必须没有重绑定、整体逃逸或动态读取，
+ // 否则参数求值仍可能进入未知代码，不能把该调用当作纯观察。
+ const consoleMethods=new Set(['log','warn','error','info','debug']);
+ const badConsole=nodes.filter(n=>free(n,'console')).find(ref=>{
+  const member=parents.get(ref),call=parents.get(member);
+  return !(member?.type==='MemberExpression'&&member.object===ref&&consoleMethods.has(property(member))&&call?.type==='CallExpression'&&call.callee===member);
+ });
+ const closedConsole=!badConsole;
+ const logObservation=n=>n?.type==='CallExpression'&&(free(n.callee,'$log')||closedConsole&&n.callee.type==='MemberExpression'&&free(n.callee.object,'console')&&consoleMethods.has(property(n.callee)));
  for(let index=0;index<proof.machines.length;index++){
   const machine=proof.machines[index],call=wraps[index];
   if(!call||machine.minimal||!machine.proved)continue;
@@ -1104,6 +1113,7 @@ export function lowerAsyncRegenerator(source){
   if(innerNodes.some(n=>n.type==='Identifier'&&n.name==='arguments'&&free(n,'arguments'))){reject('异步状态机正文读取 arguments');continue;}
   const context=inner.params[0],contextBinding=bindings.get(context);
   if(!contextBinding){reject('异步状态机上下文绑定未知');continue;}
+  const mentionsContext=node=>!!node&&(node.type==='Identifier'&&bindings.get(node)===contextBinding||children(node).some(([,child])=>mentionsContext(child)));
   if(contextBinding.refs.some(ref=>ref.start<inner.start||ref.end>inner.end)){reject('异步状态机上下文逃逸出正文');continue;}
   const allowedMembers=new Set(['prev','next','sent','stop','abrupt','catch','t0']);
   let invalid=null;
@@ -1130,8 +1140,11 @@ export function lowerAsyncRegenerator(source){
   for(const n of innerNodes){
    if(n.type!=='ReturnStatement'||owners.get(n)!==inner||!n.argument)continue;
    const argument=n.argument;
-   if(argument.type==='CallExpression'&&argument.callee.type==='MemberExpression'&&bindings.get(argument.callee.object)===contextBinding&&['stop','abrupt','catch'].includes(property(argument.callee)))continue;
    const parts=argument.type==='SequenceExpression'?argument.expressions:[argument];
+   const tail=parts.at(-1);
+   // 终止返回只要求序列尾部是状态机的 stop/abrupt/catch；前缀保持原文执行，
+   // 因此日志或完成副作用仍按原顺序发生，不能丢弃也不能重排。
+   if(tail?.type==='CallExpression'&&tail.callee.type==='MemberExpression'&&bindings.get(tail.callee.object)===contextBinding&&['stop','abrupt','catch'].includes(property(tail.callee)))continue;
    const awaited=parts.at(-1);
    let target=null;
    const prefix=[];
@@ -1142,6 +1155,10 @@ export function lowerAsyncRegenerator(source){
     if(part.type==='AssignmentExpression'&&part.operator==='='&&part.left.type==='MemberExpression'&&bindings.get(part.left.object)===contextBinding&&property(part.left)==='prev'&&part.right.type==='Literal'&&typeof part.right.value==='number'){
      prefix.push(source.slice(part.start,part.end)+';');continue;
     }
+    // 状态上下文之外的普通赋值和日志观察按原顺序保留；任何读取或写入状态
+    // 槽的前缀都拒绝，避免降低后的 next/sent 控制流被原文改写。
+    if(part.type==='AssignmentExpression'&&part.operator==='='&&!mentionsContext(part)){prefix.push(source.slice(part.start,part.end)+';');continue;}
+    if(logObservation(part)){prefix.push(source.slice(part.start,part.end)+';');continue;}
     returnError='异步挂起返回含未知前置表达式：第 '+(source.slice(0,part.start).split('\n').length)+' 行';break;
    }
    if(returnError)break;
@@ -1175,13 +1192,17 @@ export function lowerAsyncRegenerator(source){
   if(generatorEscape){reject(generatorEscape);continue;}
   // t0 是 catch 保存点的专用槽：只允许由匹配 tryLoc 的 ctx.catch 调用赋值，
   // 不允许读出、动态访问或其它来源写入。
-  let t0Assignments=0,t0Error=null;
+  let t0Assignments=0,t0Error=null,t0Assignment=null;
   const catchCall=node=>node?.type==='CallExpression'&&node.callee.type==='MemberExpression'&&bindings.get(node.callee.object)===contextBinding&&property(node.callee)==='catch'&&node.arguments.length===1&&node.arguments[0].type==='Literal'&&node.arguments[0].value===exception.tryLoc;
   for(const n of innerNodes){
    if(n.type!=='MemberExpression'||bindings.get(n.object)!==contextBinding||property(n)!=='t0')continue;
    const parent=parents.get(n);
-   if(parent?.type==='AssignmentExpression'&&parent.left===n&&parent.operator==='='&&catchCall(parent.right)){t0Assignments++;if(t0Assignments>1){t0Error='异步状态机 t0 有多个保存点写入';break;}continue;}
-   t0Error='异步状态机 t0 只允许由 catch 保存点赋值';break;
+   if(parent?.type==='AssignmentExpression'&&parent.left===n&&parent.operator==='='&&catchCall(parent.right)){t0Assignments++;if(t0Assignments>1){t0Error='异步状态机 t0 有多个保存点写入';break;}t0Assignment=parent;continue;}
+   // 保存值只能在同一处理区域内、赋值之后读取；跨 case 或赋值前读取仍拒绝。
+   if(!t0Assignment||n.start<=t0Assignment.end){t0Error='异步状态机 t0 只允许由 catch 保存点赋值';break;}
+   let clause=n;while(clause&&clause.type!=='SwitchCase')clause=parents.get(clause);
+   let savedClause=t0Assignment;while(savedClause&&savedClause.type!=='SwitchCase')savedClause=parents.get(savedClause);
+   if(!clause||clause!==savedClause){t0Error='异步状态机 t0 读取必须位于同一保存处理区域';break;}
   }
   if(t0Error){reject(t0Error);continue;}
   // catch 区域只允许状态控制与完成；业务调用、对象写入、抛出和挂起都拒绝。
@@ -1196,11 +1217,14 @@ export function lowerAsyncRegenerator(source){
   }
   if(t0Error){reject(t0Error);continue;}
   let handlerCompletions=0,handlerError=null;
+  const insideObservation=(n,clause)=>{for(let p=parents.get(n);p;p=parents.get(p)){if(p.type==='SwitchCase'||p.start<clause.start)break;if(p.type==='CallExpression'&&logObservation(p))return true;}return false;};
   for(const clause of handlerClauses){
    for(const n of innerNodes){
     if(n.start<clause.start||n.end>clause.end)continue;
     if(n.type==='CallExpression'){
+     if(insideObservation(n,clause))continue;
      if(free(n.callee,'$done')||closedCompletionForwarderCall(ix,n)){handlerCompletions++;continue;}
+     if(logObservation(n))continue;
      if(n.callee.type==='MemberExpression'&&bindings.get(n.callee.object)===contextBinding&&['abrupt','stop'].includes(property(n.callee)))continue;
      if(catchCall(n))continue;
      handlerError='异步状态机异常处理区域含业务调用：第 '+source.slice(0,n.start).split('\n').length+' 行';break;

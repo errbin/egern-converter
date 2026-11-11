@@ -66,6 +66,54 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
         result = compare(SOURCE, output, 'surge', URL, fixture)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_async_prefix_effects_terminal_tail_and_saved_error_observation(self):
+        prefix = SOURCE.replace(
+            '(ctx.prev=0,ctx.next=3,low())',
+            "(console.log('start'),marker='go',ctx.prev=0,ctx.next=3,low())",
+        )
+        lowered = lower(prefix)
+        self.assertEqual(len(lowered['transformations']), 1, lowered)
+        self.assertIn("console.log('start');", lowered['source'])
+        self.assertIn("marker='go';", lowered['source'])
+        self.assertIn('ctx.next = 3;', lowered['source'])
+        self.assertIn('ctx.sent = await', lowered['source'])
+
+        terminal = lower(SOURCE.replace(
+            "return ctx.abrupt('return',$done({body:'bad'}));",
+            "return (console.log('stop'),$done({body:'bad'}),ctx.abrupt('return'));",
+        ))
+        self.assertEqual(len(terminal['transformations']), 1, terminal)
+        self.assertIn("console.log('stop')", terminal['source'])
+
+        observed = SOURCE.replace(
+            "case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});",
+            "case 16:ctx.t0=ctx.catch(0);console.log(ctx.t0);$done({body:'caught'});",
+        )
+        lowered = lower(observed)
+        self.assertEqual(len(lowered['transformations']), 1, lowered)
+        self.assertIn('console.log(ctx.t0);', lowered['source'])
+        output = convert_script(observed, 'Fixture', URL, '', source_format='surge')
+        fixture = {'name': 'async regenerator observed catch', 'request': {'url': URL},
+                   'expected': {'result': {'body': 'ok'}}}
+        result = compare(observed, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_async_prefix_context_writes_unknown_calls_and_cross_case_t0_are_rejected(self):
+        for source, reason in [
+            (SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
+                            "(console.log('start'),unknown(),ctx.prev=0,ctx.next=3,low())"),
+             '异步挂起返回含未知前置表达式'),
+            (SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
+                            "(ctx.sent='bad',ctx.prev=0,ctx.next=3,low())"),
+             '异步挂起返回含未知前置表达式'),
+            (SOURCE.replace("case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});",
+                            "case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});"
+                            "case 17:console.log(ctx.t0);ctx.next=19;break;"),
+             '异步状态机 t0 读取必须位于同一保存处理区域'),
+        ]:
+            with self.subTest(source=source):
+                self.assert_not_released(source, reason)
+
     def test_non_promise_suspension_is_not_released(self):
         self.assert_not_released(SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
                                                 '(ctx.prev=0,ctx.next=3,42)'),
