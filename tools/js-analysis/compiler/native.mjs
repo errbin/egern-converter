@@ -1838,16 +1838,24 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[fnParent];
      else{
       if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
-      calls=fnBinding.refs.map(ref=>{const call=parents.get(ref);return call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')?call:null;});
+      calls=[];
+      for(const ref of fnBinding.refs){
+       const call=parents.get(ref);
+       if(call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')){calls.push(call);continue;}
+       // 函数存在性观察不构成调用点，也不会把函数值交给未知代码；其余非
+       // 调用引用仍拒绝，避免参数实参来源无法闭合。
+       const observed=call?.type==='UnaryExpression'&&['typeof','!'].includes(call.operator)||
+        ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(call?.type)&&call.test===ref;
+       if(!observed)return null;
+      }
      }
-     return calls?.length&&calls.every(Boolean)?{fn,position,calls}:null;
+     return calls?.length?{fn,position,calls}:null;
     };
     // 记录字段集合优先静态枚举。实参本身可以是不透明的运行期请求值，但只有
     // 参数绑定未复制、未逃逸、只访问白名单字段且只有一个派发点时才会走到这里。
     // 参数入口的一次自我快照（如 t={...defaults,...t}）仍要求旧字段集合由
     // 所有调用点的闭合实参共同证明。
-    const recordFields=(node,seen=new Set(),selfFields=null)=>{
-     node=resolve(node,seen);
+    const recordFields=(node,seen=new Set(),selfFields=null,boundary=null)=>{
      if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
      if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
      if(node?.type==='Identifier'){
@@ -1859,10 +1867,42 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
        // 由默认对象本身稳定决定，混入任一显式实参即拒绝。
        const site=parameterCallSites(source),formal=site?.fn.params[site.position];
        if(!site||formal?.type!=='AssignmentPattern'||site.calls.some(call=>call.arguments.length>site.position&&!free(call.arguments[site.position],'undefined')))return null;
-       return recordFields(formal.right,new Set(seen).add(source),null);
+       return recordFields(formal.right,new Set(seen).add(source),null,boundary);
       }
-      return recordFields(source.init,new Set(seen).add(source),null);
+      const result=recordFields(source.init,new Set(seen).add(source),null,boundary);
+      if(!result||!boundary)return result;
+      // 实参记录可以在调用前用静态字段逐项装配。只有同一函数内、无分支包裹、
+      // 且在调用之前完成的普通赋值才加入字段集合；动态键、删除、更新和
+      // 调用后的写入都不能证明请求字段在派发时存在。
+      const boundaryOwner=owners.get(boundary);
+      const ancestors=new Set();for(let node=boundary;node;node=parents.get(node))ancestors.add(node);
+      for(const write of nodes){
+       if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='MemberExpression'||write.left.object.type!=='Identifier'||bindings.get(write.left.object)!==source)continue;
+       const field=property(write.left);
+       if(field===undefined||!fields.includes(field))return null;
+       // 其它函数里的字段规范化会在调用返回前实时生效，但不属于调用点的
+       // 静态装配序列；它们不贡献“必定存在”的字段，也不据此拒绝记录。
+       if(owners.get(write)!==boundaryOwner)continue;
+       if(write.end>boundary.start)return null;
+       // 写入必须与派发共享同一个语句列表，并在其中位于派发之前；中途出现
+       // 分支、异常或循环时无法证明派发时字段已写入，只忽略该字段。
+       let container=write;while(parents.get(container)&&!ancestors.has(parents.get(container)))container=parents.get(container);
+       const common=parents.get(container);
+       if(!common||!['BlockStatement','SwitchCase','Program'].includes(common.type))continue;
+       const direct=node=>{while(parents.get(node)!==common)node=parents.get(node);return node;};
+       const list=common.type==='SwitchCase'?common.consequent:common.body;
+       const writeChild=direct(write),boundaryChild=direct(boundary);
+       if(!list.includes(writeChild)||!list.includes(boundaryChild)||list.indexOf(writeChild)>=list.indexOf(boundaryChild))continue;
+       for(let parent=parents.get(write);parent&&parent!==writeChild;parent=parents.get(parent)){
+        if(['IfStatement','ConditionalExpression','LogicalExpression','TryStatement','ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement'].includes(parent.type))continue;
+       }
+       result.add(field);
+      }
+      return result;
      }
+     node=resolve(node,seen);
+     if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
+     if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
      if(node?.type!=='ObjectExpression')return null;
      const result=new Set();
      for(const entry of node.properties){
@@ -1929,7 +1969,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       let actual=call.arguments[site.position],formal=site.fn.params[site.position];
       if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void'&&actual.argument.type==='Literal')actual=formal?.type==='AssignmentPattern'?formal.right:null;
       if(actual&&!safeRecordSource(actual,call))return null;
-      const record=actual?recordFields(actual,new Set(),null):null;
+      const record=actual?recordFields(actual,new Set(),null,call):null;
       return record;
      });
     };
