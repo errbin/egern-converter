@@ -1247,6 +1247,165 @@ function discardedValue(node,ix){
  if(parent?.type!=='SequenceExpression')return false;
  return parent.expressions[parent.expressions.length-1]!==node||discardedValue(parent,ix);
 }
+// 识别 javascript-obfuscator 丢弃式自防御壳：工厂 IIFE 返回一个只调用一次回调的
+// 包装函数，回调仅对包装器自身做源码自检，包装调用的结果被丢弃。只有工厂、回调
+// 注入路径、回调纯度和自检形状全部闭合时才把回调体短路为空；生成代码的格式化会
+// 改变函数源码，自检正则可能灾难性回溯，而该结果本来就不可观察。
+function staticStringValue(node){
+ if(node?.type==='Literal'&&typeof node.value==='string')return node.value;
+ if(node?.type==='BinaryExpression'&&node.operator==='+'){
+  const left=staticStringValue(node.left),right=staticStringValue(node.right);
+  if(left!==undefined&&right!==undefined)return left+right;
+ }
+ return undefined;
+}
+function staticMemberKey(node){
+ if(node?.type!=='MemberExpression')return undefined;
+ return node.computed?staticStringValue(node.property):property(node);
+}
+function pureLocalValue(node,locals,ix){
+ if(!node)return false;
+ switch(node.type){
+  case 'Literal':return node.value===null||['string','number','boolean'].includes(typeof node.value);
+  case 'Identifier':{const binding=ix.bindings.get(node);return !!binding&&locals.has(binding);}
+  case 'ObjectExpression':
+   return node.properties.every(entry=>{
+    if(entry.type!=='Property'||entry.kind!=='init'||entry.method)return false;
+    const name=entry.computed?staticStringValue(entry.key):(entry.key.name??entry.key.value);
+    return name!==undefined&&name!=='__proto__'&&pureLocalValue(entry.value,locals,ix);
+   });
+  case 'ArrayExpression':return node.elements.every(element=>element&&element.type!=='SpreadElement'&&pureLocalValue(element,locals,ix));
+  case 'BinaryExpression':return node.operator==='+'&&pureLocalValue(node.left,locals,ix)&&pureLocalValue(node.right,locals,ix);
+  case 'LogicalExpression':return ['&&','||','??'].includes(node.operator)&&pureLocalValue(node.left,locals,ix)&&pureLocalValue(node.right,locals,ix);
+  case 'ConditionalExpression':return pureLocalValue(node.test,locals,ix)&&pureLocalValue(node.consequent,locals,ix)&&pureLocalValue(node.alternate,locals,ix);
+  case 'UnaryExpression':return ['!','+','-','void','typeof'].includes(node.operator)&&pureLocalValue(node.argument,locals,ix);
+  case 'MemberExpression':return staticMemberKey(node)!=='__proto__'&&staticMemberKey(node)!==undefined&&pureLocalValue(node.object,locals,ix);
+  case 'FunctionExpression':
+  case 'ArrowFunctionExpression':return true;
+  default:return false;
+ }
+}
+function selfCheckExpression(node,wrapper,locals,ix){
+ if(node?.type!=='CallExpression')return false;
+ const searchCall=node,call=searchCall.callee;
+ if(call.type!=='MemberExpression'||staticMemberKey(call)!=='search'||searchCall.arguments.length!==1||!pureLocalValue(searchCall.arguments[0],locals,ix))return false;
+ const construct=call.object;
+ if(construct.type!=='CallExpression'||construct.arguments.length!==1)return false;
+ const constructMember=construct.callee;
+ if(constructMember.type!=='MemberExpression'||staticMemberKey(constructMember)!=='constructor')return false;
+ if(construct.arguments[0].type!=='Identifier'||ix.bindings.get(construct.arguments[0])!==wrapper)return false;
+ const secondToString=constructMember.object;
+ if(secondToString.type!=='CallExpression'||secondToString.arguments.length)return false;
+ const secondMember=secondToString.callee;
+ if(secondMember.type!=='MemberExpression'||staticMemberKey(secondMember)!=='toString')return false;
+ const firstSearch=secondMember.object;
+ if(firstSearch.type!=='CallExpression'||firstSearch.arguments.length!==1||!pureLocalValue(firstSearch.arguments[0],locals,ix))return false;
+ const firstSearchMember=firstSearch.callee;
+ if(firstSearchMember.type!=='MemberExpression'||staticMemberKey(firstSearchMember)!=='search')return false;
+ const firstToString=firstSearchMember.object;
+ if(firstToString.type!=='CallExpression'||firstToString.arguments.length)return false;
+ const firstToStringMember=firstToString.callee;
+ if(firstToStringMember.type!=='MemberExpression'||staticMemberKey(firstToStringMember)!=='toString')return false;
+ const receiver=firstToStringMember.object;
+ return receiver.type==='Identifier'&&ix.bindings.get(receiver)===wrapper;
+}
+export function lowerDiscardedSelfCheckCallbacks(source){
+ const tree=parse(source,options),ix=index(tree),edits=[];
+ const inside=(node,range)=>node.start>=range.start&&node.end<=range.end;
+ const localBinding=(node,locals)=>{const binding=node?.type==='Identifier'?ix.bindings.get(node):null;return binding&&locals.has(binding)?binding:null;};
+ const rejected=(node,locals)=>{
+  if(node.type==='ThisExpression'||node.type==='NewExpression'||node.type==='AwaitExpression'||node.type==='YieldExpression'||node.type==='TaggedTemplateExpression'||node.type==='DebuggerStatement')return true;
+  if(node.type==='Identifier'&&ix.reference(node)){
+   const binding=ix.bindings.get(node);
+   return !binding||!locals.has(binding);
+  }
+  return false;
+ };
+ for(const declarator of ix.nodes){
+  if(declarator.type!=='VariableDeclarator'||declarator.id.type!=='Identifier'||declarator.init?.type!=='CallExpression')continue;
+  const init=declarator.init;
+  if(init.arguments.length!==2||init.arguments[1].type!=='FunctionExpression')continue;
+  const callback=init.arguments[1];
+  if(callback.async||callback.generator||callback.params.length||callback.body.type!=='BlockStatement')continue;
+  const wrapper=ix.bindings.get(declarator.id);
+  if(!wrapper||wrapper.writes.length||init.callee.type!=='Identifier')continue;
+  const factory=ix.bindings.get(init.callee);
+  if(!factory||factory.writes.length||factory.refs.some(ref=>ref!==init.callee))continue;
+  const factoryInit=factory.init;
+  if(factoryInit?.type!=='CallExpression'||factoryInit.arguments.length||factoryInit.callee.type!=='FunctionExpression')continue;
+  const factoryFn=factoryInit.callee;
+  if(factoryFn.async||factoryFn.generator||factoryFn.params.length||factoryFn.body.type!=='BlockStatement')continue;
+  const factoryStatements=factoryFn.body.body;
+  if(factoryStatements.length<2)continue;
+  const returned=factoryStatements.at(-1);
+  if(returned.type!=='ReturnStatement'||returned.argument?.type!=='FunctionExpression')continue;
+  const setup=factoryStatements.slice(0,-1);
+  if(!setup.every(statement=>statement.type==='VariableDeclaration'&&statement.declarations.every(item=>item.id.type==='Identifier'&&item.init)))continue;
+  const factoryLocals=new Set();
+  for(const statement of setup)for(const item of statement.declarations)factoryLocals.add(ix.bindings.get(item.id));
+  if(!setup.every(statement=>statement.declarations.every(item=>pureLocalValue(item.init,factoryLocals,ix))))continue;
+  const returnedFunction=returned.argument;
+  if(returnedFunction.async||returnedFunction.generator||returnedFunction.params.length!==2||returnedFunction.params.some(param=>param.type!=='Identifier'))continue;
+  const callbackBinding=ix.bindings.get(returnedFunction.params[1]);
+  if(!callbackBinding||callbackBinding.writes.length!==1||callbackBinding.refs.length!==3)continue;
+  let applyCall=null,nullAssignment=null,tested=false;
+  for(const ref of callbackBinding.refs){
+   const parent=ix.parents.get(ref);
+   if(parent?.type==='IfStatement'&&parent.test===ref)tested=true;
+   else if(parent?.type==='MemberExpression'&&parent.object===ref&&staticMemberKey(parent)==='apply'){
+    const call=ix.parents.get(parent);
+    if(call?.type==='CallExpression'&&call.callee===parent)applyCall=call;
+   }else if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&parent.right?.type==='Literal'&&parent.right.value===null)nullAssignment=parent;
+   else{applyCall=null;break;}
+  }
+  if(!tested||!applyCall||!nullAssignment||applyCall.arguments.length!==2)continue;
+  if(applyCall.arguments[0].type!=='Identifier'||ix.bindings.get(applyCall.arguments[0])!==ix.bindings.get(returnedFunction.params[0]))continue;
+  if(!ix.free(applyCall.arguments[1],'arguments'))continue;
+  const applyDeclarator=ix.parents.get(applyCall);
+  if(applyDeclarator?.type!=='VariableDeclarator'||applyDeclarator.init!==applyCall||applyDeclarator.id.type!=='Identifier')continue;
+  const applyDeclaration=ix.parents.get(applyDeclarator),applyBlock=ix.parents.get(applyDeclaration);
+  if(applyDeclaration?.type!=='VariableDeclaration'||applyBlock?.type!=='BlockStatement')continue;
+  const applyIndex=applyBlock.body.indexOf(applyDeclaration),afterApply=applyBlock.body[applyIndex+1];
+  if(!afterApply||afterApply.type!=='ReturnStatement'||afterApply.argument?.type!=='SequenceExpression'||afterApply.argument.expressions.length!==2)continue;
+  const [resetExpression,resultExpression]=afterApply.argument.expressions;
+  if(resetExpression!==nullAssignment||resultExpression.type!=='Identifier'||ix.bindings.get(resultExpression)!==ix.bindings.get(applyDeclarator.id))continue;
+  const resultBinding=ix.bindings.get(applyDeclarator.id);
+  if(!resultBinding||resultBinding.writes.length||resultBinding.refs.length!==1||resultBinding.refs[0]!==resultExpression)continue;
+  const outside=wrapper.refs.filter(ref=>!inside(ref,callback));
+  if(outside.length!==1)continue;
+  const discarded=ix.parents.get(outside[0]);
+  if(discarded?.type!=='CallExpression'||discarded.callee!==outside[0]||discarded.arguments.length||!discardedValue(discarded,ix))continue;
+  const locals=new Set();
+  for(const statement of callback.body.body){
+   if(statement.type==='VariableDeclaration')for(const item of statement.declarations)if(item.id.type==='Identifier')locals.add(ix.bindings.get(item.id));
+  }
+  const statements=callback.body.body.slice(0,-1),returnedSelfCheck=callback.body.body.at(-1);
+  if(returnedSelfCheck?.type!=='ReturnStatement'||!selfCheckExpression(returnedSelfCheck.argument,wrapper,locals,ix))continue;
+  let valid=true;
+  for(const statement of statements){
+   if(statement.type==='VariableDeclaration'){
+    if(!statement.declarations.every(item=>item.id.type==='Identifier'&&item.init&&pureLocalValue(item.init,locals,ix))){valid=false;break;}
+   }else if(statement.type==='ExpressionStatement'){
+    const expression=statement.expression;
+    const target=expression.left;
+    const localTarget=expression.type==='AssignmentExpression'&&expression.operator==='='&&(localBinding(target,locals)||target.type==='MemberExpression'&&localBinding(target.object,locals)&&staticMemberKey(target)!==undefined&&staticMemberKey(target)!=='__proto__');
+    if(!localTarget||!pureLocalValue(expression.right,locals,ix)){valid=false;break;}
+   }else{valid=false;break;}
+  }
+  if(!valid)continue;
+  for(const node of ix.nodes){
+   if(!inside(node,callback))continue;
+   if(rejected(node,locals)&&ix.bindings.get(node)!==wrapper){valid=false;break;}
+  }
+  if(!valid)continue;
+  edits.push({start:callback.body.start,end:callback.body.end,value:'{}'});
+ }
+ if(!edits.length)return {source,transformations:[]};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.value+output.slice(edit.end);
+ return {source:output,transformations:[{kind:'discarded-self-check-shell',callbacks:edits.length,reason:'工厂与回调注入路径闭合、回调只做源码自检、包装调用结果被丢弃；短路自检回调体'}]};
+}
+
 function proveShellWrites(ranges,ix,shellBinding){
  const local=new Set();
  for(const n of ix.nodes){

@@ -90,6 +90,8 @@ const notification=(title,subtitle,body,options={})=>{
  if(url!==undefined)n.action={type:'openUrl',url};else if(clip!==undefined)n.action={type:'clipboard',text:clip};
  const media=options.mediaUrl??options['media-url'];if(media!==undefined)n.attachment={url:media};
  if(options['media-base64']!==undefined)n.attachment={base64:options['media-base64'],mimeType:options['media-base64-mime']};
+ const dismiss=options['auto-dismiss'],duration=options.duration??(dismiss===true?10:typeof dismiss==='number'?dismiss:undefined);
+ if(duration!==undefined)n.duration=duration;
  if(options.sound!==undefined)n.sound=options.sound;
  events.notifications.push(n);
 };

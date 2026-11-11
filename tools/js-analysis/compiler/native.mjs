@@ -12,7 +12,7 @@ import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowe
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts} from '../analysis/values.mjs';
-import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables} from '../transforms/decoding.mjs';
+import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
 // Compile legacy HTTP scripts to direct Egern APIs. No runtime bridge is emitted.
@@ -27,12 +27,12 @@ function compileNative(source,format,options){
   // embedded libraries. No input body is evaluated during this reduction.
   const functionSource=lowerFunctionConstructorSource(source);
   libraries=protectLibraries(functionSource.source);
-  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),decoded=lowerStringTables(obfuscated.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
+  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
   return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
-   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[]};}
 }
 function normalizeLegacyNumbers(source){
@@ -1591,13 +1591,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    else {
     const mutable=returned??notificationFields(a[3])??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
     if(mutable?.stringUrl)out.push(`...(typeof ${argument(3)} === 'string' ? {action: {type: 'openUrl', url: ${argument(3)}}} : {})`);
-    const f=mutable?.fields??object(a[3],'通知参数'),allowed=['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','sound'];
+    const f=mutable?.fields??object(a[3],'通知参数'),allowed=['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'];
     const value=k=>captured?`${argument(3)}${mutable?.nullable?'?.':''}[${JSON.stringify(k)}]`:render(f.get(k));
     const add=(k,text)=>out.push(`...(${mutable?.nullable?`${argument(3)} != null && `:''}${mutable?.optional.has(k)?`Object.hasOwn(${argument(3)}, ${JSON.stringify(k)}) && `:''}${value(k)} !== undefined ? {${text}} : {})`);
     for(const k of f.keys())if(!allowed.includes(k))fail(a[3],'未适配通知字段：'+k);
     if(mutable?.returnedRecord){
-     const optionsName=fresh('notificationSourceOptions'),resultName=fresh('notificationNativeOptions'),urlName=fresh('notificationSourceUrl'),mediaUrlName=fresh('notificationMediaUrl'),base64Name=fresh('notificationMediaBase64'),mimeName=fresh('notificationMediaMime');
-     const statements=[`const ${resultName} = {};`,`const ${urlName} = ${optionsName}?.url ?? ${optionsName}?.openUrl ?? ${optionsName}?.["open-url"];`,`if (${optionsName}?.action === "clipboard") { if (${optionsName}?.text !== undefined) ${resultName}.action = {type: "clipboard", text: ${optionsName}.text}; } else if (${urlName} !== undefined) ${resultName}.action = {type: "openUrl", url: ${urlName}};`,`const ${mediaUrlName} = ${optionsName}?.["media-url"] ?? ${optionsName}?.mediaUrl;`,`if (${mediaUrlName} !== undefined) ${resultName}.attachment = {url: ${mediaUrlName}}; else { const ${base64Name} = ${optionsName}?.["media-base64"]; if (${base64Name} !== undefined) { const ${mimeName} = ${optionsName}?.["media-base64-mime"]; if (${mimeName} === undefined) throw new Error("Base64 notification attachment requires MIME type"); ${resultName}.attachment = {base64: ${base64Name}, mimeType: ${mimeName}}; } }`,`if (${optionsName}?.sound !== undefined) { if (typeof ${optionsName}.sound !== "boolean") throw new TypeError("Notification sound must be boolean"); ${resultName}.sound = ${optionsName}.sound; }`,`return ${resultName};`];
+     const optionsName=fresh('notificationSourceOptions'),resultName=fresh('notificationNativeOptions'),urlName=fresh('notificationSourceUrl'),mediaUrlName=fresh('notificationMediaUrl'),base64Name=fresh('notificationMediaBase64'),mimeName=fresh('notificationMediaMime'),dismissName=fresh('notificationAutoDismiss');
+     const statements=[`const ${resultName} = {};`,`const ${urlName} = ${optionsName}?.url ?? ${optionsName}?.openUrl ?? ${optionsName}?.["open-url"];`,`if (${optionsName}?.action === "clipboard") { if (${optionsName}?.text !== undefined) ${resultName}.action = {type: "clipboard", text: ${optionsName}.text}; } else if (${urlName} !== undefined) ${resultName}.action = {type: "openUrl", url: ${urlName}};`,`const ${mediaUrlName} = ${optionsName}?.["media-url"] ?? ${optionsName}?.mediaUrl;`,`if (${mediaUrlName} !== undefined) ${resultName}.attachment = {url: ${mediaUrlName}}; else { const ${base64Name} = ${optionsName}?.["media-base64"]; if (${base64Name} !== undefined) { const ${mimeName} = ${optionsName}?.["media-base64-mime"]; if (${mimeName} === undefined) throw new Error("Base64 notification attachment requires MIME type"); ${resultName}.attachment = {base64: ${base64Name}, mimeType: ${mimeName}}; } }`,`const ${dismissName} = ${optionsName}?.["auto-dismiss"];`,`if (${dismissName} !== undefined) { if (${dismissName} === true) ${resultName}.duration = 10; else if (${dismissName} !== false) { if (typeof ${dismissName} !== "number" || !Number.isFinite(${dismissName}) || ${dismissName} < 0) throw new TypeError("Notification auto-dismiss must be boolean or non-negative seconds"); ${resultName}.duration = ${dismissName}; } }`,`if (${optionsName}?.sound !== undefined) { if (typeof ${optionsName}.sound !== "boolean") throw new TypeError("Notification sound must be boolean"); ${resultName}.sound = ${optionsName}.sound; }`,`return ${resultName};`];
      out.push(`...(((${optionsName}) => {${statements.join(' ')}})(${argument(3)}))`);
     }else{
     const urls=['url','openUrl','open-url'].filter(k=>f.has(k));if(urls.length>1)fail(a[3],'通知 URL 字段冲突');
@@ -1607,6 +1607,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const media=f.get('mediaUrl')??f.get('media-url');if(media&&f.has('media-base64'))fail(a[3],'通知附件冲突');
     if(media){const k=f.has('mediaUrl')?'mediaUrl':'media-url';add(k,`attachment: {url: ${value(k)}}`);}
     if(f.has('media-base64')){if(!f.has('media-base64-mime'))fail(a[3],'Base64 附件需要 MIME');add('media-base64',`attachment: {base64: ${value('media-base64')}, mimeType: ${value('media-base64-mime')}}`);}
+    if(f.has('auto-dismiss')){
+     if(mutable)fail(a[3],'可变 auto-dismiss 参数需要可证明的布尔或秒数数据流');
+     const dismiss=resolve(f.get('auto-dismiss'));
+     if(free(dismiss,'undefined')||dismiss?.type==='UnaryExpression'&&dismiss.operator==='void'&&dismiss.argument.type==='Literal'||dismiss?.type==='Literal'&&dismiss.value===false){}
+     else if(dismiss?.type==='Literal'&&dismiss.value===true)out.push('duration: 10');
+     else if(dismiss?.type==='Literal'&&typeof dismiss.value==='number'&&Number.isFinite(dismiss.value)&&dismiss.value>=0)out.push('duration: '+(captured?`${argument(3)}["auto-dismiss"]`:render(dismiss)));
+     else fail(f.get('auto-dismiss'),'auto-dismiss 必须为布尔值或非负秒数');
+    }
     if(f.has('sound')){if(mutable)fail(a[3],'可变 sound 参数需要可证明的布尔数据流');const s=resolve(f.get('sound'));if(s.type!=='Literal'||typeof s.value!=='boolean')fail(s,'sound 必须为布尔值');out.push('sound: '+value('sound'));}
     }
    }
@@ -1721,7 +1729,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    required.push(own);
   }
-  if([...fields.keys()].some(k=>!['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','sound'].includes(k)))return null;
+  if([...fields.keys()].some(k=>!['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'].includes(k)))return null;
   return {fields,optional:new Set([...fields.keys()].filter(k=>required.some(s=>!s.has(k)))),nullable:true,stringUrl,returnedRecord:true};
  }
  function notificationFields(ref){
@@ -1743,7 +1751,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   for(const p of initial.properties){if(p.type!=='Property'||p.kind!=='init'||key(p)===undefined||key(p)==='__proto__')return null;fields.set(key(p),p.value);}
   const optional=new Set();
   for(const member of writes){const k=property(member);if(k==='__proto__')return null;if(!fields.has(k))optional.add(k);fields.set(k,parents.get(member).right);}
-  if([...fields.keys()].some(k=>!['url','openUrl','open-url','mediaUrl','media-url'].includes(k)))return null;
+  if([...fields.keys()].some(k=>!['url','openUrl','open-url','mediaUrl','media-url','auto-dismiss'].includes(k)))return null;
   return {fields,optional};
  }
  function http(input,method,qx){
