@@ -33,10 +33,84 @@ export function closedIdentityMethodCall(ix,call,arg){
  const parameter=bindings.get(wrapper.params[0]);if(!parameter||parameter.writes.length)return false;
  const same=n=>n?.type==='Identifier'&&bindings.get(n)===parameter;
  const objectBuiltin=n=>n?.type==='MemberExpression'&&free(n.object,'Object')&&['setPrototypeOf','create','defineProperty','getPrototypeOf'].includes(property(n));
+ const unknown=Symbol('unknown');
+ // 闭合字面量表只能通过静态成员读取；整体传递、写入或删除都会让后续
+ // 谓词的求值不再确定，因此返回 null 让调用方保守拒绝。
+ const closedObject=n=>{
+  let object=n;
+  if(n?.type==='Identifier'){
+   const binding=bindings.get(n);
+   if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+   for(const ref of binding.refs){
+    const use=parents.get(ref);
+    if(use?.type!=='MemberExpression'||use.object!==ref||property(use)===undefined)return null;
+    const parent=parents.get(use);
+    if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return null;
+   }
+   object=binding.init;
+  }
+  return object?.type==='ObjectExpression'?object:null;
+ };
+ const closedValue=n=>{
+  if(n?.type==='Literal')return n.value;
+  if(n?.type==='Identifier'){
+   if(n.name==='undefined'&&free(n))return undefined;
+   const binding=bindings.get(n);
+   if(binding&&!binding.writes.length&&binding.init?.type==='Literal')return binding.init.value;
+   return unknown;
+  }
+  if(n?.type==='MemberExpression'){
+   const object=closedObject(n.object),name=property(n);
+   if(object&&name!==undefined){
+    const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+    if(entries.length===1&&entries[0].value.type==='Literal')return entries[0].value.value;
+   }
+  }
+  return unknown;
+ };
+ // 只对“单条 return 比较两个形参”的闭合谓词求值；函数来源必须唯一且
+ // 不可重绑，实参必须全部是闭合字面量。
+ const closedPredicate=n=>{
+  if(n?.type!=='CallExpression'||n.optional||n.arguments.some(argument=>argument.type==='SpreadElement'))return null;
+  let fn=null;
+  if(n.callee.type==='Identifier'){
+   const binding=bindings.get(n.callee);
+   if(binding&&!binding.writes.length&&functions.has((binding.fn??binding.init)?.type))fn=binding.fn??binding.init;
+  }else if(n.callee.type==='MemberExpression'){
+   const object=closedObject(n.callee.object),name=property(n.callee);
+   if(object&&name!==undefined){
+    const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+    if(entries.length===1&&functions.has(entries[0].value.type))fn=entries[0].value;
+   }
+  }
+  if(!fn||fn.async||fn.generator||fn.params.length!==2||fn.params.some(parameter=>parameter.type!=='Identifier'))return null;
+  const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+  if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return null;
+  const value=(node,substitutions)=>{
+   if(node.type==='Literal')return node.value;
+   if(node.type==='Identifier'){
+    const binding=bindings.get(node),position=fn.params.findIndex(parameter=>bindings.get(parameter)===binding);
+    if(position>=0)return substitutions[position];
+    if(node.name==='undefined'&&free(node))return undefined;
+   }
+   return unknown;
+  };
+  const args=n.arguments.map(closedValue);
+  if(args.some(value=>value===unknown))return null;
+  const returned=statements[0].argument;
+  if(returned.type==='Literal'&&typeof returned.value==='boolean')return returned.value;
+  if(returned.type==='BinaryExpression'&&['===','!==','==','!='].includes(returned.operator)){
+   const left=value(returned.left,args),right=value(returned.right,args);
+   if(left===unknown||right===unknown)return null;
+   return returned.operator==='==='?left===right:returned.operator==='!=='?left!==right:returned.operator==='=='?left==right:left!=right;
+  }
+  return null;
+ };
  const truth=n=>{
   if(n?.type==='Literal')return typeof n.value==='boolean'?n.value:null;
   if(n?.type==='UnaryExpression'&&n.operator==='!'){const value=truth(n.argument);return value===null?null:!value;}
   if(objectBuiltin(n))return true;
+  if(n?.type==='CallExpression')return closedPredicate(n);
   return null;
  };
  const effect=n=>{
@@ -52,8 +126,21 @@ export function closedIdentityMethodCall(ix,call,arg){
   if(n?.type==='ConditionalExpression'){const value=truth(n.test);if(value===true)return returnsParameter(n.consequent);if(value===false)return returnsParameter(n.alternate);return returnsParameter(n.consequent)&&returnsParameter(n.alternate);}
   return false;
  };
+ // 单层 if 只有在条件可静态求值时才允许选择分支；无法求值时必须要求
+ // 两个分支都原样返回参数，避免把未知条件当成固定分支。
+ const statementReturns=n=>{
+  if(n?.type==='ReturnStatement')return !!n.argument&&returnsParameter(n.argument);
+  if(n?.type==='BlockStatement')return n.body.length===1&&statementReturns(n.body[0]);
+  if(n?.type==='IfStatement'){
+   const value=truth(n.test);
+   if(value===true)return statementReturns(n.consequent);
+   if(value===false)return statementReturns(n.alternate);
+   return statementReturns(n.consequent)&&statementReturns(n.alternate);
+  }
+  return false;
+ };
  const statements=wrapper.body.type==='BlockStatement'?wrapper.body.body:[wrapper.body];
- return statements.length===1&&statements[0].type==='ReturnStatement'&&!!statements[0].argument&&returnsParameter(statements[0].argument);
+ return statements.length===1&&statementReturns(statements[0]);
 }
 
 // Structured early-return propagation for statically resolved bundled clients.

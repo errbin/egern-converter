@@ -47,6 +47,43 @@ class CompletionForwarderChainTests(unittest.TestCase):
         result = compare(source, output, 'loon', URL, fixture)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_closed_predicate_and_if_identity_wrapper_keep_timer_completion(self):
+        sources = [
+            ("const A={},flags={enabled:true};"
+             "function same(left,right){return left===right}"
+             "A.mark=function(fn){if(same(flags.enabled,true))return fn;else return fn;};"
+             "setTimeout(A.mark(()=>$done({body:'ok'})),0);"),
+            ("const A={},flags={enabled:true},P={same:function(left,right){return left===right}};"
+             "A.mark=function(fn){return P.same(flags.enabled,false)?Object.setPrototypeOf(fn,A):fn;};"
+             "setTimeout(A.mark(()=>$done({body:'ok'})),0);"),
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+                fixture = {'name': 'conditional identity completion wrapper', 'event_loop': True,
+                           'request': {'url': URL}, 'expected': {'result': {'body': 'ok'}}}
+                result = compare(source, output, 'loon', URL, fixture)
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_unknown_predicate_side_effect_and_table_write_reject_identity_wrapper(self):
+        variants = [
+            ("const A={},flags={enabled:true};"
+             "function same(left,right){return left===right}"
+             "A.mark=function(fn){if(same(flags.enabled,false))return fn;else{touch();return fn;}};"
+             "setTimeout(A.mark(()=>$done({body:'ok'})),0);"),
+            ("const A={},flags={enabled:true};"
+             "function same(left,right){return left===right}"
+             "A.mark=function(fn){if(same(flags.enabled,true)){touch();return fn;}else return fn;};"
+             "setTimeout(A.mark(()=>$done({body:'ok'})),0);"),
+            ("const A={},flags={enabled:true};flags.enabled=false;"
+             "function same(left,right){return left===right}"
+             "A.mark=function(fn){if(same(flags.enabled,true))return fn;else{touch();return fn;}};"
+             "setTimeout(A.mark(()=>$done({body:'ok'})),0);"),
+        ]
+        for source in variants:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')
+
     def test_forwarder_parameter_rewrite_side_effect_and_order_remain_rejected(self):
         for source in [
             "function dispatch(f,v){return f({body:'bad'})}dispatch($done,{body:'ok'});",
