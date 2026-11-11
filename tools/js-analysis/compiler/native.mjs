@@ -109,6 +109,191 @@ function compile(original,format,options,libraries){
   return finish(prepare(expanded));
  }
 }
+// 条件接收者只有在测试表达式可由平台值、字面量和闭合观察函数静态求值，
+// 且选中分支是通知 API 时，才能按原参数顺序收敛为一次直接调用。测试中的
+// 局部别名写入必须只服务于该接收者选择；否则保留原文继续拒绝。
+function lowerConditionalPlatformReceivers(source,format){
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
+ catch{return {source,transformations:[]};}
+ const {nodes,parents,bindings,free,owners}=ix;
+ const UNKNOWN=Symbol('unknown'),NOTIFY=Symbol('notify'),NOTIFICATION=Symbol('notification');
+ const loops=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
+ const enclosingFunction=node=>{let parent=parents.get(node);while(parent&&!functions.has(parent.type))parent=parents.get(parent);return parent??null;};
+ const insideLoop=node=>{for(let parent=parents.get(node);parent&&!functions.has(parent.type);parent=parents.get(parent))if(loops.has(parent.type))return true;return false;};
+ const canAffectCall=(node,call)=>{
+  if(node.start<call.start)return true;
+  if(insideLoop(call))return true;
+  const callFn=enclosingFunction(call);
+  let fn=enclosingFunction(node);
+  while(fn&&fn!==callFn){if(fn.start>call.start)return fn.type==='FunctionDeclaration';return true;}
+  return false;
+ };
+ const declarationCounts=new Map();
+ for(const n of nodes)if(n.type==='VariableDeclarator'||n.type==='FunctionDeclaration'){
+  const b=bindings.get(n.id);if(b)declarationCounts.set(b,(declarationCounts.get(b)||0)+1);
+ }
+ const staticProperty=n=>property(n);
+ const platformValue=(n,format)=>{
+  if(n?.type!=='Identifier'||!free(n))return UNKNOWN;
+  if(n.name==='undefined')return undefined;
+  if(n.name==='$notify')return format==='qx'?NOTIFY:undefined;
+  if(n.name==='$notification')return format==='qx'?undefined:NOTIFICATION;
+  return UNKNOWN;
+ };
+ const memberValue=(n,value)=>{
+  const key=staticProperty(n);if(!key)return UNKNOWN;
+  if(value===NOTIFICATION)return key==='post'?NOTIFY:UNKNOWN;
+  // 其余接收者（包括 qx 下不存在的 $notification）没有可证明成员语义。
+  return UNKNOWN;
+ };
+ const truthy=v=>!!v;
+ const binary=(operator,a,b)=>{
+  if(a===UNKNOWN||b===UNKNOWN)return UNKNOWN;
+  switch(operator){
+   case '===':return a===b;case '!==':return a!==b;case '==':return a==b;case '!=':return a!=b;
+   case '<':return a<b;case '<=':return a<=b;case '>':return a>b;case '>=':return a>=b;
+   case '+':return a+b;case '-':return a-b;case '*':return a*b;case '/':return a/b;
+   default:return UNKNOWN;
+  }
+ };
+ const readonlyStringObservation=call=>{
+  if(call.type!=='CallExpression'||call.arguments.length===0||call.callee.type!=='MemberExpression')return false;
+  const receiver=call.callee.object,name=staticProperty(call.callee);
+  const stringReceiver=receiver.type==='Literal'&&typeof receiver.value==='string'||free(receiver,'String');
+  return stringReceiver&&['concat','includes','indexOf','startsWith','endsWith','slice','substring','substr','replace','replaceAll','split','padStart','padEnd','repeat','trim'].includes(name);
+ };
+ const functionAt=(callee,call)=>{
+  if(callee.type==='Identifier'){
+   const b=bindings.get(callee);
+   if(!b||b.writes.length||declarationCounts.get(b)!==1)return null;
+   const fn=b.fn??b.init;
+   if(!functions.has(fn?.type)||fn.async||fn.generator||fn.body.type!=='BlockStatement'||fn.body.body.length!==1||fn.body.body[0].type!=='ReturnStatement')return null;
+   if(!b.refs.length||b.refs.some(ref=>parents.get(ref)?.type!=='CallExpression'||parents.get(ref).callee!==ref))return null;
+   return fn;
+  }
+  if(callee.type!=='MemberExpression'||!callee.object||callee.object.type!=='Identifier')return null;
+  const name=staticProperty(callee);if(name===undefined)return null;
+  const objectBinding=bindings.get(callee.object);
+  if(!objectBinding||objectBinding.writes.length||declarationCounts.get(objectBinding)!==1||objectBinding.init?.type!=='ObjectExpression')return null;
+  if(objectBinding.init.properties.some(p=>p.type!=='Property'||p.kind!=='init'||p.computed&&key(p)===undefined))return null;
+  const primitiveHooksSafe=objectBinding.init.properties.every(p=>!['toString','valueOf'].includes(String(key(p))));
+  if(objectBinding.refs.some(ref=>{
+   const parent=parents.get(ref),use=parents.get(parent);
+   if(!canAffectCall(ref,call))return false;
+   if(parent?.type==='MemberExpression'&&parent.object===ref){
+    const key=staticProperty(parent);if(key===undefined)return true;
+    return key===name&&(use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||use?.operator==='delete');
+   }
+   return !(primitiveHooksSafe&&parent?.type==='CallExpression'&&parent.arguments.includes(ref)&&readonlyStringObservation(parent));
+  }))return null;
+  const entries=objectBinding.init.properties.filter(p=>p.type==='Property'&&p.kind==='init'&&String(key(p))===String(name));
+  const fn=entries.length===1?entries[0].value:null;
+  if(!functions.has(fn?.type)||fn.async||fn.generator||fn.body.type!=='BlockStatement'||fn.body.body.length!==1||fn.body.body[0].type!=='ReturnStatement')return null;
+  return fn;
+ };
+ const evaluate=(n,env,{allowAssignment=false,seenFns=new Set(),format,targetCall}={})=>{
+  if(!n)return UNKNOWN;
+  if(n.type==='Literal')return n.value;
+  if(n.type==='Identifier'){
+   const b=bindings.get(n);
+   if(b&&env.has(b))return env.get(b);
+   const value=platformValue(n,format);
+   if(value!==UNKNOWN)return value;
+   return UNKNOWN;
+  }
+  if(n.type==='MemberExpression'){
+   const value=evaluate(n.object,env,{allowAssignment,seenFns,format,targetCall});if(value===UNKNOWN)return UNKNOWN;
+   return memberValue(n,value);
+  }
+  if(n.type==='AssignmentExpression'){
+   if(!allowAssignment||n.operator!=='='||n.left.type!=='Identifier')return UNKNOWN;
+   const b=bindings.get(n.left);if(!b)return UNKNOWN;
+   const value=evaluate(n.right,env,{allowAssignment,seenFns,format,targetCall});if(value===UNKNOWN)return UNKNOWN;
+   env.set(b,value);return value;
+  }
+  if(n.type==='BinaryExpression'){
+   const a=evaluate(n.left,env,{allowAssignment,seenFns,format,targetCall}),b=evaluate(n.right,env,{allowAssignment,seenFns,format,targetCall});
+   return binary(n.operator,a,b);
+  }
+  if(n.type==='LogicalExpression'){
+   const a=evaluate(n.left,env,{allowAssignment,seenFns,format,targetCall});if(a===UNKNOWN)return UNKNOWN;
+   if(n.operator==='&&')return truthy(a)?evaluate(n.right,env,{allowAssignment,seenFns,format,targetCall}):a;
+   if(n.operator==='||')return truthy(a)?a:evaluate(n.right,env,{allowAssignment,seenFns,format,targetCall});
+   if(n.operator==='??')return a==null?evaluate(n.right,env,{allowAssignment,seenFns,format,targetCall}):a;
+   return UNKNOWN;
+  }
+  if(n.type==='UnaryExpression'){
+   if(n.operator==='typeof'&&!bindings.has(n.argument)){
+    const value=platformValue(n.argument,format);
+    if(value!==UNKNOWN)return value===undefined?'undefined':value===NOTIFY?'function':'object';
+   }
+   const value=evaluate(n.argument,env,{allowAssignment,seenFns,format,targetCall});if(value===UNKNOWN)return UNKNOWN;
+   if(n.operator==='!')return !value;if(n.operator==='void')return undefined;
+   if(n.operator==='typeof')return value===undefined?'undefined':value===NOTIFY?'function':value===NOTIFICATION?'object':typeof value;
+   if(n.operator==='+')return +value;if(n.operator==='-')return -value;
+   return UNKNOWN;
+  }
+  if(n.type==='ConditionalExpression'){
+   const test=evaluate(n.test,env,{allowAssignment,seenFns,format,targetCall});if(test===UNKNOWN)return UNKNOWN;
+   return evaluate(test?n.consequent:n.alternate,env,{allowAssignment,seenFns,format,targetCall});
+  }
+  if(n.type==='CallExpression'){
+   if(n.optional||n.arguments.some(a=>a.type==='SpreadElement'))return UNKNOWN;
+   const fn=functionAt(n.callee,targetCall);if(!fn||seenFns.has(fn))return UNKNOWN;
+   const next=new Set(seenFns);next.add(fn);const local=new Map(env);
+   for(let i=0;i<fn.params.length;i++){
+    const parameter=fn.params[i],id=parameter.type==='AssignmentPattern'?parameter.left:parameter;
+    if(id.type!=='Identifier'||parameter.type==='RestElement')return UNKNOWN;
+    const value=n.arguments[i]?evaluate(n.arguments[i],env,{allowAssignment,seenFns,format,targetCall}):parameter.type==='AssignmentPattern'?evaluate(parameter.right,env,{allowAssignment,seenFns,format,targetCall}):undefined;
+    if(value===UNKNOWN)return UNKNOWN;
+    local.set(bindings.get(id),value);
+   }
+   return evaluate(fn.body.body[0].argument,local,{allowAssignment:false,seenFns:next,format,targetCall});
+  }
+  return UNKNOWN;
+ };
+ const declarationKind=binding=>{
+  const declaration=nodes.find(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding);
+  return declaration?parents.get(declaration)?.kind:undefined;
+ };
+ const edits=[];
+ for(const call of nodes){
+  if(call.type!=='CallExpression'||call.optional||call.callee.type!=='ConditionalExpression'||call.arguments.some(a=>a.type==='SpreadElement'))continue;
+  const env=new Map(),assigned=new Set();
+  const collectAssignments=n=>{
+   if(!n||typeof n!=='object')return;
+   if(n.type==='AssignmentExpression'){
+    if(n.operator==='='&&n.left.type==='Identifier'&&bindings.has(n.left))assigned.add(bindings.get(n.left));
+   }
+   if(n.type==='FunctionExpression'||n.type==='FunctionDeclaration'||n.type==='ArrowFunctionExpression')return;
+   for(const [name,value]of Object.entries(n)){
+    if(['start','end','loc'].includes(name))continue;
+    if(Array.isArray(value)){for(const child of value)if(child?.type)collectAssignments(child);}
+    else if(value?.type)collectAssignments(value);
+   }
+  };
+  collectAssignments(call.callee.test);
+  let safe=true;
+  for(const binding of assigned){
+   if(declarationKind(binding)==='const')safe=false;
+   if(binding.writes.some(write=>write.start<call.callee.test.start||write.end>call.callee.test.end))safe=false;
+   if(binding.refs.some(ref=>ref.start<call.callee.start||ref.end>call.callee.end))safe=false;
+  }
+  if(!safe)continue;
+  const test=evaluate(call.callee.test,env,{allowAssignment:true,format,targetCall:call});
+  if(test===UNKNOWN)continue;
+  const selected=test?call.callee.consequent:call.callee.alternate;
+  const operation=evaluate(selected,env,{allowAssignment:false,format,targetCall:call});
+  if(operation!==NOTIFY)continue;
+  const args=call.arguments.map(argument=>source.slice(argument.start,argument.end)).join(', ');
+  edits.push({start:call.start,end:call.end,replacement:`$notification.post(${args})`,api:'$notify'});
+ }
+ if(!edits.length)return {source,transformations:[]};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return {source:output,transformations:edits.map(({api})=>({kind:'conditional-platform-receiver',api}))};
+}
 // 只内联“本地封闭转发器”：形如 function(f, value){ return f(value); } 的
 // 本地函数/对象属性，调用点把宿主平台值作为首参传入。必须逐参数证明返回
 // 调用恰好使用同一绑定并按原顺序转发其余实参；否则保持拒绝，不做名称猜测。
@@ -307,6 +492,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const forwarders=lowerDirectPlatformForwarders(source);
  source=forwarders.source;
  libraries.transformations.push(...forwarders.transformations);
+ const conditionalReceivers=lowerConditionalPlatformReceivers(source,format);
+ source=conditionalReceivers.source;
+ libraries.transformations.push(...conditionalReceivers.transformations);
  const detachedAliases=lowerDetachedGlobalObjectAliases(source);
  source=detachedAliases;
  assertSafeMissingGlobalProbes(source);
