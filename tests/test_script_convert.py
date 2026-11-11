@@ -128,6 +128,17 @@ process.stdout.write(JSON.stringify({result,notifications,requests,storage:Objec
         self.assertEqual(result['storage']['token'], 'token123')
         self.assertEqual(result['requests'][1]['options']['headers']['Authorization'], 'token123')
 
+    def test_qx_prefs_object_exists_only_for_closed_capability_probes(self):
+        source = '(async()=>{if(typeof $prefs!=="undefined"&&$prefs.valueForKey){$prefs.setValueForKey($prefs.valueForKey("token")||"none","seen")}$done({body:$prefs.valueForKey("seen")})})();'
+        result = self.execute(source, source_format='qx', ast=True, storage={'token':'abc'})
+        self.assertEqual(result['result']['body'], 'abc')
+        self.assertEqual(result['storage']['seen'], 'abc')
+        for source in ['const p=$prefs;$done({});',
+                       'const f=$prefs.valueForKey;f("x");$done({});',
+                       '$prefs.unknown;$done({});']:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                self.execute(source, source_format='qx', ast=True)
+
     def test_async_alias_is_native_and_unresolved_parallel_projection_is_rejected(self):
         source = 'const worker=async()=>{await $task.fetch({url:"https://api.example"});$done({body:"ok"})};const alias=worker;alias();'
         self.assertEqual(self.execute(source, ast=True, http=[{'body':'ok'}])['result']['body'],'ok')

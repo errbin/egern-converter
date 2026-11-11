@@ -2905,6 +2905,16 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
    }
    if(map[n.name])return map[n.name];
+   // QX 脚本常用裸 $prefs 和成员真值探测来兼容多平台存储。目标宿主只暴露
+   // ctx.storage，因此仅允许它们出现在 typeof、逻辑合取或条件测试中；对象或
+   // 方法引用一旦赋值、传参或逃逸仍按未知平台值失败关闭。
+   if(n.name==='$prefs'&&format==='qx'){
+    const p=parents.get(n);
+    const probe=p?.type==='UnaryExpression'&&p.operator==='typeof'||p?.type==='LogicalExpression'||
+     ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===n;
+    if(probe)return context+'.storage';
+    fail(n,'存储对象整体传递无法证明字段语义，只能用于存在性判断');
+   }
    if(n.name.startsWith('$')){fail(n,'平台 API 作为值传递，无法直接原生改写：'+n.name);}
   }
   if(n.type==='MemberExpression'){
@@ -2927,6 +2937,15 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const p=parents.get(n);if(!(p?.type==='VariableDeclarator'&&p.init===n))fail(n,'压缩 API 引用必须直接调用或保存为可追溯的局部别名');
     if(p.id.type!=='Identifier'||bindings.get(p.id)?.writes.length)fail(n,'压缩 API 别名被重新赋值，无法传播 await');
     return context+'.compress.'+compressionMethod(n);
+   }
+   if(free(o,'$prefs')&&format==='qx'){
+    const storageMethod={valueForKey:'get',setValueForKey:'set',removeValueForKey:'delete'}[k];
+    if(!storageMethod)fail(n,'未知 QX 存储成员：'+k);
+    const p=parents.get(n);
+    const probe=p?.type==='UnaryExpression'&&['!','typeof'].includes(p.operator)||p?.type==='LogicalExpression'||
+     ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===n;
+    if(!probe)fail(n,'存储方法引用只能用于存在性判断或直接调用');
+    return context+'.storage.'+storageMethod;
    }
    if(free(o,'$request')||free(o,'$response')){
     const parent=parents.get(n);
