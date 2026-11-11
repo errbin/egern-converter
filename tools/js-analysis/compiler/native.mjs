@@ -3321,27 +3321,34 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
 function lowerCompressionFallbacks(source){
  const comments=[],tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree),replace=new WeakMap(),transformations=[];let changed=false;
  const {nodes,parents,bindings,free}=ix;
- const identity=fn=>{
-  if(fn?.type==='ArrowFunctionExpression')return fn.params.length===1&&fn.params[0].type==='Identifier'&&fn.body.type==='Identifier'&&bindings.get(fn.params[0])===bindings.get(fn.body);
-  if(fn?.type==='FunctionExpression'&&fn.params.length===1&&fn.params[0].type==='Identifier'&&fn.body.type==='BlockStatement'&&fn.body.body.length===1){const ret=fn.body.body[0];return ret.type==='ReturnStatement'&&ret.argument?.type==='Identifier'&&bindings.get(fn.params[0])===bindings.get(ret.argument);}
-  return false;
- };
+ // 平台类型表已证明 $utils 是对象，压缩成员也由后续原生投影提供。因此这类
+ // 能力守卫在目标宿主恒真，分支中的非恒等回退不可达，可以安全删除。只接受
+ // 由平台对象类型和已映射压缩成员探测组成的 && 合取；未知探测、||、动态成员
+ // 或局部同名绑定都必须保留原文并继续走失败关闭路径。
  const guarded=(test,name)=>{
-  if(test?.type!=='BinaryExpression'||!['===','=='].includes(test.operator))return false;
+  if(test?.type==='LogicalExpression'){
+   if(test.operator!=='&&')return null;
+   const left=guarded(test.left,name),right=guarded(test.right,name);
+   return left&&right?{probe:left.probe||right.probe}:null;
+  }
+  if(test?.type!=='BinaryExpression'||!['===','=='].includes(test.operator))return null;
   const type=test.left?.type==='UnaryExpression'&&test.left.operator==='typeof'?test.left:test.right?.type==='UnaryExpression'&&test.right.operator==='typeof'?test.right:null;
   const value=type===test.left?test.right:test.left,argument=type?.argument?.type==='ChainExpression'?type.argument.expression:type?.argument;
-  return value?.type==='Literal'&&value.value==='function'&&argument?.type==='MemberExpression'&&free(argument.object,'$utils')&&property(argument)===name;
+  if(value?.type!=='Literal')return null;
+  if(value.value==='object'&&free(argument,'$utils'))return {probe:false};
+  if(value.value==='function'&&argument?.type==='MemberExpression'&&free(argument.object,'$utils')&&property(argument)===name)return {probe:true};
+  return null;
  };
  for(const n of nodes){
   if(n.type!=='ConditionalExpression'||comments.some(c=>c.start>=n.start&&c.end<=n.end))continue;
   const yes=n.consequent.type==='MemberExpression'&&free(n.consequent.object,'$utils')?property(n.consequent):null;
   const no=n.alternate.type==='MemberExpression'&&free(n.alternate.object,'$utils')?property(n.alternate):null;
-  const name=yes??no,fallback=yes?n.alternate:n.consequent;
-  if(!['ungzip'].includes(name)||!identity(fallback)||!guarded(n.test,name))continue;
+  const name=yes??no;
+  if(!['ungzip'].includes(name)||!guarded(n.test,name)?.probe)continue;
   const declaration=parents.get(n),binding=declaration?.type==='VariableDeclarator'&&declaration.init===n&&declaration.id.type==='Identifier'?bindings.get(declaration.id):null;
   if(!binding||binding.writes.length||!binding.refs.length||binding.refs.some(ref=>{const call=parents.get(ref);return call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement');}))continue;
   replace.set(n,`$utils.${name}`);changed=true;
-  transformations.push({kind:'native-compression-fallback',line:source.slice(0,n.start).split('\n').length,api:name,reason:'将旧平台可选压缩函数与恒等回退映射为 Egern 原生压缩 API'});
+  transformations.push({kind:'native-compression-fallback',line:source.slice(0,n.start).split('\n').length,api:name,reason:'将平台能力守卫恒真的可选压缩函数与不可达回退映射为 Egern 原生压缩 API'});
  }
  return {source:changed?renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null):source,transformations};
 }

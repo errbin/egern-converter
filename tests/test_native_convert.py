@@ -142,6 +142,7 @@ class NativeCompilerTests(unittest.TestCase):
             'const ctx="author variable";$done({body:$utils.ungzip($response.body)});',
             'const unzip=$utils.ungzip;function read(b){return unzip(b)}function decode(b){return read(b)}$done({body:decode($response.body)});',
             'const unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:x=>x;$done({body:unzip($response.body)});',
+            'const unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:b=>{throw new Error("fallback must not run")};$done({body:unzip($response.body)});',
             'const decoder={read(b){return $utils.ungzip(b)}};$done({body:decoder.read($response.body)});',
             'class Decoder{read(b){return $utils.ungzip(b)}}const decoder=new Decoder();$done({body:decoder.read($response.body)});',
         ]
@@ -151,6 +152,41 @@ class NativeCompilerTests(unittest.TestCase):
                 self.assertRegex(output,r'await ctx\d*\.compress\.gunzip\(')
                 self.assertNotIn('$utils',output)
                 self.assertEqual(compare(source,output,'surge','https://example.test/source.js',fixtures)['status'],'passed')
+
+    def test_gzip_capability_fallback_with_binary_false_reads_body_bytes(self):
+        import gzip
+        from tools.egern_hub.verify import compare
+        data='二进制响应'.encode()
+        source='const unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:b=>{throw new Error("fallback must not run")};$done({body:unzip($response.bodyBytes)});'
+        output=compile_source(source,binary=False)
+        self.assertRegex(output,r'await ctx\d*\.compress\.gunzip\(')
+        self.assertNotIn('$utils',output)
+        fixture={'name':'gzip bodyBytes','binary':True,'request':{'url':'https://example.test/'},
+                 'response':{'status':200,'bytes':list(gzip.compress(data,mtime=0))},
+                 'expected':{'result':{'body':list(data)}}}
+        for platform in ('surge','loon'):
+            with self.subTest(platform=platform):
+                result=compare(source,output,platform,'https://example.test/source.js',fixture)
+                self.assertEqual(result['status'],'passed',result)
+
+    def test_compression_capability_fallback_rejects_unproven_or_escaped_aliases(self):
+        sources=[
+            'const unzip=typeof $utils==="object"&&typeof $utils?.gunzip==="function"?$utils.ungzip:b=>{throw new Error("fallback")};$done({body:unzip($response.body)});',
+            'const key=$request.url;const unzip=typeof $utils==="object"&&typeof $utils?.[key]==="function"?$utils.ungzip:b=>{throw new Error("fallback")};$done({body:unzip($response.body)});',
+            '$utils.ungzip=value=>value;const unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:b=>{throw new Error("fallback")};$done({body:unzip($response.body)});',
+            'const unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:b=>{throw new Error("fallback")};$done({body:[1].map(unzip)});',
+            'let unzip=typeof $utils==="object"&&typeof $utils?.ungzip==="function"?$utils.ungzip:b=>{throw new Error("fallback")};if($request.url)unzip=b=>b;$done({body:unzip($response.body)});',
+        ]
+        for source in sources:
+            with self.subTest(source=source),self.assertRaises(ConversionError):
+                compile_source(source,binary=True)
+        from tools.egern_hub.verify import compare
+        local='function decode($utils,fallback){const unzip=typeof $utils==="object"||typeof $utils.ungzip==="function"?$utils.ungzip:fallback;$done({body:unzip($response.body)});}decode({ungzip:value=>value},value=>"fallback");'
+        output=compile_source(local)
+        self.assertNotIn('ctx.compress.gunzip',output)
+        fixture={'name':'shadowed utils','request':{'url':'https://example.test/'},
+                 'response':{'body':'plain'},'expected':{'result':{'body':'plain'}}}
+        self.assertEqual(compare(local,output,'surge','https://example.test/source.js',fixture)['status'],'passed')
 
     def test_gzip_invalid_stream_keeps_null_failure(self):
         from tools.egern_hub.verify import compare
