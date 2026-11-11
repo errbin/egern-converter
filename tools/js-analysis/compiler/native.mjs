@@ -323,6 +323,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
  const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
+ const shapeHostValues=new WeakSet();
  let hostRequestSnapshot=null,hostRequestInitializers=[];
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
@@ -668,6 +669,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const pendingResult=pending?fresh('pendingResult'):null;
  const pendingFinished=pending?fresh('pendingFinished'):null;
  if(pending)prefix.push('let '+pendingResult+'; let '+pendingFinished+' = false;');
+ // 完成实参可能先经过闭合 helper，而 helper 正文会在 $done 投影前渲染。
+ // 先求形可登记其中整体读取的宿主消息，避免合法的 return $response 被
+ // 后续字段检查误判为对象逃逸；任何不可证形状仍在这里失败。
+ // 这里只是提前登记宿主消息，真正的形状判定仍由 payload 完成；
+ // 预处理失败时保持原行为，避免把调度/字符串完成等合法路径一并拒绝。
+ for(const n of nodes)if(n.type==='CallExpression'&&n.arguments.length===1&&n.arguments[0].type!=='SpreadElement'&&
+  isDone(n)&&['Identifier','CallExpression','AwaitExpression','SequenceExpression','ConditionalExpression','LogicalExpression'].includes(n.arguments[0].type)){try{shape(n.arguments[0]);}catch{}}
  function closedCompletionCallback(call,arg){
   const fn=target(call?.callee),position=call?.arguments.indexOf(arg),p=fn?.params[position],id=p?.type==='AssignmentPattern'?p.left:p,b=id?.type==='Identifier'?bindings.get(id):null;
   return !!b&&!b.writes.length&&b.refs.length>0&&b.refs.every(r=>{const c=parents.get(r);return c?.type==='CallExpression'&&c.callee===r&&target(r)===target(arg);});
@@ -789,7 +797,15 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return false;
  }
  function mergeShape(fields,incoming,seen){
-   if(incoming.nullable)fields.nullable=true;
+   if(incoming.hostResponse)fields.hostResponse=true;
+   if(incoming.hostRequest)fields.hostRequest=true;
+   if(incoming.nullable){
+    const alreadyNullable=fields.nullable;
+    fields.undefinedOnly=alreadyNullable?!!(fields.undefinedOnly&&incoming.undefinedOnly):!!incoming.undefinedOnly;
+    fields.nullable=true;
+    // undefined 与其他可空来源必须分开记录；`typeof value === "object"`
+    // 只能排除 undefined，不能同时证明 null 已被排除。
+   }
   for(const [k,v] of incoming){
    if(k==='abort')fields.abortValues=[...(fields.abortValues??(fields.has(k)?[fields.get(k)]:[])),...(incoming.abortValues??[v])];
    if(k==='response'){
@@ -799,6 +815,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    fields.set(k,v);
   }
   return fields;
+ }
+ function copyShape(source){
+  const copy=new Map(source);
+  for(const key of ['nullable','undefinedOnly','hostResponse','hostRequest','responseFields','variants','abortValues'])
+   if(source[key]!==undefined)copy[key]=source[key];
+  return copy;
  }
  // 只合并函数所有实际 return 的静态形状；Promise 回调参数必须能追到同一个
  // 异步函数的返回集合，不能把 Promise 对象本身当成完成结果。
@@ -810,8 +832,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const fields=new Map();
   for(const statement of returns){
    const argument=statement.argument;
-   if(!argument||argument.type==='Literal'&&argument.value===null||argument.type==='UnaryExpression'&&argument.operator==='void'){fields.nullable=true;continue;}
-   const value=shape(argument,next);
+   if(!argument||argument.type==='UnaryExpression'&&argument.operator==='void'){fields.nullable=true;fields.undefinedOnly=true;continue;}
+   if(argument.type==='Literal'&&argument.value===null){fields.nullable=true;continue;}
+   const value=shape(argument,new Set(next));
    if(!value)return null;
    mergeShape(fields,value,next);
   }
@@ -871,9 +894,89 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return null;
  }
+ function truthyGuarded(n){
+  const binding=bindings.get(n);
+  if(!binding)return false;
+  const same=test=>test?.type==='Identifier'&&bindings.get(test)===binding;
+  for(let child=n,parent=parents.get(child);parent&&!functions.has(parent.type);child=parent,parent=parents.get(child)){
+   if(parent.type==='IfStatement'&&parent.consequent===child&&same(parent.test))return true;
+   if(parent.type==='ConditionalExpression'&&parent.consequent===child&&same(parent.test))return true;
+   if(parent.type==='LogicalExpression'&&parent.operator==='&&'&&parent.right===child&&same(parent.left))return true;
+  }
+  return false;
+ }
+ function typeGuarded(n,type){
+  const binding=bindings.get(n);
+  if(!binding)return false;
+  const same=test=>test?.type==='Identifier'&&bindings.get(test)===binding;
+  const typeofCheck=test=>test?.type==='UnaryExpression'&&test.operator==='typeof'&&same(test.argument);
+  for(let child=n,parent=parents.get(child);parent&&!functions.has(parent.type);child=parent,parent=parents.get(child)){
+   if(parent.type==='SwitchCase'&&parent.test?.type==='Literal'&&parent.test.value===type){
+    const statement=parents.get(parent);
+    if(statement?.type==='SwitchStatement'&&typeofCheck(statement.discriminant))return true;
+   }
+   if(parent.type==='BinaryExpression'&&['===','=='].includes(parent.operator)){
+    const [left,right]=parent.left===child?[parent.left,parent.right]:[parent.right,parent.left];
+    if(typeofCheck(left)&&right.type==='Literal'&&right.value===type)return true;
+   }
+  }
+  return false;
+ }
+ function closedShapeFlow(binding,seen=new Set()){
+  if(!binding||seen.has(binding))return false;
+  const next=new Set(seen).add(binding);
+  return binding.refs.every(ref=>{
+   const p=parents.get(ref);
+   if(truthyGuarded(ref))return true;
+   if(p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator))return true;
+   if(p?.type==='MemberExpression'&&p.object===ref){
+    let member=p,parent=parents.get(member);
+    while(parent?.type==='MemberExpression'&&parent.object===member){
+     if(property(parent)===undefined)return false;
+     member=parent;parent=parents.get(member);
+    }
+    if(property(p)===undefined)return false;
+    if(parent?.type==='CallExpression'&&parent.callee===member)return false;
+    if(parent?.type==='UnaryExpression'&&parent.operator==='delete')return true;
+    if(parent?.type==='AssignmentExpression'&&parent.left===member)return parent.operator==='='||parent.operator==='+='||parent.operator==='-='||parent.operator==='*='||parent.operator==='/=';
+    return true;
+   }
+   if(p?.type==='AssignmentExpression'&&p.left===ref)return p.operator==='=';
+   if(p?.type==='UpdateExpression')return false;
+   if(p?.type==='SequenceExpression')return p.expressions.at(-1)===ref;
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+    if(p.optional||p.arguments.filter(argument=>argument===ref).length!==1||p.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+    if(isDone(p)||target(p.callee)&&complete.has(target(p.callee)))return true;
+    const fn=target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params?.[position];
+    if(!functions.has(fn?.type)||parameter?.type!=='Identifier')return false;
+    return closedShapeFlow(bindings.get(parameter),next);
+   }
+   if(p?.type==='ReturnStatement'||p?.type==='ArrowFunctionExpression'&&p.body===ref)return true;
+   return ['BinaryExpression','LogicalExpression','ConditionalExpression','IfStatement','WhileStatement','DoWhileStatement','SwitchStatement','ExpressionStatement'].includes(p?.type);
+  });
+ }
  function shape(n,seen=new Set()){
   if(!n)return new Map();
   if(n.type==='AwaitExpression')return promiseShape(n.argument,seen)??shape(n.argument,seen);
+  // 宿主响应对象只有完成结果会用到的公开字段；请求对象按同一字段闭合规则
+  // 参与完成结果时也只投影可原生表达的字段。二者都不是可复制的普通记录。
+  if(free(n,'$response')){
+   shapeHostValues.add(n);
+   const fields=new Map([['status',n],['headers',n],['body',n]]);
+   fields.hostResponse=true;
+   return fields;
+  }
+  if(free(n,'$request')){
+   shapeHostValues.add(n);
+   const fields=new Map([['url',n],['method',n],['headers',n],['body',n]]);
+   fields.hostRequest=true;
+   return fields;
+  }
+  if(n.type==='Literal'&&n.value===null||n.type==='UnaryExpression'&&n.operator==='void'||free(n,'undefined')){
+   const fields=new Map();fields.nullable=true;
+   if(n.type!=='Literal'||n.value!==null)fields.undefinedOnly=true;
+   return fields;
+  }
   const resolved=promiseResolverShape(n,seen);if(resolved)return resolved;
   // 逗号表达式的完成值就是最后一个表达式；前面的副作用语句仍原样保留，
   // 不影响“最终返回的是哪个闭合对象”的形状证明。
@@ -932,14 +1035,37 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const relevantWrites=b.writes.filter(w=>w.end<=n.start);
     if(!b.init&&!relevantWrites.length)fail(n,'完成结果形状无法静态确定');
     const fields=b.init?shape(b.init,new Set(seen)):new Map();
+    if(!b.init){
+     const definite=w=>{
+      let node=w;
+      for(let parent=parents.get(node);parent&&!functions.has(parent.type);node=parent,parent=parents.get(node)){
+       if(parent.type==='LogicalExpression'||parent.type==='ConditionalExpression'&&parent.test!==node||parent.type==='IfStatement'&&parent.test!==node)return false;
+       if(['WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchStatement','TryStatement'].includes(parent.type))return false;
+       if(parent.type==='BlockStatement'||parent.type==='Program'){
+        const position=parent.body.indexOf(node);
+        if(position<0)return false;
+        return parent.body.slice(0,position).some(statement=>{
+         if(statement.type==='ExpressionStatement'&&statement.expression.type==='AssignmentExpression')return statement.expression.left.type==='Identifier'&&bindings.get(statement.expression.left)===b;
+         if(statement.type==='VariableDeclaration')return statement.declarations.some(declaration=>declaration.id.type==='Identifier'&&bindings.get(declaration.id)===b&&declaration.init);
+         return false;
+        });
+       }
+      }
+      return false;
+     };
+     if(!relevantWrites.some(definite)){fields.nullable=true;fields.undefinedOnly=true;}
+    }
     for(const w of relevantWrites){
      if(w.type!=='AssignmentExpression'||w.operator!=='=')fail(n,'完成结果变量被重新赋值，无法确定字段');
      mergeShape(fields,shape(w.right,new Set(seen)),seen);
     }
     if(fields.nullable){
-     if(!completionTruthyGuard(n,b))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
-     fields.nullable=false;
+     const truthy=truthyGuarded(n)||completionTruthyGuard(n,b);
+     const objectGuard=typeGuarded(n,'object');
+     if(!truthy&&!(objectGuard&&fields.undefinedOnly))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     fields.nullable=false;fields.undefinedOnly=false;
     }
+    const closed=closedShapeFlow(b);
     for(const ref of b.refs){
      if(ref.start>=n.start)continue;
      const p=parents.get(ref),a=parents.get(p);
@@ -951,6 +1077,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(a?.type==='AssignmentExpression'&&a.left===p)mergeShape(fields,new Map([[property(p),a.right]]),seen);
      }else if(p?.type==='IfStatement'&&p.test===ref&&b.refs.some(other=>completionTruthyGuard(other,b)===ref))continue;
       else if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
+     else if(closed)continue;
      else if(p?.type==='LogicalExpression'&&['||','??'].includes(p.operator)&&p.left===ref&&p.right.type==='AssignmentExpression'&&p.right.left.type==='Identifier'&&bindings.get(p.right.left)===b)continue;
      else if(!(p?.type==='CallExpression'&&isDone(p))&&!(p?.type==='CallExpression'&&target(p.callee)&&complete.has(target(p.callee))))fail(ref,'可变完成结果对象逃逸，无法确定字段');
     }
@@ -959,9 +1086,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(b.init){
     const fields=shape(b.init,seen);
     if(fields.nullable){
-     if(!completionTruthyGuard(n,b))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     if(!truthyGuarded(n)&&!completionTruthyGuard(n,b))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
      fields.nullable=false;
     }
+    const closed=closedShapeFlow(b);
     for(const ref of b.refs){
      const p=parents.get(ref),a=parents.get(p);
      if(p?.type==='MemberExpression'&&p.object===ref){
@@ -970,16 +1098,32 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(a?.type==='AssignmentExpression'&&a.left===p)mergeShape(fields,new Map([[property(p),a.right]]),seen);
      }else if(p?.type==='IfStatement'&&p.test===ref&&b.refs.some(other=>completionTruthyGuard(other,b)===ref))continue;
       else if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
+     else if(closed)continue;
      else if(!(p?.type==='CallExpression'&&isDone(p))&&!(p?.type==='CallExpression'&&target(p.callee)&&complete.has(target(p.callee))))fail(ref,'完成结果对象逃逸，无法追溯所有字段修改');
     }
     return fields;
    }
    // A forwarding parameter can be resolved from every direct caller.
    let fn=null,param=-1;for(const f of nodes)if(functions.has(f.type)){const i=f.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);if(i>=0){fn=f;param=i;break;}}
-   if(fn){const calls=nodes.filter(c=>c.type==='CallExpression'&&target(c.callee)===fn);if(calls.length){const all=new Map();for(const c of calls){const argument=c.arguments[param],parameter=fn.params[param],fallback=parameter.type==='AssignmentPattern'?parameter.right:undefined;mergeShape(all,shape(!argument||free(argument,'undefined')?fallback:argument,new Set(seen)),seen);} return all;}}
+   if(fn){
+    if(!closedShapeFlow(b))fail(n,'完成结果参数逃逸，无法追溯所有字段修改');
+    const calls=nodes.filter(c=>c.type==='CallExpression'&&target(c.callee)===fn);if(calls.length){
+    const values=[];
+    for(const c of calls){const argument=c.arguments[param],parameter=fn.params[param],fallback=parameter.type==='AssignmentPattern'?parameter.right:undefined;const value=shape(!argument||free(argument,'undefined')?fallback:argument,new Set(seen));if(value.nullable&&argument&&truthyGuarded(argument))value.nullable=false;values.push(value);}
+    const all=new Map();for(const value of values)mergeShape(all,value,seen);
+    // 完成包装函数的各直接调用点可能位于互斥分支。保留每个调用点的闭合
+    // 形状，供完成值在运行时按判别键分派；不把互斥字段合成为一个不存在的对象。
+    const signatures=new Set();
+    const variants=values.filter(value=>{
+     const signature=JSON.stringify([...value.keys()].sort())+'|'+!!value.nullable;
+     if(signatures.has(signature))return false;signatures.add(signature);return true;
+    });
+    if(variants.length>1)all.variants=variants;
+    return all;
+   }}
   }
-  if(n.type==='CallExpression'&&n.callee.type==='Identifier'){
-   const fn=target(n.callee);
+  if(n.type==='CallExpression'&&(n.callee.type==='Identifier'||functions.has(n.callee.type))){
+   const fn=functions.has(n.callee.type)?n.callee:target(n.callee);
    if(fn&&!fn.async){const fields=returnedShape(fn,seen);if(fields)return fields;}
   }
   fail(n,'完成结果形状无法静态确定');
@@ -1012,6 +1156,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(format!=='qx'||nested)fail(n,'字符串完成结果需要 QX 的 $done(body) 契约；当前平台没有已确认的字符串完成映射');
    return '{body: '+render(n)+'}';
   }
+  if(!reference&&free(n,'$request')){
+   if(nested)fail(n,'请求对象不能嵌套为响应完成结果');
+   shapeHostValues.add(n);
+  }
   if(!reference&&free(n,'$response')){
    if(bodyWrites.has('response:body'))fail(n,'响应正文重绑后不能整体传递响应对象，无法证明状态与头部更新');
    if(nested)fail(n,'响应对象不能嵌套为请求阶段的合成响应');
@@ -1020,12 +1168,42 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return `(${context}.response ? {status: ${context}.response.status, headers: ${body} === undefined ? ${context}.response.headers : ${cleanHeaders(context+'.response.headers')}, body: ${body}} : {})`;
   }
   const fields=provenFields??shape(n);for(const k of fields.keys())if(!['url','method','headers','body','bodyBytes','status','response','abort'].includes(k))fail(n,'不支持的完成字段：'+k);
+  if(fields.hostRequest&&!fields.variants?.length){
+   const value=reference??render(n),body=readBody('$request','body');
+   return `((${value}) => ({url: ${value}.url, ...(${value}.method === undefined ? {} : {method: ${value}.method}), ...(${value}.headers === undefined ? {} : {headers: Object.fromEntries(${value}.headers)}), ...(${body} === undefined ? {} : {body: ${body}})}))(${value})`;
+  }
+  if(fields.variants?.length>1){
+   const value=reference??fresh('completionValue');
+   const guards=fields.variants.map(variant=>{
+    const keys=new Set(variant.keys());
+    const category=variant.hostRequest?'request':keys.has('response')?'response':keys.has('url')?'url':keys.has('abort')?'abort':keys.has('status')||keys.has('headers')||keys.has('body')||keys.has('bodyBytes')?'responseShape':'empty';
+    let test;
+    if(category==='response')test=`${value} && typeof ${value} === 'object' && 'response' in ${value}`;
+    else if(category==='request')test=`${value} === ${render(variant.get('url'))}`;
+    else if(category==='url')test=`${value} && typeof ${value} === 'object' && 'url' in ${value} && !('status' in ${value})`;
+    else if(category==='abort')test=`${value} && typeof ${value} === 'object' && 'abort' in ${value}`;
+    else if(category==='responseShape')test=variant.hostResponse?`${context}.response !== undefined && ${value} === ${context}.response`:`${value} && typeof ${value} === 'object' && !('response' in ${value}) && ('status' in ${value} || !('url' in ${value}) && ('headers' in ${value} || 'body' in ${value} || 'bodyBytes' in ${value}))`;
+    else test=null;
+    return {category,test,variant};
+   });
+   const categories=new Set(guards.map(item=>item.category));
+   if(guards.filter(item=>item.category!=='empty').length&&categories.size===guards.length){
+    const fallback=guards.find(item=>item.category==='empty');
+    let text=fallback?payload(n,false,value,copyShape(fallback.variant)):'{}';
+    for(const item of guards.filter(item=>item.category!=='empty')){
+     const variant=copyShape(item.variant);variant.nullable=false;
+     text=`(${item.test} ? ${payload(n,false,value,variant)} : ${text})`;
+    }
+    return `((${value}) => ${text})(${render(n)})`;
+   }
+  }
   if(fields.nullable){
    // 被调函数返回 null 时，`$done(value())` 等价于不修改消息；只有所有非空
    // 返回分支都具备封闭完成形状时才成立。这里只求值一次，其余可空形态仍拒绝。
    if(reference||!fields.size)fail(n,'完成结果可能为空，不能映射为固定字段');
    const value=fresh('completionValue');
-   return `((${value}) => ${value} == null ? {} : ${payload(n,false,value,new Map(fields))})(${render(n)})`;
+   const nestedFields=copyShape(fields);nestedFields.nullable=false;nestedFields.undefinedOnly=false;
+   return `((${value}) => ${value} == null ? {} : ${payload(n,false,value,nestedFields)})(${render(n)})`;
   }
   if(fields.has('abort')){
    if(fields.size!==1||(fields.abortValues??[fields.get('abort')]).some(v=>resolve(v)?.value!==true))fail(n,'abort 仅支持静态 true');
@@ -1047,7 +1225,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const out=[];for(const [k,v]of fields){let val=k==='bodyBytes'?bytes(v):k==='body'?bodyValue(v):k==='status'?status(v):render(v);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=cleanHeaders(val);out.push(`${k==='bodyBytes'?'body':k}: ${val}`);}text='{'+out.join(', ')+'}';
   }else{
    // Copy only statically proven fields, preserving branches where a field is absent.
-   const input=reference??render(n),value=reference||n.type==='Identifier'?input:fresh('completionValue'),out=[];for(const [k,v]of fields){let val=k==='bodyBytes'?bytesText(value+'.bodyBytes'):`${value}.${k}`;if(k==='status')val=nativeStatus(`${value}.status`);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=`${value}.body === undefined && ${value}.bodyBytes === undefined ? ${value}.headers : ${cleanHeaders(value+'.headers')}`;out.push(`...(${value}.${k} === undefined ? {} : {${k==='bodyBytes'?'body':k}: ${val}})`);}text='{'+out.join(', ')+'}';
+   const input=reference??render(n),value=reference||n.type==='Identifier'?input:fresh('completionValue'),out=[];for(const [k,v]of fields){let val=k==='bodyBytes'?bytesText(value+'.bodyBytes'):`${value}.${k}`;if(k==='body'&&fields.hostResponse)val=readBody('$response','body');if(k==='bodyBytes'&&fields.hostResponse)val=readBody('$response','bodyBytes');if(k==='status')val=nativeStatus(`${value}.status`);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=`${value}.body === undefined && ${value}.bodyBytes === undefined ? ${value}.headers : ${cleanHeaders(value+'.headers')}`;out.push(`...(${value}.${k} === undefined ? {} : {${k==='bodyBytes'?'body':k}: ${val}})`);}text='{'+out.join(', ')+'}';
    if(!reference&&n.type!=='Identifier')evaluate={value,input};
   }
   const absent=evaluate?` || ${evaluate.value}.status === undefined`:reference||n?.type==='Identifier'?` || ${reference??render(n)}.status === undefined`:'';
@@ -2193,7 +2371,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const p=parents.get(n);
     const other=p?.left===n?p.right:p?.left;
     const nullCheck=p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined'));
-    if(!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
+    if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
    }
    if(map[n.name])return map[n.name];
    if(n.name.startsWith('$'))fail(n,'平台 API 作为值传递，无法直接原生改写：'+n.name);
@@ -2416,6 +2594,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const reads=new Set(),whole=[];
   for(const ref of nodes.filter(n=>n.type==='Identifier'&&free(n,'$request'))){
    const p=parents.get(ref);
+   // 整体请求直接交给已证明的完成包装函数时，完成值本身仍走 shape/payload
+   // 的字段投影；这里只把投影需要的只读字段加入快照，不把宿主对象本身放行。
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&!p.arguments.some(a=>a.type==='SpreadElement')&&
+      (isDone(p)||target(p.callee)&&complete.has(target(p.callee)))){
+    for(const field of ['url','method','headers','body'])reads.add(field);
+    continue;
+   }
    if(p?.type==='MemberExpression'&&p.object===ref){
     const field=property(p);
     if(field===undefined||!directFields.has(field)||parents.get(p)?.type==='MemberExpression')return stop('direct field:'+(field??'dynamic'));

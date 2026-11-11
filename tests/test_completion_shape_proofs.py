@@ -9,6 +9,13 @@ URL = 'https://example.test/source.js'
 
 
 class CompletionShapeProofTests(unittest.TestCase):
+    def check(self, source, cases, format='loon'):
+        output = convert_script(source, 'Fixture', URL, '', source_format=format)
+        self.assertNotIn('$done(', output)
+        for case in cases:
+            result = compare(source, output, format, URL, case)
+            self.assertEqual(result['status'], 'passed', result)
+
     def test_direct_nullable_return_and_promise_resolution_keep_result_shape(self):
         sources = [
             '''function result(){if($request.url.includes('empty'))return null;return {body:'changed'};}
@@ -80,6 +87,84 @@ new Promise(r=>r()).finally(()=>{
         ]
         for source in sources:
             with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '完成结果|形状'):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')
+
+    def test_type_guarded_uninitialized_and_closed_host_response_shapes(self):
+        sources = [
+            '''async function produce(){return {body:'changed'}}
+let result;
+(async()=>{result=await produce()})();
+new Promise(resolve=>resolve()).finally(()=>{switch(typeof result){case 'object':$done(result);break;}});''',
+            '''function snapshot(){try{return $response}catch{return}}
+$done(snapshot());''',
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                self.check(source, [
+                    {'name':'guarded completion', 'request':{'url':URL},
+                     'response':{'status':200,'body':'original'}},
+                ])
+                if source.startswith('function snapshot'):
+                    self.check(source, [{'name':'guarded completion without response',
+                                         'request':{'url':URL}}])
+
+        source = '''function produce(empty){if(empty)return;return {body:'changed'}}
+let result;
+(async()=>{result=await produce($request.url.includes('empty'))})();
+new Promise(resolve=>resolve()).finally(()=>{switch(typeof result){case 'object':$done(result);break;case 'undefined':$done({});break;}});'''
+        self.check(source, [{'name':'undefined return guard '+state,
+            'request':{'url':URL+('' if state=='value' else '/empty')},
+            'response':{'body':'original'}} for state in ['value','empty']])
+
+        source = '''function finish(response){return {body:response.body}}
+$httpClient.get({url:'https://example.test/api'},(error,response,body)=>{
+if(error)$done({});else $done(finish(response));});'''
+        self.check(source, [{'name':'closed host response helper', 'request':{'url':URL},
+            'http':[{'url':'https://example.test/api','status':200,'body':'reply'}]}])
+
+        source = '''function finish(value){$done(value)}
+if($argument==='response')finish($response);
+else if($argument==='wrap')finish({response:$response});
+else if($argument==='request')finish($request);
+else finish({});'''
+        self.check(source, [{'name':'completion variant '+argument,
+            'request':{'url':URL,'method':'GET'},
+            'response':{'status':200,'body':'original'},
+            'argument':argument} for argument in ['response','wrap','request','empty']])
+
+        source = '''function finish(value){$done(value)}
+let result;
+(async()=>{result=$response})();
+new Promise(resolve=>resolve()).finally(()=>{
+  if(result){if($argument==='response'){result.status=201;finish(result);}else finish({});}
+  else finish({});
+});'''
+        self.check(source, [{'name':'mutated host response '+argument,
+            'request':{'url':URL},
+            'response':{'status':200,'body':'original'},
+            'argument':argument} for argument in ['response','empty']])
+        self.check(source, [{'name':'mutated host response without response',
+            'request':{'url':URL},
+            'argument':argument} for argument in ['response','empty']])
+
+    def test_unproven_completion_shape_variants_remain_rejected(self):
+        sources = [
+            '''let result;(async()=>{result=null})();
+new Promise(resolve=>resolve()).finally(()=>{switch(typeof result){case 'object':$done(result);break;}});''',
+            '''async function produce(){return {body:'changed'}}let result;
+(async()=>{result=await produce()})();
+new Promise(resolve=>resolve()).finally(()=>{switch(typeof result){case 'object':$done(result);break;default:$done(result)}});''',
+            '''async function produce(){return {body:'changed'}}let result;
+(async()=>{result=await produce()})();
+new Promise(resolve=>resolve()).finally(()=>$done(result));''',
+            '''$done({body:'changed',unknown:1});''',
+            '''function finish(value){$done(value)}
+if($argument)finish({response:{body:'a'},body:'x'});else finish({response:{body:'b'}});''',
+            '''function finish(value){unknown(value);return value}
+$done(finish($response));''',
+        ]
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '完成结果|支持|response'):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
 
