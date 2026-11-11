@@ -1941,12 +1941,28 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      return null;
     };
     const dispatches=binding.refs.map(dispatchOf).filter(Boolean);
-    if(dispatches.length!==1)return false;
-    const dispatch=dispatches[0];
-    if(parameter&&binding.writes.length&&binding.writes[0].end>=dispatch.start)return false;
+    if(!dispatches.length)return false;
+    // 同一记录可能在同一 if/else 决策树的两个互斥分支里各自派发一次。
+    // 只有两两互斥时才允许多个派发点；顺序执行的两个接收者仍然拒绝。
+    const exclusive=(a,b)=>{
+     for(let ancestor=parents.get(a);ancestor;ancestor=parents.get(ancestor)){
+      if(ancestor.type!=='IfStatement'&&ancestor.type!=='ConditionalExpression')continue;
+      const consequent=ancestor.consequent,alternate=ancestor.alternate;if(!consequent||!alternate)continue;
+      const side=(node,part)=>part.start<=node.start&&node.end<=part.end;
+      const left=side(a,consequent)?'consequent':side(a,alternate)?'alternate':null;
+      const right=side(b,consequent)?'consequent':side(b,alternate)?'alternate':null;
+      if(left&&right&&left!==right)return true;
+     }
+     return false;
+    };
+    if(dispatches.length>1&&!dispatches.every((a,i)=>dispatches.every((b,j)=>i===j||exclusive(a,b))))return false;
+    const dispatch=dispatches[0],dispatchSet=new Set(dispatches);
+    const firstDispatch=dispatches.reduce((a,b)=>a.start<=b.start?a:b);
+    if(parameter&&binding.writes.length&&binding.writes[0].end>=firstDispatch.start)return false;
     // 请求对象仍可能被派发后才运行的定时器或回调捕获。这些捕获不能改写已发送
     // 的内容，但也不得修改记录或创建可再次派发的别名。
     const dispatchOwner=owners.get(dispatch),deferredFns=new Set();
+    if(dispatches.some(call=>owners.get(call)!==dispatchOwner))return false;
     const addCallback=(value)=>{const fn=target(value);if(fn&&fn!==dispatchOwner)deferredFns.add(fn);};
     const addCallCallbacks=(call,seen=new Set())=>{
      if(!call||seen.has(call))return;seen=new Set(seen);seen.add(call);
@@ -1957,7 +1973,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(chained?.type==='CallExpression'&&chained.callee===holder)addCallCallbacks(chained,seen);
      }
     };
-    addCallCallbacks(dispatch);
+    for(const call of dispatches)addCallCallbacks(call);
     for(const call of nodes)if(call.type==='CallExpression'&&owners.get(call)===dispatchOwner&&(free(call.callee,'setTimeout')||free(call.callee,'setInterval')))for(const argument of call.arguments)addCallback(argument);
     const pending=[...deferredFns];
     while(pending.length){
@@ -2001,7 +2017,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const transportFlag=field=>['binary-mode','full-header-mode','auto-redirect','auto-cookie','insecure'].includes(field);
     for(const ref of binding.refs){
      const p=parents.get(ref),q=parents.get(p);
-     if(p===dispatch)continue;
+     if(dispatchSet.has(p))continue;
      if(deferredRef(ref)){
       if(mutatesRequest(ref)||deferredEscape(ref))return false;
       continue;
@@ -2030,16 +2046,16 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(nested===undefined)return false;
       if(field==='headers'||field==='header'){
        const use=parents.get(q);
-       if(use?.type==='AssignmentExpression'&&use.left===q){if(use.operator!=='='||!(use.end<dispatch.start))return false;}
-       else if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===q){if(!(use.end<dispatch.start))return false;}
+       if(use?.type==='AssignmentExpression'&&use.left===q){if(use.operator!=='='||!(use.end<firstDispatch.start))return false;}
+       else if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===q){if(!(use.end<firstDispatch.start))return false;}
        else if(use?.type==='CallExpression'&&use.callee===q)return false;
        continue;
       }
       if(field==='method'&&['toLocaleLowerCase','toLowerCase'].includes(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)continue;
       if(field==='opts'&&qx&&['redirection','skip-cert-verify','auto-cookie','policy'].includes(String(nested))){
        const use=parents.get(q);
-       if(use?.type==='AssignmentExpression'&&use.left===q){if(use.operator!=='='||!(use.end<dispatch.start))return false;continue;}
-       if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===q){if(!(use.end<dispatch.start))return false;continue;}
+       if(use?.type==='AssignmentExpression'&&use.left===q){if(use.operator!=='='||!(use.end<firstDispatch.start))return false;continue;}
+       if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===q){if(!(use.end<firstDispatch.start))return false;continue;}
        if(use?.type==='CallExpression'&&use.callee===q)return false;
        continue;
       }
@@ -2047,7 +2063,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      }
      if(q?.type==='AssignmentExpression'&&q.left===p){
       if(q.operator!=='='&&!(q.operator==='+='&&field==='url'))return false;
-      if(!(q.end<dispatch.start))return false;
+      if(!(q.end<firstDispatch.start))return false;
       if(transportFlag(field)){
        const value=resolve(q.right);
        if(baseFields?.has(field)&&(conditionalWrite(q)||value?.type!=='Literal'||typeof value.value!=='boolean'))return false;
@@ -2055,9 +2071,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       continue;
      }
      if(q?.type==='UpdateExpression')return false;
-     if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<dispatch.start))return false;continue;}
+     if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<firstDispatch.start))return false;continue;}
      if(q?.type==='CallExpression'&&q.arguments.includes(p)){
-      if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<dispatch.start))return false;continue;}
+      if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<firstDispatch.start))return false;continue;}
       if(['url','method','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'].includes(field))continue;
       return false;
      }
@@ -2942,6 +2958,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(free(o,'$prefs')&&format==='qx'){
     const storageMethod={valueForKey:'get',setValueForKey:'set',removeValueForKey:'delete'}[k];
     if(!storageMethod)fail(n,'未知 QX 存储成员：'+k);
+    const p=parents.get(n);
+    const probe=p?.type==='UnaryExpression'&&['!','typeof'].includes(p.operator)||p?.type==='LogicalExpression'||
+     ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===n;
+    if(!probe)fail(n,'存储方法引用只能用于存在性判断或直接调用');
+    return context+'.storage.'+storageMethod;
+   }
+   if(free(o,'$persistentStore')){
+    // 旧持久化 API 的方法引用只允许作为存在性探测；直接调用已在调用表达式
+    // 分支按同一 key/value 顺序映射，整体对象或函数别名仍按逃逸拒绝。
+    const storageMethod={read:'get',write:'set',removeValueForKey:'delete'}[k];
+    if(!storageMethod)fail(n,'未知持久化存储成员：'+k);
     const p=parents.get(n);
     const probe=p?.type==='UnaryExpression'&&['!','typeof'].includes(p.operator)||p?.type==='LogicalExpression'||
      ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(p?.type)&&p.test===n;
