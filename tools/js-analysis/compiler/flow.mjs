@@ -2,6 +2,60 @@ import {children,patch,renderTree,property,key,functions,initializedAfter,closed
 import {parse} from '../core/syntax.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 
+// 唯一静态方法定义 + 唯一调用点，且方法体只做原型/属性设置后原样返回参数：
+// 该调用对回调值而言是恒等包装。名字在整个封闭程序内必须唯一，避免同名方法
+// 来自外部对象或发生重写。
+export function closedIdentityMethodCall(ix,call,arg){
+ const {nodes,parents,bindings,free}=ix;
+ if(call?.type!=='CallExpression'||call.arguments.length!==1||call.arguments[0]!==arg)return false;
+ const callee=call.callee;if(callee.type!=='MemberExpression')return false;
+ const name=property(callee);if(name===undefined||name==='__proto__'||name==='constructor')return false;
+ const definitions=[],uses=[],definitionMembers=new Set();
+ for(const n of nodes){
+  if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&property(n.left)===name&&functions.has(n.right?.type)){definitions.push(n.right);definitionMembers.add(n.left);}
+  else if(n.type==='Property'&&n.kind==='init'&&key(n)===name&&functions.has(n.value?.type))definitions.push(n.value);
+  else if(n.type==='MemberExpression'&&property(n)===name)uses.push(n);
+ }
+ if(definitions.length!==1||uses.length!==definitionMembers.size+1||uses.find(item=>!definitionMembers.has(item))!==callee)return false;
+ const builtin=new Set(['Object','Array','JSON','Math','String','Number','Boolean','Promise','Error','Date','RegExp','Function','Symbol','Reflect','Map','Set','WeakMap','WeakSet','parseInt','parseFloat','isNaN','isFinite','encodeURI','decodeURI','encodeURIComponent','decodeURIComponent']);
+ const local=n=>{
+  if(!n)return false;
+  if(n.type==='Literal')return true;
+  if(n.type==='Identifier')return !!bindings.get(n)||builtin.has(n.name);
+  if(n.type==='MemberExpression')return local(n.object)&&(!n.computed||n.property.type==='Literal');
+  if(n.type==='CallExpression')return local(n.callee)&&!n.optional&&n.arguments.every(local);
+  if(n.type==='SequenceExpression')return n.expressions.every(local);
+  return false;
+ };
+ if(!local(callee.object))return false;
+ const wrapper=definitions[0];
+ if(wrapper.async||wrapper.generator||wrapper.params.length!==1||wrapper.params[0].type!=='Identifier')return false;
+ const parameter=bindings.get(wrapper.params[0]);if(!parameter||parameter.writes.length)return false;
+ const same=n=>n?.type==='Identifier'&&bindings.get(n)===parameter;
+ const objectBuiltin=n=>n?.type==='MemberExpression'&&free(n.object,'Object')&&['setPrototypeOf','create','defineProperty','getPrototypeOf'].includes(property(n));
+ const truth=n=>{
+  if(n?.type==='Literal')return typeof n.value==='boolean'?n.value:null;
+  if(n?.type==='UnaryExpression'&&n.operator==='!'){const value=truth(n.argument);return value===null?null:!value;}
+  if(objectBuiltin(n))return true;
+  return null;
+ };
+ const effect=n=>{
+  if(n?.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&same(n.left.object))return true;
+  if(n?.type==='CallExpression'&&objectBuiltin(n.callee)&&!n.arguments.some(argument=>argument.type==='SpreadElement'))return property(n.callee)!=='create'||!n.arguments.some(argument=>!local(argument));
+  if(n?.type==='SequenceExpression')return n.expressions.every(effect);
+  if(n?.type==='ConditionalExpression'){const value=truth(n.test);if(value===true)return effect(n.consequent);if(value===false)return effect(n.alternate);return effect(n.consequent)&&effect(n.alternate);}
+  return false;
+ };
+ const returnsParameter=n=>{
+  if(same(n))return true;
+  if(n?.type==='SequenceExpression')return n.expressions.slice(0,-1).every(effect)&&returnsParameter(n.expressions.at(-1));
+  if(n?.type==='ConditionalExpression'){const value=truth(n.test);if(value===true)return returnsParameter(n.consequent);if(value===false)return returnsParameter(n.alternate);return returnsParameter(n.consequent)&&returnsParameter(n.alternate);}
+  return false;
+ };
+ const statements=wrapper.body.type==='BlockStatement'?wrapper.body.body:[wrapper.body];
+ return statements.length===1&&statements[0].type==='ReturnStatement'&&!!statements[0].argument&&returnsParameter(statements[0].argument);
+}
+
 // Structured early-return propagation for statically resolved bundled clients.
 // Native payloads are stored only while unwinding ordinary JS helper calls;
 // there is no legacy API object, thrown sentinel or async polling runtime.
@@ -18,6 +72,25 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   n=resolve(n,seen);if(functions.has(n?.type))return [n];
   if(n?.type==='AssignmentExpression'&&n.operator==='=')return targets(n.right,seen);
   if(n?.type==='SequenceExpression')return targets(n.expressions.at(-1),seen);
+  if(n?.type==='Identifier'){
+   const binding=bindings.get(n),writes=(binding?.writes??[]).filter(write=>write.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&write.right!==n&&write.end<=n.start);
+   if(writes.length&&!seen.has(binding)){
+    const write=writes.reduce((a,b)=>a.start>b.start?a:b),ancestors=new Set();
+    for(let current=write;current;current=parents.get(current))ancestors.add(current);
+    let common=null;
+    for(let current=n;current;current=parents.get(current))if(ancestors.has(current)){common=current;break;}
+    let writeChild=write,referenceChild=n;
+    if(common){while(parents.get(writeChild)!==common)writeChild=parents.get(writeChild);while(parents.get(referenceChild)!==common)referenceChild=parents.get(referenceChild);}
+    // 必须能证明最后一次赋值在读取之前完成：同一序列、语句块或实参列表中
+    // 位于左侧且没有更晚的写入。
+    let ordered=false;
+    if(common?.type==='SequenceExpression'){const a=common.expressions.indexOf(writeChild),b=common.expressions.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
+    else if(common?.type==='BlockStatement'||common?.type==='Program'){const a=common.body.indexOf(writeChild),b=common.body.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
+    else if(common?.type==='CallExpression'){const a=common.arguments.indexOf(writeChild),b=common.arguments.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
+    if(ordered){const next=new Set(seen);next.add(binding);const result=targets(write.right,next);return result;}
+   }
+  }
+  if(n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.arguments.length===1&&closedIdentityMethodCall(ix,n,n.arguments[0]))return targets(n.arguments[0],seen);
   if(n?.type==='MemberExpression'){
    const object=resolve(n.object,new Set(seen));
    if(object?.type==='ObjectExpression'){
@@ -70,6 +143,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
  }}
  function closedCallback(call,arg,seen=new Set()){
   if(isHTTP?.(call)&&call.arguments[1]===arg)return true;
+  if(closedIdentityMethodCall(ix,call,arg))return true;
   if(timerCallback(call)&&call.arguments[0]===arg)return true;
   if(call?.type==='NewExpression'&&free(call.callee,'Promise')&&call.arguments.length===1&&call.arguments[0]===arg)return targets(arg).length===1&&executors.has(targets(arg)[0]);
   const fns=targets(call?.callee),position=call?.arguments.indexOf(arg);
@@ -91,7 +165,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   // “目标函数忽略返回值”不能成立，因此该族继续按未知回调拒绝。
   if(functions.has(n.type)&&(done.has(n)||asyncAdded.has(n))&&n.type!=='FunctionDeclaration'){
    const p=parents.get(n);
-   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
+   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='SequenceExpression'&&p.expressions.at(-1)===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
   }
   if(free(n,'globalThis')){
    const p=parents.get(n);
@@ -212,13 +286,16 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type==='MemberExpression'&&free(n.object,'$utils'))return result(raw(n));
   const opaqueCallee=n.type==='CallExpression'&&(n.callee.type==='MemberExpression'&&free(n.callee.object)&&['$notification','$utils','$persistentStore','$prefs','$task','$httpClient'].includes(n.callee.object.name)||n.callee.type==='Identifier'&&free(n.callee,'$log'));
   const parts=children(n).filter(([field,c])=>(!opaqueCallee||field!=='callee')&&(!['Property','MethodDefinition'].includes(n.type)||c===n.value||n.computed)).map(([field,c])=>({field,node:c,value:expression(c,owner)}));
+  // 纯读取的接收者没有求值顺序副作用，参数中的完成副作用可以先展开。
+  const simpleReference=node=>node.type==='Identifier'||node.type==='ThisExpression'||node.type==='MemberExpression'&&!node.optional&&property(node)!==undefined&&simpleReference(node.object);
   const before=[];
   for(let i=0;i<parts.length;i++){
    const p=parts[i];before.push(...p.value.before);
    let code=p.value.code;
    if(parts.slice(i+1).some(x=>x.value.before.length)&&!['Literal','FunctionExpression','ArrowFunctionExpression'].includes(p.node.type)){
     if(n.type==='AssignmentExpression'&&n.operator==='='&&p.field==='left'&&['Identifier','ArrayPattern','ObjectPattern'].includes(p.node.type)){substitutions.set(p.node,code);continue;}
-    if(n.type==='CallExpression'&&p.field==='callee'||n.type==='AssignmentExpression'&&p.field==='left')fail(n,'复杂接收者与完成参数交错，需先确定求值顺序');
+    if(n.type==='CallExpression'&&p.field==='callee'){if(simpleReference(p.node))continue;fail(n,'复杂接收者与完成参数交错，需先确定求值顺序');}
+    if(n.type==='AssignmentExpression'&&p.field==='left'){if(p.node.type==='Identifier'||p.node.type==='MemberExpression'&&simpleReference(p.node.object))continue;fail(n,'复杂接收者与完成参数交错，需先确定求值顺序');}
     const saved=fresh('value');before.push(`const ${saved} = ${code};`);code=saved;
    }
    substitutions.set(p.node,code);

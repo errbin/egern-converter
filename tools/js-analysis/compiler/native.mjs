@@ -3,10 +3,10 @@ import {parse,withSyntaxCache} from '../core/syntax.mjs';
 import {analyze} from '../analysis/analyze.mjs';
 import {rewriteUsageComments,copyrightDocumentation,formatNative,compactNative,singleLineSource} from '../output/source.mjs';
 import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/clients.mjs';
-import {structuredFlow,completionStatements,pendingCompletion} from './flow.mjs';
+import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
@@ -36,6 +36,9 @@ function compileNative(source,format,options){
     stateMachineProof={detected:proof.detected,proved:proof.proved,release:proof.release,gaps:proof.gaps,summary:proof.summary};
    }catch(error){stateMachineProof={detected:0,proved:false,release:false,gaps:['状态机证明失败：'+error.message],summary:{machines:0,proved:0,states:0,edges:0,saveSlots:0,driveCount:0,externalDrives:0}};}
   }
+  const forwarders=lowerCompletionForwarders(dispatch.source,[]);
+  dispatch.source=forwarders.source;
+  dispatch.transformations.push(...forwarders.transformations);
   const minimalStateMachines=lowerMinimalRegenerator(dispatch.source);
   dispatch.source=minimalStateMachines.source;
   dispatch.transformations.push(...minimalStateMachines.transformations);
@@ -601,6 +604,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  }));
  function target(n,seen=new Set()){
   if(functions.has(n?.type))return n;
+  if(n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.arguments.length===1&&!n.optional&&closedIdentityMethodCall(ix,n,n.arguments[0]))return target(n.arguments[0],seen);
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b&&!b.writes.length&&!seen.has(b)){seen.add(b);if(b.fn||b.init)return b.fn??target(b.init,seen);
    for(const fn of nodes.filter(n=>functions.has(n.type))){const position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);if(position<0)continue;
     const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),callee=id?bindings.get(id):null;
@@ -953,7 +957,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(functions.has(n.type)&&complete.has(n)){
    const p=parents.get(n);
-   if(p?.type==='CallExpression'&&p.callee!==n){const m=p.callee.type==='MemberExpression'?property(p.callee):null;if(!['then','catch'].includes(m)&&!clientMethod(p.callee)&&!closedCompletionCallback(p,n))fail(n,'完成函数作为回调传递，无法证明全局终止流程');}
+   if(p?.type==='CallExpression'&&p.callee!==n){const m=p.callee.type==='MemberExpression'?property(p.callee):null;if(!['then','catch'].includes(m)&&!clientMethod(p.callee)&&!closedCompletionCallback(p,n)&&!closedIdentityMethodCall(ix,p,n))fail(n,'完成函数作为回调传递，无法证明全局终止流程');}
    if(p?.type==='NewExpression')fail(n,'Promise 执行器中的完成操作不能直接改写为 return');
   }
   if(n.type==='CallExpression'&&terminal(n)){

@@ -909,3 +909,92 @@ function applyLocalEdits(source,edits){
  for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
  return output;
 }
+
+// 封闭转发器只做一次原序转交：直接 `return first(second)`，或经闭合字面量
+// 表逐层转发到同样的纯函数。参数不得重写、函数体不得有其它语句。
+function completionForwarderContext(ix){
+ const {nodes,parents,bindings,free}=ix;
+ const functionAt=(callee,seen=new Set())=>{
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(!binding||binding.writes.length||seen.has(binding))return null;
+   const value=binding.fn??binding.init;
+   return functions.has(value?.type)?value:null;
+  }
+  if(callee?.type==='MemberExpression'){
+   const name=property(callee);
+   if(name===undefined||callee.computed&&callee.property.type!=='Literal')return null;
+   let object=callee.object;
+   if(object.type==='Identifier'){
+    const binding=bindings.get(object);
+    if(!binding||binding.writes.length||seen.has(binding))return null;
+    // 查表对象必须是完全闭合的字面量：只允许通过静态属性读取，不能再写入
+    // 任何成员，也不能作为整体传给其它代码。
+    for(const ref of binding.refs){
+     const use=parents.get(ref);
+     if(use?.type!=='MemberExpression'||use.object!==ref||property(use)===undefined||use.computed&&use.property.type!=='Literal')return null;
+     const parent=parents.get(use);
+     if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return null;
+    }
+    object=binding.init;
+   }
+   if(object?.type!=='ObjectExpression')return null;
+   const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+   if(entries.length!==1||entries[0].computed&&entries[0].key.type!=='Literal'||!functions.has(entries[0].value.type))return null;
+   return entries[0].value;
+  }
+  return null;
+ };
+ const sameParameter=(node,parameter,binding)=>node?.type==='Identifier'&&bindings.get(node)===bindings.get(parameter)&&!!binding;
+ const forwarder=(fn,seen=new Set())=>{
+  if(!functions.has(fn?.type)||fn.async||fn.generator||seen.has(fn))return false;
+  seen=new Set(seen);seen.add(fn);
+  if(fn.params.length!==2||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
+  const [first,second]=fn.params,firstBinding=bindings.get(first),secondBinding=bindings.get(second);
+  if(!firstBinding||!secondBinding||firstBinding.writes.length||secondBinding.writes.length)return false;
+  const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+  if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return false;
+  const call=statements[0].argument;
+  if(call.type!=='CallExpression'||call.optional||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(call.arguments.length===1&&sameParameter(call.callee,first,firstBinding)&&sameParameter(call.arguments[0],second,secondBinding))return true;
+  if(call.arguments.length!==2)return false;
+  const target=functionAt(call.callee,seen);
+  if(!target||!forwarder(target,seen))return false;
+  return sameParameter(call.arguments[0],first,firstBinding)&&sameParameter(call.arguments[1],second,secondBinding);
+ };
+ return call=>{
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==2||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(!free(call.arguments[0],'$done'))return false;
+  const fn=functionAt(call.callee);
+  return !!fn&&forwarder(fn);
+ };
+}
+
+// 只有需要异步降级的机器区域才把转发器还原成直接完成调用；其它区域的
+// 转发器保持原样，避免把原本不可证的嵌入式完成路径带进原生终止分析。
+export function closedCompletionForwarderCall(ix,call){
+ try{return completionForwarderContext(ix)(call);}catch{return false;}
+}
+
+export function lowerCompletionForwarders(source,ranges=null){
+ if(!source.includes('$done'))return {source,transformations:[],edits:[]};
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
+ catch{return {source,transformations:[],edits:[]};}
+ const {nodes,parents}=ix,isForwarder=completionForwarderContext(ix),edits=[];
+ for(const call of nodes){
+  const inside=ranges?.some(([start,end])=>call.start>=start&&call.end<=end);
+  const parent=parents.get(call);
+  const standalone=parent?.type==='ExpressionStatement'&&parent.expression===call||
+   parent?.type==='ReturnStatement'&&parent.argument===call||
+   parent?.type==='ArrowFunctionExpression'&&parent.body===call;
+  if(ranges&&!inside&&!standalone)continue;
+  if(!isForwarder(call))continue;
+  edits.push({start:call.start,end:call.end,replacement:'$done('+source.slice(call.arguments[1].start,call.arguments[1].end)+')',line:source.slice(0,call.start).split('\n').length});
+ }
+ if(!edits.length)return {source,transformations:[],edits:[]};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return {source:output,edits,transformations:edits.map(({line})=>({kind:'completion-forwarder',line,reason:'封闭转发函数只把完成函数与载荷按原顺序转交，改写为直接完成调用'}))};
+}
+
