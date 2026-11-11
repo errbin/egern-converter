@@ -792,7 +792,7 @@ export function lowerMinimalRegenerator(source){
  for(let i=0;i<proof.machines.length;i++){
   const machine=proof.machines[i];
   if(!machine.minimal||!wraps[i])continue;
-  const plan=planLowering(wraps[i],ix,source);
+  const plan=planLowering(wraps[i],ix,source,machine);
   if(plan.error){released.push({line:machine.line,released:false,reason:plan.error});continue;}
   edits.push(...plan.edits);
   released.push({line:machine.line,released:true});
@@ -808,7 +808,7 @@ export function lowerMinimalRegenerator(source){
  return {source:output,transformations:released.filter(item=>item.released).map(item=>({kind:'minimal-regenerator',line:item.line})),released};
 }
 
-function planLowering(call,ix,source){
+function planLowering(call,ix,source,machine){
  const {parents,bindings,free}=ix;
  const ret=parents.get(call);
  if(ret?.type!=='ReturnStatement'||ret.argument!==call)return {error:'极简状态机必须由外层函数直接返回'};
@@ -823,7 +823,9 @@ function planLowering(call,ix,source){
  const inner=call.arguments[0];
  if(inner.type!=='FunctionExpression'||inner.async||inner.generator||inner.id||inner.params.length!==1||inner.params[0].type!=='Identifier'||inner.body.type!=='BlockStatement')return {error:'极简状态机正文形状未知'};
  const tryNode=call.arguments[3];
- if(tryNode&&!(tryNode.type==='Literal'&&tryNode.value===null))return {error:'极简状态机不允许异常表'};
+ const exceptions=machine?.exceptions??[];
+ if(tryNode&&!(tryNode.type==='Literal'&&tryNode.value===null)&&!exceptions.length)return {error:'极简状态机异常表未通过证明'};
+ if(exceptions.some(entry=>typeof entry.tryLoc!=='number'||typeof entry.catchLoc!=='number'||entry.tryLoc>=entry.catchLoc))return {error:'极简状态机异常表范围不可用'};
  if(call.arguments.slice(1,3).some(argument=>!argument||!['Identifier','Literal','ThisExpression'].includes(argument.type)))return {error:'wrap 辅助参数必须是静态值'};
  const forbidden=ix.nodes.filter(n=>n.start>=inner.start&&n.end<=inner.end&&(n.type==='TryStatement'||n.type==='AwaitExpression'||n.type==='YieldExpression'||n.type==='ThisExpression'||n.type==='Super'||n.type==='MetaProperty'||n.type==='WithStatement'));
  if(forbidden.length)return {error:'极简状态机正文含未支持的执行语义'};
@@ -885,7 +887,21 @@ function planLowering(call,ix,source){
 
  const contextName=inner.params[0].name;
  const context='var '+contextName+' = {prev: 0, next: 0, sent: void 0, method: "next", arg: void 0, done: false, stop() { return {done: true}; }, abrupt(type, arg) { this.done = type === "return"; return {done: true, type: type, arg: arg}; }};';
- return {edits:[{start:ret.start,end:ret.end,replacement:context+'\n'+innerText},driverEdit]};
+ let replacement=context+'\n'+innerText;
+ if(exceptions.length){
+  // 把 tryEntries 的 catch 边改写为同步循环中的异常重定向；finally 已在证明阶段拒绝。
+  const errorName=freshErrorName(ix);
+  const route=exceptions.map((entry,index)=>(index?'else ':'')+'if('+contextName+'.prev>='+entry.tryLoc+'&&'+contextName+'.prev<'+entry.catchLoc+')'+contextName+'.next='+entry.catchLoc+';').join('')+'else throw '+errorName+';';
+  replacement=context+'\nfor(;;){try{\n'+innerText+'\n}catch('+errorName+'){'+route+'}}';
+ }
+ return {edits:[{start:ret.start,end:ret.end,replacement},driverEdit]};
+}
+
+function freshErrorName(ix){
+ const used=new Set(ix.nodes.filter(node=>node.type==='Identifier').map(node=>node.name));
+ let name='regeneratorError',index=2;
+ while(used.has(name))name='regeneratorError'+index++;
+ return name;
 }
 
 function applyLocalEdits(source,edits){

@@ -119,6 +119,39 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         with self.assertRaises(ConversionError):
             convert_script(source, 'Fixture', URL, '', source_format='surge')
 
+    def test_clean_exception_handler_enters_minimal_mode(self):
+        body = ("case 0:ctx.prev=0;ctx.next=2;break;"
+                "case 2:JSON.parse('{');ctx.next=4;break;"
+                "case 4:ctx.next=6;break;"
+                "case 6:$done({body:'recovered'});return ctx.stop();")
+        machine = prove(source_with(body, table='[[0,4]]'))['machines'][0]
+        self.assertTrue(machine['minimal'], machine)
+        self.assertEqual([(entry['tryLoc'], entry['catchLoc']) for entry in machine['exceptions']], [(0, 4)], machine)
+
+    def test_exception_handler_business_side_effect_is_rejected(self):
+        body = ("case 0:ctx.prev=0;ctx.next=2;break;"
+                "case 2:ctx.next=4;break;"
+                "case 4:$persistentStore.write('late','effect');ctx.next=6;break;"
+                "case 6:$done({body:'x'});return ctx.stop();")
+        machine = prove(source_with(body, table='[[0,4]]'))['machines'][0]
+        self.assertFalse(machine['minimal'], machine)
+        self.assertTrue(any('异常处理区域含业务副作用' in gap for gap in machine['minimalGaps']), machine)
+
+    def test_exception_handler_target_unreachable_is_rejected(self):
+        body = ("case 0:return ctx.stop();"
+                "case 2:ctx.prev=2;ctx.next=4;break;"
+                "case 4:$done({body:'x'});return ctx.stop();")
+        proof = prove(source_with(body, table='[[2,4]]'))
+        self.assertFalse(proof['proved'], proof)
+        self.assertTrue(any('异常处理目标状态不可达' in gap for gap in proof['machines'][0]['minimalGaps']), proof)
+
+    def test_exception_table_state_count_mismatch_is_rejected(self):
+        body = ("case 0:ctx.prev=0;ctx.next=2;break;"
+                "case 2:$done({body:'x'});return ctx.stop();")
+        proof = prove(source_with(body, table='[[0,2],[0,2],[0,2]]'))
+        self.assertFalse(proof['proved'], proof)
+        self.assertTrue(any('异常表条目数与状态数不一致' in gap for gap in proof['gaps']), proof)
+
     def test_native_option_exposes_stage_one_summary_without_release(self):
         source = source_with('case 0:return ctx.stop();')
         report = js_analysis.analyze_many(

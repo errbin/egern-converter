@@ -821,6 +821,18 @@ export function regeneratorStateMachine(ix,source){
   return ['UpdateExpression','AwaitExpression','YieldExpression','NewExpression','TaggedTemplateExpression'].includes(n.type)||
    n.type==='UnaryExpression'&&n.operator==='delete';
  }
+ function handlerEffect(n,param){
+  // 异常处理区域只允许状态控制；业务调用、完成调用、对象写入、
+  // 异常抛出和异步挂起都保持拒绝。
+  if(n.type==='CallExpression'){
+   const callee=unwrap(n.callee);
+   return !(callee?.type==='MemberExpression'&&contextMember(callee,param)&&['abrupt','stop'].includes(property(callee)));
+  }
+  if(n.type==='AssignmentExpression')return !(n.left.type==='MemberExpression'&&contextMember(n.left,param)&&['prev','next','sent'].includes(property(n.left)));
+  if(n.type==='UpdateExpression')return true;
+  return ['AwaitExpression','YieldExpression','NewExpression','TaggedTemplateExpression','ThrowStatement'].includes(n.type)||
+   n.type==='UnaryExpression'&&n.operator==='delete';
+ }
  function mayCompleteNormally(statement){
   if(!statement)return true;
   if(['ReturnStatement','ThrowStatement','BreakStatement','ContinueStatement'].includes(statement.type))return false;
@@ -1006,6 +1018,8 @@ export function regeneratorStateMachine(ix,source){
   }
 
   const tryNode=call.arguments[3];
+  const exceptionEntries=[];
+  let exceptionFinally=false;
   if(tryNode){
    let table=unwrap(tryNode);
    if(table.type==='Identifier'){
@@ -1013,17 +1027,27 @@ export function regeneratorStateMachine(ix,source){
    }
    if(table?.type==='Literal'&&table.value===null)table=null;
    if(table&&table.type!=='ArrayExpression')gaps.push('异常表不是有限数组');
-   for(const entry of table?.elements??[]){
+   const entries=table?.elements??[];
+   // 条目数超过状态数必然存在无法映射的 try/handler 状态。
+   if(table?.type==='ArrayExpression'&&entries.length>states.size)gaps.push('异常表条目数与状态数不一致：'+entries.length+' > '+states.size);
+   const seenTryLocs=new Set();
+   for(const entry of entries){
     if(entry?.type!=='ArrayExpression'||entry.elements.length<2||entry.elements.length===3||entry.elements.length>4){gaps.push('异常表条目形状未知：第 '+lineOf(entry??table)+' 行');continue;}
     const values=entry.elements.map(stateValue);
     if(values.some(value=>value===null)){gaps.push('异常表含非有限状态：第 '+lineOf(entry)+' 行');continue;}
     const [tryLoc,catchLoc,finallyLoc,afterLoc]=values;
+    if(seenTryLocs.has(tryLoc))gaps.push('异常表 try 保存点重复：'+tryLoc);
+    else seenTryLocs.add(tryLoc);
     const tryOwners=prevOwners.get(tryLoc),tryOrigin=tryOwners?.size===1?[...tryOwners][0]:null;
     if(tryOwners?.size>1)gaps.push('异常表 try 保存点对应多个状态：'+tryLoc);
     else if(tryOrigin===null)gaps.push('异常表 try 保存点不在状态图中：'+tryLoc);
     for(const [name,target] of [['catch',catchLoc],['finally',finallyLoc],['after',afterLoc]])if(target!==undefined&&target!==null&&!states.has(target))gaps.push('异常表 '+name+' 目标不在状态图中：'+target);
-    if(tryOrigin!==null&&catchLoc!==undefined&&catchLoc!==null)addEdge(stateId(tryOrigin),stateId(catchLoc),'exception',entry,String(catchLoc));
+    if(tryOrigin!==null&&catchLoc!==undefined&&catchLoc!==null){
+     addEdge(stateId(tryOrigin),stateId(catchLoc),'exception',entry,String(catchLoc));
+     exceptionEntries.push({tryLoc,catchLoc,line:lineOf(entry)});
+    }
     if(finallyLoc!==undefined&&finallyLoc!==null){
+     exceptionFinally=true;
      if(afterLoc===undefined||afterLoc===null)gapFinally();
      else{
       if(tryOrigin!==null)addEdge(stateId(tryOrigin),stateId(finallyLoc),'exception-finally',entry,String(finallyLoc));
@@ -1062,12 +1086,14 @@ export function regeneratorStateMachine(ix,source){
    }))gaps.push('保存槽 '+name+' 逃逸出封闭调用位置');
   }
 
-  // 极简模式只覆盖同步、无异常边、无 finally 且完成槽单写不逃逸的机器。
+  // 极简模式允许无 finally 的 catch 边，但要求 try 范围数值有序、
+  // handler 目标可达且 handler 区域没有业务副作用。
   // 这里只产出可放行判据；真正的源码改写由 transforms/specialization.mjs 完成。
   const minimalGaps=[];
   const innerNodes=nodes.filter(n=>n.start>=fn.start&&n.end<=fn.end);
-  if(tryNode)minimalGaps.push('极简模式包含异常表');
-  if(edges.some(edge=>['exception','exception-finally','finally-resume'].includes(edge.kind)))minimalGaps.push('极简模式包含异常或 finally 边');
+  if(exceptionFinally||edges.some(edge=>['exception-finally','finally-resume'].includes(edge.kind)))minimalGaps.push('极简模式不支持 finally 块');
+  if(exceptionEntries.some(entry=>typeof entry.tryLoc!=='number'||typeof entry.catchLoc!=='number'))minimalGaps.push('极简模式异常表要求数值状态');
+  if(exceptionEntries.some(entry=>entry.tryLoc>=entry.catchLoc))minimalGaps.push('极简模式异常表 try 范围顺序不成立');
   if(terminals.some(terminal=>terminal.kind==='throw'))minimalGaps.push('极简模式包含显式抛出终止');
   if(innerNodes.some(n=>n.type==='TryStatement'||n.type==='AwaitExpression'||n.type==='YieldExpression'))minimalGaps.push('极简模式包含异常或异步挂起点');
   if(innerNodes.some(n=>n.type==='ThisExpression'))minimalGaps.push('极简模式正文读取 this');
@@ -1121,7 +1147,6 @@ export function regeneratorStateMachine(ix,source){
    }
   }
   for(const slot of slots.values())if(slot.kind==='completion'&&slot.writes.length!==1)minimalGaps.push('极简模式保存槽 '+slot.name+' 有多个写入点');
-  const uniqueMinimalGaps=[...new Set(minimalGaps)];
 
   const stateNodes=[...states].sort((a,b)=>typeof a===typeof b?(a<b?-1:a>b?1:0):typeof a==='number'?-1:1).map(state=>({id:stateId(state),kind:'restore',state,line:lineOf(caseByState.get(state))}));
   const graphNodes=[{id:'invoke',kind:'dispatch',line:runtimeInfo.container?lineOf(runtimeInfo.container):lineOf(fn)},...stateNodes,...terminals];
@@ -1135,9 +1160,32 @@ export function regeneratorStateMachine(ix,source){
   if(deadTerminals.length)gaps.push('终止节点从单一入口不可达：'+deadTerminals.length+' 个');
   for(const state of states)if(!(adjacency.get(stateId(state))?.length))gaps.push('状态 '+state+' 没有可证明的出边');
   if(!terminals.length)gaps.push('状态图没有返回点或异常终止点');
+  const stateByNodeId=new Map([...states].map(state=>[stateId(state),state]));
+  const handlerStates=new Set();
+  for(const entry of exceptionEntries){
+   if(!seen.has(stateId(entry.catchLoc))){minimalGaps.push('极简模式异常处理目标状态不可达：'+entry.catchLoc);continue;}
+   // catch 区域的边界按 switch case 的 fallthrough 链计算；显式 next 跳转属于恢复流程。
+   const region=new Set([entry.catchLoc]),pending=[entry.catchLoc];
+   while(pending.length){
+    const state=pending.shift();
+    for(const edge of edges)if(edge.from===stateId(state)&&edge.kind==='fallthrough'){
+     const target=stateByNodeId.get(edge.to);
+     if(target!==undefined&&!region.has(target)){region.add(target);pending.push(target);}
+    }
+   }
+   for(const state of region)handlerStates.add(state);
+  }
+  for(const state of handlerStates){
+   const clause=caseByState.get(state);if(!clause)continue;
+   for(const n of nodes)if(n.start>=clause.start&&n.end<=clause.end&&own(n,fn)&&handlerEffect(n,param)){
+    minimalGaps.push('极简模式异常处理区域含业务副作用：状态 '+state+'，第 '+lineOf(n)+' 行');
+    break;
+   }
+  }
+  const uniqueMinimalGaps=[...new Set(minimalGaps)];
   const uniqueGaps=[...new Set([...gaps,...runtimeInfo.gaps])];
   machines.push({line:lineOf(call),entryState:0,proved:uniqueGaps.length===0,gaps:uniqueGaps,nodes:graphNodes,edges,
-   states:states.size,reachableStates:stateNodes.filter(node=>seen.has(node.id)).length,deadStates,deadTerminals,edges_count:edges.length,saveSlots:[...slots.values()],runtime:{driveCount:runtimeInfo.driveCount,internalDrives:runtimeInfo.internalDrives,externalDrives:runtimeInfo.externalDrives},
+   states:states.size,reachableStates:stateNodes.filter(node=>seen.has(node.id)).length,deadStates,deadTerminals,edges_count:edges.length,saveSlots:[...slots.values()],exceptions:exceptionEntries.map(({tryLoc,catchLoc,line})=>({tryLoc,catchLoc,line})),handlerStates:[...handlerStates],runtime:{driveCount:runtimeInfo.driveCount,internalDrives:runtimeInfo.internalDrives,externalDrives:runtimeInfo.externalDrives},
    minimal:uniqueGaps.length===0&&uniqueMinimalGaps.length===0,minimalGaps:uniqueMinimalGaps,release:false});
  }
  const gaps=[...new Set([...runtimeInfo.gaps,...machines.flatMap(machine=>machine.gaps)])];
