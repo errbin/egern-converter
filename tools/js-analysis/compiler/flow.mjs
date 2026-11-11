@@ -38,7 +38,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type!=='CallExpression')return false;
   if(n.callee.type==='MemberExpression'&&free(n.callee.object,'$task')&&property(n.callee)==='fetch')return true;
   if(n.callee.type==='MemberExpression'){
-   if(free(n.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any'].includes(property(n.callee)))return true;
+   if(free(n.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any','withResolvers'].includes(property(n.callee)))return true;
    if(['then','catch','finally'].includes(property(n.callee)))return promiseValue(n.callee.object,seen);
   }
   const fns=targets(n.callee);
@@ -175,7 +175,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(!free(n,'Promise'))return false;
   const p=parents.get(n),call=parents.get(p);
   if(p?.type==='NewExpression'&&p.callee===n||p?.type==='UnaryExpression'&&p.operator==='typeof')return false;
-  return !(p?.type==='MemberExpression'&&p.object===n&&['resolve','reject','all','allSettled','race','any'].includes(property(p))&&call?.type==='CallExpression'&&call.callee===p);
+  return !(p?.type==='MemberExpression'&&p.object===n&&['resolve','reject','all','allSettled','race','any','withResolvers'].includes(property(p))&&call?.type==='CallExpression'&&call.callee===p);
  }))fail(tree,'并发完成传播依赖标准 Promise，构造器修改或逃逸尚未证明');
  const finish=concurrent?fresh('finishNative'):null,reject=concurrent?fresh('rejectNative'):null,finished=concurrent?fresh('nativeResult'):null;
  const awaitValue=code=>executorCompletion?`await Promise.race([${code}, ${finished}])`:`await ${code}`;
@@ -210,7 +210,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   }
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&done.has(owner))return promise(n,owner,wait);
   if(n.type==='MemberExpression'&&free(n.object,'$utils'))return result(raw(n));
-  const opaqueCallee=n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&free(n.callee.object)&&['$notification','$utils','$persistentStore','$prefs','$task','$httpClient'].includes(n.callee.object.name);
+  const opaqueCallee=n.type==='CallExpression'&&(n.callee.type==='MemberExpression'&&free(n.callee.object)&&['$notification','$utils','$persistentStore','$prefs','$task','$httpClient'].includes(n.callee.object.name)||n.callee.type==='Identifier'&&free(n.callee,'$log'));
   const parts=children(n).filter(([field,c])=>(!opaqueCallee||field!=='callee')&&(!['Property','MethodDefinition'].includes(n.type)||c===n.value||n.computed)).map(([field,c])=>({field,node:c,value:expression(c,owner)}));
   const before=[];
   for(let i=0;i<parts.length;i++){

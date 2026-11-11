@@ -359,6 +359,59 @@ export function lowerClosedHTTP(source){
  }
  return source;
 }
+// 闭合的兼容 helper 可能在同一代码块探测两个旧 HTTP 接收者。可选链会在读取
+// 实参前短路，因此来源平台只会求值其中一个接收者。删除不可达语句后，请求
+// 字段只需针对唯一派发证明，也不会凭空生成第二个原生请求。
+export function lowerAlternateHTTPReceivers(source,format){
+ const ix=index(parse(source,{ecmaVersion:'latest',allowAwaitOutsideFunction:true,allowReturnOutsideFunction:true}));
+ const {nodes,parents,free}=ix,remove=new Set(),replace=new WeakMap(),transformations=[];
+ const chain=n=>n?.type==='ChainExpression'?chain(n.expression):n;
+ const base=n=>{
+  n=chain(n);
+  if(n?.type==='CallExpression'){
+   const holder=chain(n.callee);
+   if(holder?.type==='MemberExpression'&&['then','catch','finally'].includes(property(holder)))n=chain(holder.object);
+  }
+  n=chain(n);
+  if(n?.type!=='CallExpression')return null;
+  const callee=n.callee;
+  if(callee?.type==='MemberExpression'&&callee.optional&&callee.object.type==='Identifier'&&free(callee.object,'$httpClient'))return {call:n,kind:'httpClient'};
+  if(callee?.type==='MemberExpression'&&callee.optional&&free(callee.object,'$task')&&property(callee)==='fetch')return {call:n,kind:'task'};
+  return null;
+ };
+ const blocks=new Map();
+ for(const statement of nodes){
+  if(statement.type!=='ExpressionStatement')continue;
+  const item=base(statement.expression);if(!item)continue;
+  const block=parents.get(statement);
+  if(!['Program','BlockStatement'].includes(block?.type)||parents.get(block)?.type==='Program'&&block===statement)continue;
+  if(block.type==='Program')continue;
+  if(!blocks.has(block))blocks.set(block,[]);
+  blocks.get(block).push({statement,...item});
+ }
+ const selected=format==='qx'?'task':'httpClient',discarded=selected==='task'?'httpClient':'task';
+ for(const entries of blocks.values()){
+  const chosen=entries.filter(entry=>entry.kind===selected),other=entries.filter(entry=>entry.kind===discarded);
+  if(chosen.length!==1||other.length!==1)continue;
+  const block=parents.get(chosen[0].statement),fn=parents.get(block);
+  if(!functions.has(fn?.type))continue;
+  const local=index(fn);
+  const references=kind=>local.nodes.filter(n=>n.type==='Identifier'&&n.name===(kind==='task'?'$task':'$httpClient')&&local.free(n,n.name));
+  if(references('task').length!==1||references('httpClient').length!==1)continue;
+  remove.add(other[0].statement);
+  const expression=chosen[0].statement.expression,inner=chain(expression),callee=inner?.callee;
+  if(callee?.optional){
+   const before=source.slice(expression.start,expression.end),at=callee.start-expression.start;
+   const selected=source.slice(callee.start,callee.end);
+   const unoptional=callee.computed?selected.replace('?.',''):selected.replace('?.','.');
+   const value=before.slice(0,at)+unoptional+before.slice(at+callee.end-callee.start);
+   replace.set(expression,{direct:true,value});
+  }
+  transformations.push({kind:'alternate-http-receiver',format,kept:selected,reason:'同一闭合 helper 的两个可选旧 HTTP 接收者按来源平台择一，未选分支在原文中也不会求值'});
+ }
+ if(!transformations.length)return {source,transformations};
+ return {source:renderTree(source,ix.nodes[0],n=>remove.has(n)?{direct:true,value:''}:replace.get(n)??null),transformations};
+}
 export function lowerSelectedHTTP(source){
  const ix=index(parse(source,{ecmaVersion:'latest',allowAwaitOutsideFunction:true,allowReturnOutsideFunction:true})),replace=new WeakMap();
  const {nodes,parents,bindings,free}=ix,methods=new Set(['get','post','put','delete','head','options','patch']);
@@ -414,6 +467,51 @@ function lowerOne(source){
   if(d&&!calls.every(c=>ordered(d,c)))continue;
   const local=index(fn);
   if(local.nodes.some(n=>n.type==='ThisExpression'||local.free(n,'arguments')))continue;
+  const requestArgumentClosed=call=>{
+   const argument=call.arguments[0];
+   if(argument?.type!=='Identifier')return true;
+   const binding=local.bindings.get(argument);if(!binding)return true;
+   return binding.refs.every(ref=>{
+    if(ref===argument)return true;
+    const p=local.parents.get(ref),q=local.parents.get(p);
+    if(p?.type==='MemberExpression'&&p.object===ref&&property(p)!==undefined){
+     const field=String(property(p));
+     if(q?.type==='MemberExpression'&&q.object===p){
+      const nested=property(q),use=local.parents.get(q);
+      if(nested===undefined)return false;
+      if(['headers','header'].includes(field)){
+       if((use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'))return use.end<call.start;
+       if(use?.type==='CallExpression'&&use.callee===q)return false;
+       return true;
+      }
+      if(field==='method'&&['toLocaleLowerCase','toLowerCase'].includes(String(nested))&&use?.type==='CallExpression'&&use.callee===q)return true;
+      return false;
+     }
+     if(q?.type==='AssignmentExpression'&&q.left===p)return q.end<call.start;
+     if(q?.type==='UpdateExpression')return false;
+     if(q?.type==='UnaryExpression'&&q.operator==='delete')return q.end<call.start;
+     if(q?.type==='CallExpression'&&q.callee===p)return false;
+     if(q?.type==='CallExpression'&&q.arguments.includes(p)){
+      if(field==='headers'||field==='header')return q.end<call.start;
+      return false;
+     }
+     return true;
+    }
+    if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+     if(p===call)return true;
+     if(p.callee.type==='MemberExpression'&&local.free(p.callee.object,'console')&&['log','warn','error','info','debug'].includes(property(p.callee)))return true;
+     if(p.callee.type==='MemberExpression'&&local.free(p.callee.object,'JSON')&&property(p.callee)==='stringify'||local.free(p.callee,'$log'))return true;
+     return false;
+    }
+    if(p?.type==='VariableDeclarator'&&p.init===ref)return false;
+    if(p?.type==='AssignmentExpression'&&p.right===ref)return p.left.type==='Identifier'&&local.bindings.get(p.left)===binding;
+    if(p?.type==='SpreadElement'&&q?.type==='ObjectExpression'){
+     const assignment=local.parents.get(q);
+     return assignment?.type==='AssignmentExpression'&&assignment.left.type==='Identifier'&&local.bindings.get(assignment.left)===binding;
+    }
+    return p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator);
+   });
+  };
   // Getter adapters sometimes copy status/statusCode before returning the same
   // legacy message. Admit only field-only consumers and exact reciprocal copies.
   const statements=fn.body.type==='BlockStatement'?flatten(fn.body):[],last=statements.at(-1),message=last?.type==='ReturnStatement'?last.argument:null;
@@ -435,7 +533,8 @@ function lowerOne(source){
    for(const c of calls)replace.set(c,'('+text+')('+source.slice(c.arguments[0].start,c.arguments[0].end)+')');
    replace.set(declaration,'');break;
   }
-  if(!local.nodes.some(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&free(n.callee.object,'$httpClient')))continue;
+  const dispatches=local.nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&local.free(n.callee.object,'$httpClient'));
+  if(!dispatches.length||!dispatches.every(requestArgumentClosed))continue;
   const callbackParameter=(parameter,seen=new Set())=>{
    const id=parameter?.type==='AssignmentPattern'?parameter.left:parameter,pb=id?.type==='Identifier'?bindings.get(id):null;
    if(!pb||pb.writes.length||seen.has(pb))return false;seen=new Set(seen);seen.add(pb);

@@ -105,7 +105,7 @@ export function specializeParameters(source){
   else unknownPrototype=true;
  }
  for(const n of nodes)if(!unknownPrototype){
-  if(n.type==='MemberExpression'&&n.object.type==='Identifier'&&typeof property(n)==='string'&&!unstablePrototype.has(property(n))){const p=parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete')continue;if(absent(n.object,property(n),new Set(),objectGuarded(n)))replace.set(n,'(void 0)');}
+  if(n.type==='MemberExpression'&&n.object.type==='Identifier'&&typeof property(n)==='string'&&!unstablePrototype.has(property(n))){const p=parents.get(n),q=p?.type==='MemberExpression'&&p.object===n?parents.get(p):null;if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete'||q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.operator==='delete')continue;if(absent(n.object,property(n),new Set(),objectGuarded(n)))replace.set(n,'(void 0)');}
   if(n.type==='BinaryExpression'&&n.operator==='in'&&n.left.type==='Literal'&&typeof n.left.value==='string'&&!unstablePrototype.has(n.left.value)&&absent(n.right,n.left.value))replace.set(n,'false');
   if(n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.init?.type==='Identifier')for(const p of n.id.properties){
    const b=p.type==='Property'&&p.value.type==='Identifier'?bindings.get(p.value):null;

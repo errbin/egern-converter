@@ -8,7 +8,7 @@ const input=JSON.parse(readFileSync(0,'utf8'));
 // constructors/functions cross the VM boundary; unlisted dynamic URLs fail.
 const urlValues={};
 function collectURLs(value){
- if(typeof value==='string'){try{const u=new URL(value);urlValues[value]=Object.fromEntries(['href','origin','protocol','username','password','host','hostname','port','pathname','search','hash'].map(k=>[k,u[k]]));}catch{}}
+ if(typeof value==='string'){try{const u=new URL(value);urlValues[value]=Object.fromEntries(['href','origin','protocol','username','password','host','hostname','port','pathname','search','searchParams','hash'].map(k=>[k,k==='searchParams'?u.search:u[k]]));}catch{}}
  else if(value&&typeof value==='object')for(const v of Object.values(value))collectURLs(v);
 }
 collectURLs(input.fixture);
@@ -65,7 +65,7 @@ const Headers = ${FixtureHeaders.toString()};
 globalThis.Headers=Headers;
 globalThis.URLSearchParams=${FixtureSearchParams.toString()};
 globalThis.URL=class{
- constructor(value,base){if(base!==undefined||!Object.hasOwn(fixtureURLs,value))throw Error('URL is outside the fixture model');Object.assign(this,fixtureURLs[value]);}
+ constructor(value,base){if(base!==undefined||!Object.hasOwn(fixtureURLs,value))throw Error('URL is outside the fixture model');Object.assign(this,fixtureURLs[value]);this.searchParams=new URLSearchParams(this.searchParams);}
  toString(){return this.href;}
 };
 const FixtureBody=${FixtureBody.toString()};

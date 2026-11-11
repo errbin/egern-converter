@@ -199,7 +199,21 @@ export function protectLibraries(source,{sourceType='script'}={}){
    if(n.type==='VariableDeclaration')for(const d of n.declarations){if(d.id.type!=='Identifier')throw Error('Unsupported library export pattern');exports.push(d.id.name);}
   }
   const marker=fresh(),raw=source.slice(start,end);
-  blocks.set(marker,{...known,contract:contract(body),runtime_contract:runtimeContract,raw,start,end,placeholderBindings:[...new Set(exports)],code:known.globalReceiver?`(function(){${raw}}).call(globalThis);`:(known.implicitBindings?.length?'var '+known.implicitBindings.join(', ')+';\n':'')+raw});
+  // 受审查库在原始脚本中运行于宽松模式。若库正文包含隐式全局写入，而恢复
+  // 时因业务仍读取库内声明而按原字节直出，模块严格模式会让赋值抛错。这里
+  // 只收集库正文自己创建的隐式全局名，恢复时在模块函数顶部补一个本地绑定；
+  // 平台 API、标准内建和库内已声明名字都不在这个范围内。
+  const globals=new Set(['globalThis','global','window','self','module','exports','require','process','Object','Array','String','Number','Boolean','BigInt','Uint8Array','ArrayBuffer','DataView','Error','TypeError','RangeError','Math','JSON','undefined','Infinity','NaN','parseInt','parseFloat','isNaN','isFinite','console','Date','RegExp','Promise','setTimeout','clearTimeout','setInterval','clearInterval']);
+  let implicitWrites=[];
+  try{
+   const localIndex=index(parse(raw,{ecmaVersion:'latest',allowAwaitOutsideFunction:true,allowReturnOutsideFunction:true}));
+   implicitWrites=[...new Set(localIndex.nodes.filter(n=>{
+    if(n.type!=='Identifier'||!localIndex.free(n))return false;
+    const p=localIndex.parents.get(n);
+    return p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'&&p.argument===n;
+   }).map(n=>n.name).filter(name=>!name.startsWith('$')&&!globals.has(name)))];
+  }catch{}
+  blocks.set(marker,{...known,contract:contract(body),runtime_contract:runtimeContract,raw,start,end,implicitWrites,placeholderBindings:[...new Set(exports)],code:known.globalReceiver?`(function(){${raw}}).call(globalThis);`:(known.implicitBindings?.length?'var '+known.implicitBindings.join(', ')+';\n':'')+raw});
   const dependencies=new Set();
   if(known.retainDependencies)for(const n of ix.nodes)if(n.start>=start&&n.end<=end&&n.type==='Identifier'&&ix.reference(n)){
    const binding=ix.bindings.get(n),initial=binding?.init;
@@ -212,7 +226,7 @@ export function protectLibraries(source,{sourceType='script'}={}){
  }
  const render=n=>renderTree(source,n,node=>replace.has(node)?{direct:true,value:replace.get(node)}:null);
  const restore=(code,{globalReceiver=true}={})=>{
-  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set();
+  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set(),implicit=new Set();
   for(const n of i.nodes)if(n.type==='VariableDeclaration'){
    const b=blocks.get(n.declarations[0]?.id?.name);if(!b)continue;
    if(found.has(n.declarations[0].id.name))throw Error('Duplicate public library placeholder');
@@ -220,12 +234,14 @@ export function protectLibraries(source,{sourceType='script'}={}){
    // 若库外业务仍读取库内声明，IIFE 包装会让这些绑定失联；此时必须按原
    // 字节直出，让库与业务继续共享作者原本的词法作用域。
    const referenced=b.placeholderBindings.some(name=>i.nodes.some(x=>x.type==='Identifier'&&x.name===name&&i.reference(x)));
-   replacements.set(n,globalReceiver&&!referenced?b.code:b.raw);
+   const wrapped=globalReceiver&&!referenced;
+   replacements.set(n,wrapped?b.code:b.raw);
+   if(!wrapped)for(const name of b.implicitWrites??[])implicit.add(name);
   }
   // 分析阶段把库外的无用全局对象别名换成了标记；恢复时改回真实的全局对象。
   for(const n of i.nodes)if(n.type==='Identifier'&&/^publicLibraryGlobalAlias\d+$/.test(n.name)&&i.parents.get(n)?.type==='VariableDeclarator'&&i.parents.get(n).init===n)replacements.set(n,'globalThis');
   if(found.size!==blocks.size)throw Error('Public library placeholder lost during compilation');
-  return renderTree(code,t,n=>{
+  let output=renderTree(code,t,n=>{
    if(replacements.has(n))return {direct:true,value:replacements.get(n)};
    if(n.type==='VariableDeclaration'){
     const declarations=n.declarations.filter(d=>!placeholderBindings.has(d.id.type==='Identifier'?d.id.name:null));
@@ -233,6 +249,17 @@ export function protectLibraries(source,{sourceType='script'}={}){
    }
    return null;
   });
+  if(implicit.size){
+   const restored=index(parse(output,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
+   const body=restored.nodes.find(n=>n.type==='ExportDefaultDeclaration')?.declaration?.body;
+   if(body?.type!=='BlockStatement')throw Error('公共库隐式全局恢复缺少模块函数体');
+   const names=[...implicit].filter(name=>!restored.nodes.some(n=>n.type==='Identifier'&&n.name===name&&restored.bindings.has(n)));
+   if(names.length){
+    const at=body.start+1;
+    output=output.slice(0,at)+' var '+names.join(', ')+';'+output.slice(at);
+   }
+  }
+  return output;
  };
  return {source:render(tree),restore,valueContracts:[...blocks.values()].flatMap(b=>b.valueContracts??[]),blocks:[...blocks.values()].map(({name,source,start,end,contract})=>({name,source,start,end,contract}))};
 }
