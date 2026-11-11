@@ -2150,7 +2150,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(opts?.type!=='ObjectExpression'||opts.properties.some(p=>p.type!=='Property'||p.kind!=='init'||p.method||key(p)!=='filter'||p.value.type!=='Literal'||typeof p.value.value!=='string'))fail(input,'回调 HTTP 的 QX opts 仅支持静态 filter 字符串');
    object(f.get('opts'),'回调 HTTP 的 QX opts');f.delete('opts');
   }
-  const allowed=qx?['url','method','headers','body','bodyBytes','opts']:['url','headers','body','timeout','policy','policy-descriptor','insecure','auto-redirect','auto-cookie','binary-mode','full-header-mode',...(format==='loon'?['node']:[])];
+  const allowed=qx?['url','method','headers','body','bodyBytes','timeout','opts']:['url','headers','body','timeout','policy','policy-descriptor','insecure','auto-redirect','auto-cookie','binary-mode','full-header-mode',...(format==='loon'?['node']:[])];
   for(const k of f.keys())if(!allowed.includes(k))fail(input,'未适配 HTTP 参数：'+k);
   if(!f.has('url'))fail(input,'HTTP 请求缺少 URL');
   const declaredMethod=f.get('method'),dynamicMethod=!!callbackSelector||qx&&!method&&fieldValues.has(declaredMethod)&&resolve(declaredMethod)?.type!=='Literal';
@@ -2159,6 +2159,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(f.has('bodyBytes'))out.push(optionalHTTPFields.has(f.get('bodyBytes'))?`...(${render(f.get('bodyBytes'))} === undefined ? {} : {body: ${bytes(f.get('bodyBytes'))}})`:'body: '+bytes(f.get('bodyBytes')));else if(f.has('body'))out.push(optionalHTTPFields.has(f.get('body'))?`...(${render(f.get('body'))} === undefined ? {} : {body: ${bodyValue(f.get('body'))}})`:'body: '+bodyValue(f.get('body')));
   const flag=(m,k,fallback)=>{if(!m.has(k))return fallback;const v=resolve(m.get(k));if(v.type!=='Literal'||typeof v.value!=='boolean')fail(v,'HTTP 布尔参数必须可静态确定：'+k);return v.value;};
   if(qx){const o=f.has('opts')?object(f.get('opts'),'QX HTTP 选项'):new Map();for(const k of o.keys())if(!['redirection','skip-cert-verify','auto-cookie','policy'].includes(k))fail(input,'未适配 HTTP opts：'+k);
+   if(f.has('timeout'))out.push('timeout: '+render(f.get('timeout')));
    out.push(`redirect: '${flag(o,'redirection',true)?'follow':'manual'}'`,`credentials: '${flag(o,'auto-cookie',false)?'include':'omit'}'`,`insecureTls: ${flag(o,'skip-cert-verify',false)}`);if(o.has('policy'))out.push('policy: '+render(o.get('policy')));
   }else{
    const timeout=fresh('httpTimeout');

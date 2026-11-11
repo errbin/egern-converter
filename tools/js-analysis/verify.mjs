@@ -119,7 +119,7 @@ function oldNetwork(input,method,qx=false){
  const options={};
  if(r.body!==undefined)options.body=r.body;if(r.bodyBytes!==undefined)options.body=r.bodyBytes;
  if(r.headers)options.headers=r.headers;
- if(qx){const o=r.opts??{};options.redirect=o.redirection===false?'manual':'follow';options.credentials=o['auto-cookie']?'include':'omit';options.insecureTls=o['skip-cert-verify']??false;if(o.policy!==undefined)options.policy=o.policy;}
+ if(qx){const o=r.opts??{};if(r.timeout!==undefined)options.timeout=r.timeout;options.redirect=o.redirection===false?'manual':'follow';options.credentials=o['auto-cookie']?'include':'omit';options.insecureTls=o['skip-cert-verify']??false;if(o.policy!==undefined)options.policy=o.policy;}
  else {options.timeout=r.timeout===undefined?5000:r.timeout*(platform==='loon'?1:1000);options.redirect=r['auto-redirect']===false?'manual':'follow';options.credentials=r['auto-cookie']===false?'omit':'include';if(r.policy!==undefined||r.node!==undefined)options.policy=r.policy??r.node;if(r['policy-descriptor']!==undefined)options.policyDescriptor=r['policy-descriptor'];if(r.insecure!==undefined)options.insecureTls=r.insecure;}
  return network(method??r.method??'GET',r.url,options);
 }

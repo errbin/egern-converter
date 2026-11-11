@@ -341,12 +341,23 @@ $done({body:JSON.stringify([text,pattern.source,String(big),result()===undefined
         source = '$done({body:typeof $response.body+":"+($response.bodyBytes instanceof ArrayBuffer)});'
         self.assertEqual(self.execute(source, body='abc', binary=True, source_format='qx', ast=True)['result']['body'], 'string:true')
 
+    def test_qx_task_fetch_timeout_passes_through_in_milliseconds(self):
+        from tools.egern_hub.verify import compare
+        source = '$task.fetch({url:"https://api.example",timeout:15000}).then(r=>$done({body:r.body}));'
+        output = compile_source(source, source_format='qx')
+        self.assertRegex(output, r'timeout:\s*15000')
+        self.assertNotIn('.timeout * 1000', output)
+        fixture = {'name':'qx timeout','request':{'url':'https://example.test/'},
+                   'http':[{'status':200,'body':'ok'}], 'expected':{'result':{'body':'ok'}}}
+        result = compare(source,output,'qx','https://example.test/source.js',fixture)
+        self.assertEqual(result['status'],'passed',result)
+
     def test_unknown_flow_and_api_shapes_are_build_errors(self):
         sources = [
             'const finish=()=>{$done({})};[1].forEach(finish);$done({});',
             'const finish=()=>{$done({})};const box={finish};box.finish();',
             'try{$done({});}finally{$notify("late");}',
-            'const input={url:"https://api.example"};input.timeout=5;$task.fetch(input).then(r=>$done({}));',
+            'const input={url:"https://api.example"};input.unknown=5;$task.fetch(input).then(r=>$done({}));',
             'const f=()=>JSON.parse("{}");$done(f());',
             'let result={};result={body:"changed"};$done(result);',
             'const result={};Object.assign(result,{body:"changed"});$done(result);',

@@ -121,6 +121,18 @@ process.stdout.write(JSON.stringify({result,notifications,requests,storage:Objec
         self.assertEqual(result['requests'][0]['options'], {'redirect':'manual','credentials':'omit','insecureTls':False,'policy':'direct'})
         self.assertEqual(self.execute(source, ast=True, http=[{'error':'offline'}])['result']['body'], 'caught offline')
 
+    def test_qx_static_task_fetch_timeout_is_milliseconds(self):
+        source = '$task.fetch({url:"https://api.example",timeout:15000}).then(r=>$done({body:r.body}));'
+        result = self.execute(source, source_format='qx', ast=True, http=[{'body':'ok'}])
+        self.assertEqual(result['result']['body'], 'ok')
+        self.assertEqual(result['requests'][0]['options']['timeout'], 15000)
+        source = 'const input={url:"https://api.example",timeout:10};$task.fetch(input).then(r=>$done({body:r.body}));'
+        result = self.execute(source, source_format='qx', ast=True, http=[{'body':'ok'}])
+        self.assertEqual(result['requests'][0]['options']['timeout'], 10)
+        source = 'const input={url:"https://api.example"};input.timeout=10;$task.fetch(input).then(r=>$done({body:r.body}));'
+        result = self.execute(source, source_format='qx', ast=True, http=[{'body':'ok'}])
+        self.assertEqual(result['requests'][0]['options']['timeout'], 10)
+
     def test_async_iife_await_nested_requests_and_storage(self):
         source = '(async()=>{const first=await $task.fetch({url:"https://first.example"});$prefs.setValueForKey(first.body,"token");const second=await $task.fetch({url:"https://second.example",headers:{Authorization:$prefs.valueForKey("token")}});$done({body:second.body})})();'
         result = self.execute(source, ast=True, http=[{'body':'token123'},{'body':'final'}])
@@ -159,12 +171,12 @@ process.stdout.write(JSON.stringify({result,notifications,requests,storage:Objec
             self.execute('$task.fetch({url:"https://api.example"}).then(r=>r.body);function unused(){$done({})}',ast=True,http=[{'body':'ok'}])
 
     def test_http_unknown_options_do_not_silently_disappear(self):
-        for options in ['timeout:10','opts:{hints:false}']:
+        for options in ['opts:{hints:false}']:
             source = '$task.fetch({url:"https://api.example",'+options+'}).then(r=>$done({}));'
             with self.subTest(options=options), self.assertRaises(ConversionError):
                 self.execute(source,ast=True)
         # Statically traceable local option objects receive the same build-time validation.
-        for expression in ['{url:"https://api.example",timeout:10}', '{url:"https://api.example",opts:{redirection:"false"}}']:
+        for expression in ['{url:"https://api.example",opts:{redirection:"false"}}']:
             with self.subTest(expression=expression), self.assertRaises(ConversionError):
                 self.execute('const input='+expression+';$task.fetch(input).then(r=>$done({}));',ast=True)
 

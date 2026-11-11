@@ -69,7 +69,7 @@ HTTP URL 可沿未逃逸的局部函数参数追溯，包括 JSON 数据中字�
 
 “支持 Egern”的兼容库须区分旧 `$done` / `$notification` 分支与原生 `export default async (ctx)` 入口。前者仍需静态转换，不能作为原生脚本原样引用的依据。
 
-HTTP 参数按来源解释：Surge timeout 秒转毫秒；Loon timeout 已是毫秒，未指定时使用 5000 ms。QX 不接受未声明的 timeout 字段。policy、policy-descriptor、重定向、Cookie 和 TLS 选项映射到对应原生字段。QX Cookie 默认关闭，Surge / Loon 默认开启。QX 错误处理中使用的 `error` 字段就地保留；没有通用 HTTP 包装器。QX 正文和 bodyBytes 同时使用时只读一次流，分别解码文本和保留 ArrayBuffer；Surge / Loon 的二进制正文为 Uint8Array。
+HTTP 参数按来源解释：Surge timeout 秒转毫秒；Loon timeout 已是毫秒，未指定时使用 5000 ms；QX `$task.fetch` 的 timeout 已是毫秒并原样映射。policy、policy-descriptor、重定向、Cookie 和 TLS 选项映射到对应原生字段。QX Cookie 默认关闭，Surge / Loon 默认开启。QX 错误处理中使用的 `error` 字段就地保留；没有通用 HTTP 包装器。QX 正文和 bodyBytes 同时使用时只读一次流，分别解码文本和保留 ArrayBuffer；Surge / Loon 的二进制正文为 Uint8Array。
 
 未提供存储键时按原始 URL 生成本站命名空间；Loon 按 `ctx.script.name` 生成稳定键。不会迁移其他 App 的存储，也不自动解释工具库的 `@key.path` 约定。
 

@@ -145,7 +145,7 @@ for(const {node:n} of nodes) {
   if(api.type!=='Identifier'||bound(api.name,scopes.get(api)))continue;
   const input=n.arguments[0];
   if(api.name==='$task'&&staticProperty(n.callee)==='fetch') {
-    checkOptions(input,['url','method','headers','body','bodyBytes','opts'],'$task.fetch');
+    checkOptions(input,['url','method','headers','body','bodyBytes','timeout','opts'],'$task.fetch');
     for(const p of input?.properties??[])if(p.type==='Property'&&(p.key.name??p.key.value)==='opts')
       checkOptions(p.value,['redirection','skip-cert-verify','auto-cookie','policy'],'$task.fetch.opts');
   } else if(api.name==='$httpClient') {
