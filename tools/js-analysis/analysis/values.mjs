@@ -716,3 +716,370 @@ export function ordinaryReceivers(tree,libraryContracts=[]){
  }
  return {safeToString,descriptorThis,methodReceiver};
 }
+
+// 从 regenerator `.wrap` 正文还原有限状态图。这里只做语法证明，不执行输入，
+// 也不把“出现过 wrap 字符串”当作放行依据；阶段一只产出证明报告，不改变转换判定。
+export function regeneratorStateMachine(ix,source){
+ const {nodes,parents,bindings,owners,free}=ix;
+ const UNKNOWN=Symbol('unknown');
+ const controls=new Set(['prev','next','sent','method','arg','rval','delegate','done','tryEntries']);
+ const abruptly=new Set(['return','throw','continue','break']);
+ const lineOf=node=>source.slice(0,node.start).split('\n').length;
+ const sameBinding=(a,b)=>!!a&&!!b&&bindings.get(a)===bindings.get(b);
+ const unwrap=n=>n?.type==='ChainExpression'?n.expression:n;
+ const staticName=n=>n?.type==='MemberExpression'?property(n):undefined;
+
+ function objectLiteral(n,seen=new Set()){
+  n=unwrap(n);
+  if(!n||seen.has(n))return null;
+  if(n.type==='ObjectExpression')return n;
+  if(n.type!=='Identifier')return null;
+  const binding=bindings.get(n);
+  if(!binding||binding.writes.length||!binding.init||seen.has(binding))return null;
+  const next=new Set(seen);next.add(binding);
+  return objectLiteral(binding.init,next);
+ }
+ function objectProperty(object,name){
+  if(!object)return UNKNOWN;
+  let value;
+  for(const entry of object.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||key(entry)!==name)continue;
+   if(value!==undefined)return UNKNOWN;
+   value=entry.value;
+  }
+  return value??UNKNOWN;
+ }
+ function scalar(n,seen=new Set()){
+  n=unwrap(n);
+  if(!n||seen.has(n))return UNKNOWN;
+  if(n.type==='Literal')return ['string','number','boolean'].includes(typeof n.value)?n.value:UNKNOWN;
+  if(n.type==='TemplateLiteral'&&n.expressions.length===0)return n.quasis[0].value.cooked??UNKNOWN;
+  if(n.type==='UnaryExpression'&&['+','-','~','!'].includes(n.operator)){
+   const value=scalar(n.argument,new Set([...seen,n]));
+   if(value===UNKNOWN)return UNKNOWN;
+   return n.operator==='+' ? +value : n.operator==='-' ? -value : n.operator==='~' ? ~value : !value;
+  }
+  if(n.type==='BinaryExpression'&&n.operator==='+'){
+   const left=scalar(n.left,new Set([...seen,n])),right=scalar(n.right,new Set([...seen,n]));
+   return left===UNKNOWN||right===UNKNOWN?UNKNOWN:left+right;
+  }
+  if(n.type==='MemberExpression'){
+   const name=staticName(n);if(name===undefined)return UNKNOWN;
+   const value=objectProperty(objectLiteral(n.object,new Set([...seen,n])),name);
+   return value===UNKNOWN?UNKNOWN:scalar(value,new Set([...seen,n]));
+  }
+  if(n.type==='Identifier'){
+   const binding=bindings.get(n);
+   if(!binding||binding.writes.length||!binding.init||seen.has(binding))return UNKNOWN;
+   const next=new Set(seen);next.add(binding);
+   return scalar(binding.init,next);
+  }
+  return UNKNOWN;
+ }
+ function stateValue(n){const value=scalar(n);return Number.isSafeInteger(value)&&value>=0||typeof value==='string'?value:null;}
+ const stateId=state=>'state:'+String(state);
+ function isThisLike(n){
+  if(n?.type==='ThisExpression')return true;
+  return n?.type==='CallExpression'&&n.arguments.length===1&&n.arguments[0].type==='ThisExpression'&&
+   n.callee.type==='Identifier'&&free(n.callee,'sloppyThis');
+ }
+ function contextMember(n,param,name){
+  if(n?.type!=='MemberExpression'||n.object.type!=='Identifier'||!sameBinding(n.object,param))return false;
+  return name===undefined||property(n)===name;
+ }
+ function dispatchTest(n,param){
+  n=unwrap(n);
+  return n?.type==='AssignmentExpression'&&n.operator==='='&&contextMember(n.left,param,'prev')&&contextMember(n.right,param,'next');
+ }
+ function own(node,fn){return owners.get(node)===fn;}
+ function functionTarget(callee,call){
+  callee=unwrap(callee);
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(!binding||binding.writes.length)return null;
+   const fn=binding.fn??binding.init;
+   if(!functions.has(fn?.type)||fn.async||fn.generator)return null;
+   if(binding.refs.some(ref=>parents.get(ref)?.type!=='CallExpression'||parents.get(ref).callee!==ref))return null;
+   return fn;
+  }
+  if(callee?.type==='MemberExpression'&&callee.object.type==='ObjectExpression'&&property(callee)!==undefined){
+   const values=callee.object.properties.filter(p=>p.type==='Property'&&p.kind==='init'&&key(p)===property(callee));
+   return values.length===1&&functions.has(values[0].value.type)?values[0].value:null;
+  }
+  return null;
+ }
+ function completionFunction(fn){
+  if(!functions.has(fn?.type))return false;
+  return nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&n.type==='CallExpression'&&free(n.callee,'$done'));
+ }
+ function finallyEffect(n,param){
+  if(n.type==='CallExpression'){
+   const callee=unwrap(n.callee);
+   return !(callee?.type==='MemberExpression'&&contextMember(callee,param)&&['abrupt','finish','stop'].includes(property(callee)));
+  }
+  if(n.type==='AssignmentExpression')return !(n.left.type==='MemberExpression'&&contextMember(n.left,param));
+  return ['UpdateExpression','AwaitExpression','YieldExpression','NewExpression','TaggedTemplateExpression'].includes(n.type)||
+   n.type==='UnaryExpression'&&n.operator==='delete';
+ }
+ function mayCompleteNormally(statement){
+  if(!statement)return true;
+  if(['ReturnStatement','ThrowStatement','BreakStatement','ContinueStatement'].includes(statement.type))return false;
+  if(statement.type==='BlockStatement')return mayCompleteNormally(statement.body.at(-1));
+  if(statement.type==='IfStatement')return mayCompleteNormally(statement.consequent)||mayCompleteNormally(statement.alternate);
+  if(statement.type==='LabeledStatement')return mayCompleteNormally(statement.body);
+  if(statement.type==='TryStatement')return !statement.finalizer||mayCompleteNormally(statement.finalizer);
+  return true;
+ }
+
+ const runtimeInfo=(()=>{
+  const required=new Set(['wrap','_invoke','abrupt','tryEntries','prev','next','mark','stop']);
+  const containers=nodes.filter(n=>functions.has(n.type));
+  let best=null;
+  for(const container of containers){
+   const found=new Set();
+   for(const n of nodes){
+    if(n.start<container.start||n.end>container.end)continue;
+    const name=n.type==='MemberExpression'?property(n):(n.type==='Property'||n.type==='MethodDefinition')?key(n):undefined;
+    if(required.has(name))found.add(name);
+   }
+   if(found.size!==required.size)continue;
+   const size=container.end-container.start;
+   if(!best||size<best.size)best={container,size};
+  }
+  if(!best)return {proved:false,gaps:['未识别完整的 regenerator 运行时契约'],driveCount:0};
+  const container=best.container,gaps=[];
+  const ranged=node=>node.start>=container.start&&node.end<=container.end;
+  const stateFunctions=nodes.filter(n=>ranged(n)&&functions.has(n.type)&&nodes.some(c=>c.start>=n.start&&c.end<=n.end&&c.type==='MemberExpression'&&isThisLike(c.object)&&controls.has(String(property(c)))));
+  const invokeNodes=nodes.filter(n=>ranged(n)&&(n.type==='MemberExpression'&&property(n)==='_invoke'||(n.type==='Property'||n.type==='MethodDefinition')&&key(n)==='_invoke'));
+  if(!stateFunctions.length)gaps.push('运行时没有可识别的上下文状态函数');
+  if(!invokeNodes.length)gaps.push('运行时缺少 _invoke 分派链接');
+  const driveCalls=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['next','throw','return'].includes(property(n.callee)));
+  const internal=driveCalls.filter(ranged),external=driveCalls.filter(n=>!ranged(n));
+  if(!driveCalls.length)gaps.push('状态机没有 next/step 驱动点');
+  for(const call of external){
+   const object=unwrap(call.callee.object);
+   if(object.type==='Identifier'){
+    const binding=bindings.get(object);
+    const escaped=!binding||binding.writes.length||binding.refs.some(ref=>{
+     const parent=parents.get(ref);
+     if(parent?.type==='MemberExpression'&&parent.object===ref)return !['next','throw','return'].includes(property(parent));
+     if(parent?.type==='ConditionalExpression'||parent?.type==='LogicalExpression'||parent?.type==='IfStatement')return false;
+     return true;
+    });
+    if(escaped){
+     gaps.push('generator 对象逃逸或被外部驱动：第 '+lineOf(call)+' 行');continue;
+    }
+   }else if(!(object.type==='CallExpression'&&object.callee.type==='MemberExpression'&&property(object.callee)==='wrap')){
+    gaps.push('generator 对象以不可证明形状被外部驱动：第 '+lineOf(call)+' 行');
+   }
+  }
+  return {proved:gaps.length===0,gaps,container,driveCount:driveCalls.length,internalDrives:internal.length,externalDrives:external.length};
+ })();
+
+ const wrapCalls=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'&&n.arguments.length>=2&&functions.has(n.arguments[0]?.type));
+ const machines=[];
+ for(const call of wrapCalls){
+  const fn=call.arguments[0],param=fn.params[0];
+  const gaps=[];
+  if(param?.type!=='Identifier')gaps.push('状态机正文首参数不是可追踪上下文');
+  const switches=param?.type==='Identifier'?nodes.filter(n=>own(n,fn)&&n.type==='SwitchStatement'&&dispatchTest(n.discriminant,param)):[];
+  if(switches.length!==1)gaps.push('状态机有 '+switches.length+' 个分派入口');
+  const dispatch=switches[0];
+  const cases=dispatch?.cases??[];
+  const labels=[],caseByState=new Map();
+  for(const clause of cases){
+   if(!clause.test){gaps.push('状态分派含 default 分支');continue;}
+   const state=stateValue(clause.test);
+   if(state===null){gaps.push('状态分派含非有限 case 标签：第 '+lineOf(clause)+' 行');continue;}
+   if(caseByState.has(state)){gaps.push('状态 '+state+' 有多个 case 标签');continue;}
+   caseByState.set(state,clause);labels.push(state);
+  }
+  const states=new Set(labels),edges=[],terminals=[];
+  const addEdge=(from,to,kind,node,value)=>edges.push({from,to,kind,line:node?lineOf(node):undefined,...(value!==undefined?{value}:{})});
+  const addTerminal=(id,kind,node)=>terminals.push({id,kind,line:node?lineOf(node):undefined});
+  if(!states.has(0))gaps.push('状态图没有唯一入口状态 0');
+  addEdge('invoke',stateId(0),'next',call,'undefined');
+  const prevOwners=new Map();
+  for(const [state,clause] of caseByState){
+   for(const n of nodes){
+    if(n.start<clause.start||n.end>clause.end||owners.get(n)!==fn||n.type!=='AssignmentExpression'||n.operator!=='='||!contextMember(n.left,param,'prev'))continue;
+    const saved=stateValue(n.right);
+    if(saved===null){gaps.push('状态 '+state+' 的 prev 保存值不可证明：第 '+lineOf(n)+' 行');continue;}
+    if(!prevOwners.has(saved))prevOwners.set(saved,new Set());
+    prevOwners.get(saved).add(state);
+   }
+  }
+
+  const contextOwners=new Set(),checkedContextBindings=new Set();
+  function checkContextBinding(contextParam,ownerFn){
+   const binding=contextParam?.type==='Identifier'?bindings.get(contextParam):null;
+   if(!binding||checkedContextBindings.has(binding))return;
+   checkedContextBindings.add(binding);
+   for(const ref of binding.refs){
+    if(ref.start<fn.start||ref.end>fn.end){gaps.push('状态上下文逃逸出状态机正文：第 '+lineOf(ref)+' 行');continue;}
+    const parent=parents.get(ref);
+    if(parent?.type==='MemberExpression'&&parent.object===ref&&property(parent)!==undefined){
+     const owner=owners.get(ref);if(owner&&owner!==ownerFn)contextOwners.add(owner);continue;
+    }
+    if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+     const target=functionTarget(parent.callee,parent);
+     if(target)continue;
+    }
+    gaps.push('状态上下文存在别名或未知逃逸：第 '+lineOf(ref)+' 行');
+   }
+  }
+  checkContextBinding(param,fn);
+
+  const transitionSeen=new Set(),visitedFunctions=new Set();
+  function collectTransitions(state,start,end,ownerFn,contextParam,seenFunctions=new Set()){
+   const key=state+':'+start+':'+ownerFn.start;
+   if(transitionSeen.has(key))return;transitionSeen.add(key);
+   const nextWrites=[],controlCalls=[],returns=[],throws=[],calls=[];
+   for(const n of nodes){
+    if(n.start<start||n.end>end||owners.get(n)!==ownerFn)continue;
+    if(n.type==='AssignmentExpression'&&n.left.type==='MemberExpression'&&contextMember(n.left,contextParam)){
+     const name=property(n.left);
+     if(name==='next')nextWrites.push(n);
+    }
+    if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&contextMember(n.callee,contextParam)&&['abrupt','finish','stop'].includes(property(n.callee)))controlCalls.push(n);
+    if(n.type==='CallExpression')calls.push(n);
+    if(n.type==='ReturnStatement')returns.push(n);
+    if(n.type==='ThrowStatement')throws.push(n);
+   }
+   for(const write of nextWrites){
+    const target=stateValue(write.right);
+    if(target===null||!states.has(target))gaps.push('状态 '+state+' 的 next 目标不可证明：第 '+lineOf(write)+' 行');
+    else addEdge(stateId(state),stateId(target),'next',write,source.slice(write.right.start,write.right.end));
+   }
+   for(const control of controlCalls){
+    const name=property(control.callee);
+    if(name==='stop'){const id='stop:'+control.start;addTerminal(id,'return',control);addEdge(stateId(state),id,'return',control);continue;}
+    if(name==='finish'){
+     const target=control.arguments[0]?stateValue(control.arguments[0]):null;
+     if(target===null||!states.has(target))gaps.push('状态 '+state+' 的 finish 目标不可证明：第 '+lineOf(control)+' 行');
+     else addEdge(stateId(state),stateId(target),'finish',control,String(target));
+     continue;
+    }
+    const type=control.arguments[0]?scalar(control.arguments[0]):'return';
+    if(!abruptly.has(type)){gaps.push('状态 '+state+' 的 abrupt 类型不可证明：第 '+lineOf(control)+' 行');continue;}
+    if(type==='continue'||type==='break'){
+     const target=control.arguments[1]?stateValue(control.arguments[1]):null;
+     if(target===null||!states.has(target))gaps.push('状态 '+state+' 的 abrupt '+type+' 目标不可证明：第 '+lineOf(control)+' 行');
+     else addEdge(stateId(state),stateId(target),'abrupt-'+type,control,String(target));
+    }else{
+     const id=type+':'+control.start;addTerminal(id,type,control);addEdge(stateId(state),id,type,control);
+    }
+   }
+   if(ownerFn===fn)for(const ret of returns){
+    if(ret.argument?.type==='CallExpression'&&ret.argument.callee.type==='MemberExpression'&&contextMember(ret.argument.callee,param)&&['abrupt','stop','finish'].includes(property(ret.argument.callee)))continue;
+    const id='return:'+ret.start;addTerminal(id,'return',ret);addEdge(stateId(state),id,'return',ret);
+   }
+   if(ownerFn===fn)for(const thrown of throws){const id='throw:'+thrown.start;addTerminal(id,'throw',thrown);addEdge(stateId(state),id,'throw',thrown);}
+   for(const n of calls){
+    const target=functionTarget(n.callee,n);
+    const contextArgs=n.arguments.map((arg,index)=>sameBinding(unwrap(arg),contextParam)?index:-1).filter(index=>index>=0);
+    if(contextArgs.length>1)gaps.push('状态上下文通过多个实参传入调用：第 '+lineOf(n)+' 行');
+    if(!target&&contextArgs.length)gaps.push('状态上下文传入未知调用：第 '+lineOf(n)+' 行');
+    if(!target||seenFunctions.has(target))continue;
+    visitedFunctions.add(target);
+    const nested=new Set(seenFunctions);nested.add(target);
+    let targetContext=contextParam;
+    if(contextArgs.length===1){
+     targetContext=target.params[contextArgs[0]];
+     if(targetContext?.type!=='Identifier'){gaps.push('状态上下文传入的形参不是可追踪标识符：第 '+lineOf(n)+' 行');targetContext=null;}
+     else checkContextBinding(targetContext,target);
+    }
+    collectTransitions(state,target.start,target.end,target,targetContext,nested);
+   }
+  }
+  for(let i=0;i<cases.length;i++){
+   const clause=cases[i],state=stateValue(clause.test);
+   if(state===null)continue;
+   collectTransitions(state,clause.start,clause.end,fn,param);
+   if(i>0&&mayCompleteNormally(cases[i-1].consequent.at(-1))){const previous=stateValue(cases[i-1].test);if(previous!==null)addEdge(stateId(previous),stateId(state),'fallthrough',clause);}
+  }
+  for(const captured of contextOwners)if(!visitedFunctions.has(captured))gaps.push('访问状态上下文的函数未证明为封闭调用：第 '+lineOf(captured)+' 行');
+
+  for(const n of nodes){
+   if(n.start<fn.start||n.end>fn.end||n.type!=='AssignmentExpression'||n.left.type!=='MemberExpression')continue;
+   if(n.left.object.type==='Identifier'&&sameBinding(n.left.object,param)&&property(n.left)===undefined)gaps.push('状态上下文存在动态属性写入：第 '+lineOf(n)+' 行');
+  }
+
+  const tryNode=call.arguments[3];
+  if(tryNode){
+   let table=unwrap(tryNode);
+   if(table.type==='Identifier'){
+    const binding=bindings.get(table);table=binding&&!binding.writes.length?unwrap(binding.init):null;
+   }
+   if(table?.type==='Literal'&&table.value===null)table=null;
+   if(table&&table.type!=='ArrayExpression')gaps.push('异常表不是有限数组');
+   for(const entry of table?.elements??[]){
+    if(entry?.type!=='ArrayExpression'||entry.elements.length<2||entry.elements.length===3||entry.elements.length>4){gaps.push('异常表条目形状未知：第 '+lineOf(entry??table)+' 行');continue;}
+    const values=entry.elements.map(stateValue);
+    if(values.some(value=>value===null)){gaps.push('异常表含非有限状态：第 '+lineOf(entry)+' 行');continue;}
+    const [tryLoc,catchLoc,finallyLoc,afterLoc]=values;
+    const tryOwners=prevOwners.get(tryLoc),tryOrigin=tryOwners?.size===1?[...tryOwners][0]:null;
+    if(tryOwners?.size>1)gaps.push('异常表 try 保存点对应多个状态：'+tryLoc);
+    else if(tryOrigin===null)gaps.push('异常表 try 保存点不在状态图中：'+tryLoc);
+    for(const [name,target] of [['catch',catchLoc],['finally',finallyLoc],['after',afterLoc]])if(target!==undefined&&target!==null&&!states.has(target))gaps.push('异常表 '+name+' 目标不在状态图中：'+target);
+    if(tryOrigin!==null&&catchLoc!==undefined&&catchLoc!==null)addEdge(stateId(tryOrigin),stateId(catchLoc),'exception',entry,String(catchLoc));
+    if(finallyLoc!==undefined&&finallyLoc!==null){
+     if(afterLoc===undefined||afterLoc===null)gapFinally();
+     else{
+      if(tryOrigin!==null)addEdge(stateId(tryOrigin),stateId(finallyLoc),'exception-finally',entry,String(finallyLoc));
+      addEdge(stateId(finallyLoc),stateId(afterLoc),'finally-resume',entry,String(afterLoc));
+      for(const [state,clause] of caseByState)if(state>=finallyLoc&&state<afterLoc){
+       for(const n of nodes)if(n.start>=clause.start&&n.end<=clause.end&&finallyEffect(n,param))gaps.push('finally 区域含可观察副作用：状态 '+state+'，第 '+lineOf(n)+' 行');
+      }
+     }
+    }
+   }
+  }
+  function gapFinally(){gaps.push('finally 条目缺少 afterLoc');}
+
+  const slots=new Map();
+  const addSlot=(name,kind,writes)=>{const previous=slots.get(name);if(previous)previous.writes.push(...writes);else slots.set(name,{name,kind,writes:[...writes]});};
+  for(const name of controls){
+   const writes=nodes.filter(n=>n.start>=fn.start&&n.end<=fn.end&&n.type==='AssignmentExpression'&&n.left.type==='MemberExpression'&&contextMember(n.left,param,name));
+   if(writes.length)addSlot('ctx.'+name,'control',writes.map(n=>({line:lineOf(n),offset:n.start})));
+  }
+  for(const n of nodes){
+   if(n.start<fn.start||n.end>fn.end)continue;
+   let name=null,writes=[],fnValue=null,slotBinding=null;
+   if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&completionFunction(n.init)){
+    name=n.id.name;fnValue=n.init;slotBinding=bindings.get(n.id);writes=[n];if(slotBinding)writes.push(...slotBinding.writes);
+   }else if(n.type==='AssignmentExpression'&&n.left.type==='Identifier'&&completionFunction(n.right)){
+    name=n.left.name;fnValue=n.right;slotBinding=bindings.get(n.left);writes=[n];if(slotBinding)writes.push(...slotBinding.writes);
+   }
+   if(!name)continue;
+   addSlot(name,'completion',writes.map(w=>({line:lineOf(w),offset:w.start})));
+   if(writes.length!==1)gaps.push('保存槽 '+name+' 有多个写入点');
+   if(slotBinding&&slotBinding.refs.some(ref=>{
+    if(ref.start>=fnValue.start&&ref.end<=fnValue.end)return false;
+    const parent=parents.get(ref);
+    if(parent?.type==='CallExpression'&&parent.callee===ref)return false;
+    return true;
+   }))gaps.push('保存槽 '+name+' 逃逸出封闭调用位置');
+  }
+
+  const stateNodes=[...states].sort((a,b)=>typeof a===typeof b?(a<b?-1:a>b?1:0):typeof a==='number'?-1:1).map(state=>({id:stateId(state),kind:'restore',state,line:lineOf(caseByState.get(state))}));
+  const graphNodes=[{id:'invoke',kind:'dispatch',line:runtimeInfo.container?lineOf(runtimeInfo.container):lineOf(fn)},...stateNodes,...terminals];
+  const adjacency=new Map();
+  for(const edge of edges){if(!adjacency.has(edge.from))adjacency.set(edge.from,[]);adjacency.get(edge.from).push(edge.to);}
+  const queue=['invoke'],seen=new Set(queue);
+  while(queue.length){const from=queue.shift();for(const to of adjacency.get(from)??[]){if(!seen.has(to)){seen.add(to);queue.push(to);}}}
+  const deadStates=[...states].filter(state=>!seen.has(stateId(state)));
+  const deadTerminals=terminals.filter(terminal=>!seen.has(terminal.id)).map(terminal=>terminal.id);
+  if(deadStates.length)gaps.push('状态从单一入口不可达：'+deadStates.join('、'));
+  if(deadTerminals.length)gaps.push('终止节点从单一入口不可达：'+deadTerminals.length+' 个');
+  for(const state of states)if(!(adjacency.get(stateId(state))?.length))gaps.push('状态 '+state+' 没有可证明的出边');
+  if(!terminals.length)gaps.push('状态图没有返回点或异常终止点');
+  const uniqueGaps=[...new Set([...gaps,...runtimeInfo.gaps])];
+  machines.push({line:lineOf(call),entryState:0,proved:uniqueGaps.length===0,gaps:uniqueGaps,nodes:graphNodes,edges,
+   states:states.size,reachableStates:stateNodes.filter(node=>seen.has(node.id)).length,deadStates,deadTerminals,edges_count:edges.length,saveSlots:[...slots.values()],runtime:{driveCount:runtimeInfo.driveCount,internalDrives:runtimeInfo.internalDrives,externalDrives:runtimeInfo.externalDrives},
+   release:false});
+ }
+ const gaps=[...new Set([...runtimeInfo.gaps,...machines.flatMap(machine=>machine.gaps)])];
+ return {detected:machines.length,proved:machines.length>0&&gaps.length===0,machines,gaps,release:false,
+  summary:{machines:machines.length,proved:machines.filter(machine=>machine.proved).length,states:machines.reduce((sum,machine)=>sum+machine.states,0),reachableStates:machines.reduce((sum,machine)=>sum+machine.reachableStates,0),edges:machines.reduce((sum,machine)=>sum+machine.edges_count,0),saveSlots:machines.reduce((sum,machine)=>sum+machine.saveSlots.length,0),driveCount:runtimeInfo.driveCount??0,externalDrives:runtimeInfo.externalDrives??0}};
+}

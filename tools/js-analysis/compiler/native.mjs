@@ -11,7 +11,7 @@ import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatf
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
-import {valueFacts} from '../analysis/values.mjs';
+import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
 import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
@@ -21,7 +21,7 @@ export function native(source,format='surge',options={}){
  return withSyntaxCache(()=>compileNative(source,format,options));
 }
 function compileNative(source,format,options){
- let libraries;
+ let libraries,stateMachineProof;
  try{
   // Reveal a closed, data-only Function-constructor shell before identifying
   // embedded libraries. No input body is evaluated during this reduction.
@@ -29,11 +29,18 @@ function compileNative(source,format,options){
   libraries=protectLibraries(functionSource.source);
   const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
+  if(options.state_machine_proof){
+   try{
+    const proofSource=dispatch.source,tree=parse(proofSource,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});
+    const proof=regeneratorStateMachine(index(tree),proofSource);
+    stateMachineProof={detected:proof.detected,proved:proof.proved,release:proof.release,gaps:proof.gaps,summary:proof.summary};
+   }catch(error){stateMachineProof={detected:0,proved:false,release:false,gaps:['状态机证明失败：'+error.message],summary:{machines:0,proved:0,states:0,edges:0,saveSlots:0,driveCount:0,externalDrives:0}};}
+  }
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
   return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
-   static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
- }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[]};}
+   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+ }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[],...(stateMachineProof?{state_machine:stateMachineProof}:{})};}
 }
 function normalizeLegacyNumbers(source){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),edits=[];
