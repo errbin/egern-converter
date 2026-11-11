@@ -133,7 +133,7 @@ function fold(source,format,options,qxHint){
   while(low<high){const middle=(low+high)>>1;if(thisExpressions[middle].start<fn.start)low=middle+1;else high=middle;}
   return low<thisExpressions.length&&thisExpressions[low].start>=fn.start&&thisExpressions[low].end<=fn.end;
  }
- const used=name=>ix.nodes.some(n=>ix.free(n,name)&&!(ix.parents.get(n)?.operator==='typeof'));
+ const used=name=>ix.nodes.some(n=>ix.free(n,name)&&!(ix.parents.get(n)?.operator==='typeof')||n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&property(n)===name);
  const qx=qxHint??(format==='qx'||(used('$task')&&!used('$httpClient')));
  const records=new WeakSet();
  const stableRegexTest=!ix.nodes.some(n=>ix.free(n,'RegExp')||n.type==='MemberExpression'&&(['constructor','prototype'].includes(property(n))||property(n)==='test'&&(ix.parents.get(n)?.type==='AssignmentExpression'||ix.parents.get(n)?.type==='UpdateExpression'||ix.parents.get(n)?.operator==='delete')));
@@ -268,6 +268,7 @@ function fold(source,format,options,qxHint){
      if(n.operator==='typeof'&&ix.free(n.argument,'globalThis')){complete('object');continue;}
      if(n.operator==='typeof'&&n.argument.type==='ChainExpression'){frame.argument=n.argument.expression;}
      else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip'){complete('function');continue;}
+     else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$task')&&property(n.argument)==='fetch'&&types.$task==='object'){complete('function');continue;}
      else if(n.operator==='typeof'&&ix.free(n.argument)&&n.argument.name.startsWith('$')){complete(Object.hasOwn(types,n.argument.name)?types[n.argument.name]:UNKNOWN);continue;}
      frame.state='unary';stack.push({node:frame.argument??n.argument,state:'start'});continue;
     }
@@ -336,6 +337,7 @@ function fold(source,format,options,qxHint){
   if(globalMembership.has(n))return globalMembership.get(n);
   if(keySnapshots.has(n)){const snapshot=[];records.add(snapshot);return snapshot;}
   if(n.type==='Literal')return n.value;
+  if(n.type==='MemberExpression'&&ix.free(n.object,'$task')&&property(n)==='fetch'&&types.$task==='object')return PRESENT_VERSION;
   if(n.type==='Identifier'&&ix.free(n)){
    if(Object.hasOwn(types,n.name)&&types[n.name]==='undefined')return undefined;
    if((types[n.name]==='object'||types[n.name]==='function')&&PRESENT_GLOBALS.has(n.name))return PRESENT_GLOBALS.get(n.name);

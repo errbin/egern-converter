@@ -3142,7 +3142,102 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(!record||!closedResponseRecord(record)||!closedResponseReads())return false;
   closedResponseUses.add(ref);return true;
  }
- function reply(binding,fn=null){
+ const replyFieldNames=new Set(['body','bodyBytes','status','statusCode','headers','ok','statusText']);
+ function replyTarget(callee){
+  if(functions.has(callee?.type))return callee;
+  if(callee?.type!=='Identifier')return null;
+  const binding=bindings.get(callee);return binding?.fn&&functions.has(binding.fn.type)?binding.fn:null;
+ }
+ function replyCalls(fn){
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
+  if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&parent.arguments.every(a=>a.type!=='SpreadElement'))return [parent];
+  if(!binding||binding.writes.length||!binding.refs.length)return null;
+  const calls=[];
+  for(const ref of binding.refs){const call=parents.get(ref);if(call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement'))return null;calls.push(call);}
+  return calls;
+ }
+ function replyValueContext(ref){
+  let current=ref,parent=parents.get(current);
+  while(parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===current){current=parent;parent=parents.get(current);}
+  while(parent?.type==='AwaitExpression'&&parent.argument===current||parent?.type==='ChainExpression'&&parent.expression===current){current=parent;parent=parents.get(current);}
+  return [current,parent];
+ }
+ function replyFieldUse(ref,fields,state){
+  const member=parents.get(ref),name=property(member);
+  if(member?.type!=='MemberExpression'||member.object!==ref||name===undefined||!replyFieldNames.has(String(name)))return false;
+  fields.add(String(name));
+  const use=parents.get(member);
+  if(use?.type==='AssignmentExpression'&&use.left===member){if(use.operator!=='=')return false;state.write=true;return true;}
+  if(use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')return false;
+  if(use?.type==='CallExpression'&&use.callee===member)return false;
+  // 快照里的 headers 是普通记录；动态键仍依赖原始 Headers 语义，必须拒绝。
+  if(String(name)==='headers'&&use?.type==='MemberExpression'&&property(use)===undefined)return false;
+  return true;
+ }
+ function replyProjection(binding,fields,state,seen=new Set()){
+  if(!binding||seen.has(binding))return false;seen=new Set(seen);seen.add(binding);
+  for(const ref of binding.refs){
+   const [current,parent]=replyValueContext(ref);
+   if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
+   const other=parent?.left===current?parent.right:parent?.right===current?parent.left:null;
+   if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')))continue;
+   if(parent?.type==='LogicalExpression'&&parent.left===current||['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(parent?.type)&&parent.test===current||parent?.type==='UnaryExpression'&&parent.operator==='!')continue;
+   if(parent?.type==='MemberExpression'&&parent.object===current){if(!replyFieldUse(current,fields,state))return false;continue;}
+   if(parent?.type==='ReturnStatement'&&parent.argument===current||parent?.type==='ArrowFunctionExpression'&&parent.body===current){
+    const fn=owners.get(parent);if(!fn||!replyReturned(fn,fields,state,seen))return false;state.whole=true;continue;
+   }
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(current)){
+    const fn=replyTarget(parent.callee),parameter=fn?.params[parent.arguments.indexOf(current)],id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
+    if(!fn||id?.type!=='Identifier'||!replyParameter(fn,id,fields,state,seen))return false;state.whole=true;continue;
+   }
+   if(parent?.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier'){
+    if(!replyProjection(bindings.get(parent.id),fields,state,seen))return false;state.whole=true;continue;
+   }
+   if(parent?.type==='AssignmentExpression'&&parent.right===current&&parent.operator==='='&&parent.left.type==='Identifier'){
+    if(!replyProjection(bindings.get(parent.left),fields,state,seen))return false;state.whole=true;continue;
+   }
+   return false;
+  }
+  return true;
+ }
+ function replyParameter(fn,parameter,fields,state,seen){
+  const binding=bindings.get(parameter);if(!binding||seen.has(binding))return false;seen=new Set(seen);seen.add(binding);
+  for(const ref of binding.refs){
+   const [current,parent]=replyValueContext(ref);
+   if(parent?.type==='MemberExpression'&&parent.object===current){if(!replyFieldUse(current,fields,state))return false;continue;}
+   if(parent?.type==='ReturnStatement'&&parent.argument===current||parent?.type==='ArrowFunctionExpression'&&parent.body===current){
+    const owner=owners.get(parent);if(!owner||!replyReturned(owner,fields,state,seen))return false;continue;
+   }
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(current)){
+    const next=replyTarget(parent.callee),nextParameter=next?.params[parent.arguments.indexOf(current)],id=nextParameter?.type==='AssignmentPattern'?nextParameter.left:nextParameter;
+    if(!next||id?.type!=='Identifier'||!replyParameter(next,id,fields,state,seen))return false;continue;
+   }
+   if(parent?.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier'){
+    if(!replyProjection(bindings.get(parent.id),fields,state,seen))return false;continue;
+   }
+   return false;
+  }
+  return true;
+ }
+ function replyReturned(fn,fields,state,seen){
+  const calls=replyCalls(fn);if(!calls||!calls.length||seen.has(fn))return false;seen=new Set(seen);seen.add(fn);
+  return calls.every(call=>{
+   const [current,parent]=replyValueContext(call);
+   if(parent?.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return replyProjection(bindings.get(parent.id),fields,state,seen);
+   if(parent?.type==='ReturnStatement'&&parent.argument===current||parent?.type==='ArrowFunctionExpression'&&parent.body===current){const owner=owners.get(parent);return !!owner&&replyReturned(owner,fields,state,seen);}
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(current)){const next=replyTarget(parent.callee),parameter=next?.params[parent.arguments.indexOf(current)],id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;return !!next&&id?.type==='Identifier'&&replyParameter(next,id,fields,state,seen);}
+   if(parent?.type==='ExpressionStatement')return true;
+   return false;
+  });
+ }
+ function reply(binding,fn=null,allowSnapshot=false){
+  if(binding&&allowSnapshot){
+   const fields=new Set(),state={write:false,whole:false};
+   if(replyProjection(binding,fields,state,new Set())&&(state.whole||fields.has('ok')||fields.has('statusText'))){
+    const info={uses:fields,body:fields.has('body')?fresh('responseText'):null,bytes:fields.has('bodyBytes')||fields.has('body')?fresh('responseBytes'):null,snapshot:true,fn};
+    httpReplies.set(binding,info);return info;
+   }
+  }
   const refs=binding?.refs??[],uses=new Set();for(const ref of refs){const p=parents.get(ref);
    if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='ObjectPattern'){
     for(const entry of p.id.properties){const name=entry.type==='Property'?key(entry):null;if(!['body','bodyBytes','status','statusCode','headers'].includes(name))fail(entry,'未知 HTTP 响应解构字段');uses.add(name);}continue;
@@ -3154,11 +3249,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  function replyPrelude(info,name){const out=[];if(info.bytes)out.push(`const ${info.bytes} = await ${name}.arrayBuffer();`);if(info.body)out.push(`const ${info.body} = ${info.bytes?`new TextDecoder().decode(${info.bytes})`:`await ${name}.text()`};`);return out.join('\n');}
  // Register awaited QX replies and Promise callback parameters before rendering.
  for(const n of nodes){
-  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init?.type==='AwaitExpression'&&(isAPI(n.init.argument,'$task','fetch')||bundled&&n.init.argument.type==='CallExpression'&&n.init.argument.callee.type==='MemberExpression'&&n.init.argument.callee.object.type==='MemberExpression'&&free(n.init.argument.callee.object.object,'$native')&&property(n.init.argument.callee.object)==='http')){const b=bindings.get(n.id),info=reply(b);extraAfter.set(n,()=>replyPrelude(info,n.id.name));}
+  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init?.type==='AwaitExpression'&&(isAPI(n.init.argument,'$task','fetch')||bundled&&n.init.argument.type==='CallExpression'&&n.init.argument.callee.type==='MemberExpression'&&n.init.argument.callee.object.type==='MemberExpression'&&free(n.init.argument.callee.object.object,'$native')&&property(n.init.argument.callee.object)==='http')){const b=bindings.get(n.id),info=reply(b,null,true);if(!info.snapshot)extraAfter.set(n,()=>replyPrelude(info,n.id.name));}
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='then'&&isAPI(n.callee.object,'$task','fetch')){
    const fn=target(n.arguments[0]);if(!fn)fail(n,'HTTP 响应处理函数必须可静态追溯');
    if(fn.params[0]&&fn.params[0].type!=='Identifier')fail(fn.params[0],'HTTP 响应参数必须是简单局部变量，不能保留旧响应解构');
-   if(fn.params[0])reply(bindings.get(fn.params[0]),fn);
+   if(fn.params[0])reply(bindings.get(fn.params[0]),fn,false);
   }
   if(n.type==='CallExpression'&&clientMethod(n.callee)){
    const fn=target(n.arguments[1]),p=fn?.params[1];
@@ -3192,6 +3287,19 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const text=emit(n);generated.set(n,text);return text;
  }
  function emit(n){
+  if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&httpReplies.get(bindings.get(n.id))?.snapshot){
+   const info=httpReplies.get(bindings.get(n.id)),raw=fresh('response'),lines=[`const ${raw} = await ${render(n.init.argument)};`];
+   if(info.bytes)lines.push(`const ${info.bytes} = await ${raw}.arrayBuffer();`);
+   if(info.body)lines.push(`const ${info.body} = new TextDecoder().decode(${info.bytes});`);
+   const fields=[...info.uses].map(name=>{
+    const value=name==='body'?info.body:name==='bodyBytes'?info.bytes:name==='statusCode'?`${raw}.statusCode ?? ${raw}.status`:
+     name==='status'?`${raw}.status ?? ${raw}.statusCode`:
+     name==='headers'?`Object.fromEntries([...${raw}.headers.entries()].map(([field, value]) => [field, ${raw}.headers.getAll(field).length > 1 ? ${raw}.headers.getAll(field) : value]))`:
+     name==='ok'?`${raw}.ok`:`${raw}.${name}`;
+    return `${name}: ${value}`;
+   });
+   return `${render(n.id)} = await (async () => { ${lines.join(' ')} return {${fields.join(', ')}}; })()`;
+  }
   if(n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.callee.name===device.deviceTypeToken&&!n.arguments.length)return `(${context}.env.EGH_DEVICE_TYPE || 'iPhone')`;
   if(n.type==='CallExpression'&&free(n.callee,'setTimeout')&&n.arguments.length===2&&n.arguments[0]?.type==='CallExpression'&&n.arguments[1].type==='Literal'&&typeof n.arguments[1].value==='number'&&target(n.arguments[0].callee)&&parents.get(n)?.type==='ExpressionStatement')return render(n.arguments[0]);
   if(n.type==='AssignmentExpression'&&n.operator==='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+n.left.name+' = ('+render(n.right)+'), '+guardedImplicit.get(n.left.name)+' = true, '+n.left.name+')';
@@ -3549,9 +3657,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const field=String(property(p));
     if(['__proto__','prototype','constructor'].includes(field))return stop('parameter prototype:'+field);
     if(q?.type==='MemberExpression'&&q.object===p){
-     if(field!=='headers'||property(q)===undefined||['__proto__','prototype','constructor'].includes(String(property(q))))return stop('nested field:'+field);
+     const nested=property(q),stringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr','split','includes','startsWith','endsWith','match','matchAll','search','indexOf','lastIndexOf','slice']);
+     if(field==='headers'){
+      if(nested===undefined||['__proto__','prototype','constructor'].includes(String(nested)))return stop('nested field:'+field);
+     }else if(['url','method'].includes(field)&&nested!==undefined&&stringMethods.has(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q){
+      // url / method 是宿主保证的字符串字段；只允许原地调用字符串方法。
+     }else return stop('nested field:'+field);
      const use=parents.get(q);
-     if(use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===q)return stop('nested mutation:'+field);
+     if(use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===q&&!['url','method'].includes(field))return stop('nested mutation:'+field);
      read.add(field);continue;
     }
     if(q?.type==='AssignmentExpression'&&q.left===p){if(q.operator!=='=')return stop('compound field:'+field);write.add(field);continue;}
