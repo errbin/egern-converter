@@ -1,5 +1,5 @@
 import {pathSetterField} from '../http/requests.mjs';
-import {finiteLiteralMember,ordinaryReceivers} from '../analysis/values.mjs';
+import {finiteLiteralMember,ordinaryReceivers,regeneratorStateMachine} from '../analysis/values.mjs';
 import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,functions,initializedAfter,property,key,isolatedSwitchCase} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
@@ -773,4 +773,123 @@ export function lowerClosedAccessors(source){
  }
  function render(root){return renderTree(source,root,n=>replace.has(n)?{direct:true,value:replace.get(n)()}:null);}
  return render(tree);
+}
+
+// 极简 regenerator 只接受同步、单入口、无异常/finally、完成槽单写不逃逸的
+// `.wrap` 机器。改写限定在“外层函数只返回该机器，且生成器只在单一 `.next()`
+// driver 上消费”的闭合形状；其他形状继续沿原有拒收路径失败。
+export function lowerMinimalRegenerator(source){
+ if(!source.includes('wrap')||!source.includes('$done'))return {source,transformations:[],released:[]};
+ let tree,ix,proof;
+ try{
+  tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});
+  ix=index(tree);
+  proof=regeneratorStateMachine(ix,source);
+ }catch{return {source,transformations:[],released:[]};}
+ if(!proof.machines.some(machine=>machine.minimal))return {source,transformations:[],released:[]};
+ const wraps=ix.nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'&&n.arguments.length>=2&&functions.has(n.arguments[0]?.type));
+ const edits=[],released=[];
+ for(let i=0;i<proof.machines.length;i++){
+  const machine=proof.machines[i];
+  if(!machine.minimal||!wraps[i])continue;
+  const plan=planLowering(wraps[i],ix,source);
+  if(plan.error){released.push({line:machine.line,released:false,reason:plan.error});continue;}
+  edits.push(...plan.edits);
+  released.push({line:machine.line,released:true});
+ }
+ if(!edits.length)return {source,transformations:[],released};
+ const unique=[];
+ for(const edit of edits.sort((a,b)=>a.start-b.start)){
+  if(unique.length&&edit.start<unique.at(-1).end)return {source,transformations:[],released:[...released,{released:false,reason:'极简状态机改写区间重叠'}]};
+  unique.push(edit);
+ }
+ let output=source;
+ for(const edit of unique.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return {source:output,transformations:released.filter(item=>item.released).map(item=>({kind:'minimal-regenerator',line:item.line})),released};
+}
+
+function planLowering(call,ix,source){
+ const {parents,bindings,free}=ix;
+ const ret=parents.get(call);
+ if(ret?.type!=='ReturnStatement'||ret.argument!==call)return {error:'极简状态机必须由外层函数直接返回'};
+ const block=parents.get(ret),outer=parents.get(block);
+ if(block?.type!=='BlockStatement'||block.body.length!==1||!functions.has(outer?.type)||outer.body!==block)return {error:'外层函数必须只包含机器返回'};
+ if(outer.async||outer.generator||outer.params.length||outer.id?.type!=='Identifier')return {error:'外层函数必须是同步无参具名函数'};
+ if(call.callee.type!=='MemberExpression'||call.callee.computed||property(call.callee)!=='wrap')return {error:'极简状态机必须使用静态 wrap 成员'};
+ const receiver=call.callee.object;
+ if(receiver.type!=='Identifier')return {error:'wrap 接收者必须是稳定局部绑定'};
+ const receiverBinding=bindings.get(receiver);
+ if(!receiverBinding||receiverBinding.writes.length)return {error:'wrap 接收者不是稳定局部绑定'};
+ const inner=call.arguments[0];
+ if(inner.type!=='FunctionExpression'||inner.async||inner.generator||inner.id||inner.params.length!==1||inner.params[0].type!=='Identifier'||inner.body.type!=='BlockStatement')return {error:'极简状态机正文形状未知'};
+ const tryNode=call.arguments[3];
+ if(tryNode&&!(tryNode.type==='Literal'&&tryNode.value===null))return {error:'极简状态机不允许异常表'};
+ if(call.arguments.slice(1,3).some(argument=>!argument||!['Identifier','Literal','ThisExpression'].includes(argument.type)))return {error:'wrap 辅助参数必须是静态值'};
+ const forbidden=ix.nodes.filter(n=>n.start>=inner.start&&n.end<=inner.end&&(n.type==='TryStatement'||n.type==='AwaitExpression'||n.type==='YieldExpression'||n.type==='ThisExpression'||n.type==='Super'||n.type==='MetaProperty'||n.type==='WithStatement'));
+ if(forbidden.length)return {error:'极简状态机正文含未支持的执行语义'};
+ if(ix.nodes.some(n=>n.start>=inner.start&&n.end<=inner.end&&n.type==='Identifier'&&n.name==='arguments'&&free(n,'arguments')))return {error:'极简状态机正文读取 arguments'};
+ if(ix.nodes.some(n=>n.start>=inner.start&&n.end<=inner.end&&n.type==='ExpressionStatement'&&typeof n.directive==='string'))return {error:'极简状态机正文包含指令序言'};
+
+ const doneRefs=ix.nodes.filter(n=>n.start>=inner.start&&n.end<=inner.end&&n.type==='Identifier'&&n.name==='$done'&&free(n,'$done'));
+ if(doneRefs.length!==1)return {error:'极简状态机要求恰好一个完成调用'};
+ const doneRef=doneRefs[0];
+ const doneParent=parents.get(doneRef);
+ const innerStart=inner.body.start+1;
+ let innerText=source.slice(innerStart,inner.body.end-1),slotEdits=[];
+ if(!(doneParent?.type==='CallExpression'&&doneParent.callee===doneRef)){
+  let slot,write,assignment=false;
+  if(doneParent?.type==='VariableDeclarator'&&doneParent.init===doneRef&&doneParent.id.type==='Identifier'){
+   slot=doneParent.id;write=doneParent;
+  }else if(doneParent?.type==='AssignmentExpression'&&doneParent.operator==='='&&doneParent.right===doneRef&&doneParent.left.type==='Identifier'){
+   slot=doneParent.left;write=doneParent;assignment=true;
+  }
+  if(!slot)return {error:'极简状态机完成函数必须直接调用或保存到单一标识符'};
+  const binding=bindings.get(slot);
+  if(!binding||(assignment?(binding.writes.length!==1||binding.writes[0]!==write):binding.writes.length!==0)||binding.refs.length!==1)return {error:'极简状态机完成槽必须单写且不逃逸'};
+  const use=parents.get(binding.refs[0]);
+  if(!(use?.type==='CallExpression'&&use.callee===binding.refs[0]))return {error:'极简状态机完成槽必须直接调用'};
+  slotEdits.push({start:binding.refs[0].start,end:binding.refs[0].end,replacement:'$done'});
+  let declaration;
+  if(assignment){
+   const statement=parents.get(write);
+   if(statement?.type!=='ExpressionStatement'||statement.expression!==write)return {error:'极简状态机完成槽必须由独立语句写入'};
+   declaration=statement;
+  }else{
+   const variable=parents.get(write);
+   if(variable?.type!=='VariableDeclaration'||variable.declarations.length!==1)return {error:'极简状态机完成槽必须由单一声明写入'};
+   declaration=variable;
+  }
+  slotEdits.push({start:declaration.start,end:declaration.end,replacement:''});
+ }
+ innerText=applyLocalEdits(innerText,slotEdits.map(edit=>({...edit,start:edit.start-innerStart,end:edit.end-innerStart})));
+
+ const outerBinding=bindings.get(outer.id);
+ if(!outerBinding||outerBinding.writes.length)return {error:'外层函数绑定已重写'};
+ const refs=outerBinding.refs.filter(ref=>ref.start<outer.start||ref.end>outer.end);
+ if(refs.length!==1)return {error:'外层函数必须只有一个生成器 driver'};
+ const ref=refs[0],driverCall=parents.get(ref);
+ if(driverCall?.type!=='CallExpression'||driverCall.callee!==ref||driverCall.arguments.length||driverCall.optional)return {error:'外层函数必须由无参直接调用驱动'};
+ const driverParent=parents.get(driverCall);
+ let driverEdit=null;
+ if(driverParent?.type==='MemberExpression'&&driverParent.object===driverCall&&!driverParent.computed&&property(driverParent)==='next'){
+  const nextCall=parents.get(driverParent),statement=parents.get(nextCall);
+  if(nextCall?.type!=='CallExpression'||nextCall.callee!==driverParent||nextCall.arguments.length||statement?.type!=='ExpressionStatement'||statement.expression!==nextCall)return {error:'生成器 driver 必须直接丢弃 next 结果'};
+  driverEdit={start:statement.start,end:statement.end,replacement:source.slice(driverCall.start,driverCall.end)+';'};
+ }else if(driverParent?.type==='VariableDeclarator'&&driverParent.init===driverCall&&driverParent.id.type==='Identifier'){
+  const binding=bindings.get(driverParent.id);
+  if(!binding||binding.writes.length||binding.refs.length!==1)return {error:'生成器 driver 绑定必须单读'};
+  const member=parents.get(binding.refs[0]),nextCall=parents.get(member),statement=parents.get(nextCall);
+  if(member?.type!=='MemberExpression'||member.object!==binding.refs[0]||member.computed||property(member)!=='next'||nextCall?.type!=='CallExpression'||nextCall.callee!==member||nextCall.arguments.length||statement?.type!=='ExpressionStatement'||statement.expression!==nextCall)return {error:'生成器 driver 必须直接丢弃 next 结果'};
+  driverEdit={start:statement.start,end:statement.end,replacement:''};
+ }else return {error:'生成器 driver 形状未知'};
+
+ const contextName=inner.params[0].name;
+ const context='var '+contextName+' = {prev: 0, next: 0, sent: void 0, method: "next", arg: void 0, done: false, stop() { return {done: true}; }, abrupt(type, arg) { this.done = type === "return"; return {done: true, type: type, arg: arg}; }};';
+ return {edits:[{start:ret.start,end:ret.end,replacement:context+'\n'+innerText},driverEdit]};
+}
+
+function applyLocalEdits(source,edits){
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return output;
 }

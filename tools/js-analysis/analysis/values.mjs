@@ -1062,6 +1062,67 @@ export function regeneratorStateMachine(ix,source){
    }))gaps.push('保存槽 '+name+' 逃逸出封闭调用位置');
   }
 
+  // 极简模式只覆盖同步、无异常边、无 finally 且完成槽单写不逃逸的机器。
+  // 这里只产出可放行判据；真正的源码改写由 transforms/specialization.mjs 完成。
+  const minimalGaps=[];
+  const innerNodes=nodes.filter(n=>n.start>=fn.start&&n.end<=fn.end);
+  if(tryNode)minimalGaps.push('极简模式包含异常表');
+  if(edges.some(edge=>['exception','exception-finally','finally-resume'].includes(edge.kind)))minimalGaps.push('极简模式包含异常或 finally 边');
+  if(terminals.some(terminal=>terminal.kind==='throw'))minimalGaps.push('极简模式包含显式抛出终止');
+  if(innerNodes.some(n=>n.type==='TryStatement'||n.type==='AwaitExpression'||n.type==='YieldExpression'))minimalGaps.push('极简模式包含异常或异步挂起点');
+  if(innerNodes.some(n=>n.type==='ThisExpression'))minimalGaps.push('极简模式正文读取 this');
+  if(innerNodes.some(n=>n.type==='Identifier'&&n.name==='arguments'&&free(n,'arguments')))minimalGaps.push('极简模式正文读取 arguments');
+  for(const n of innerNodes){
+   if(n.type==='MemberExpression'&&contextMember(n,param)&&!['prev','next','sent','stop','abrupt'].includes(String(property(n)))){
+    minimalGaps.push('极简模式包含未支持的上下文成员：'+String(property(n)));
+    break;
+   }
+   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&contextMember(n.callee,param)){
+    const name=property(n.callee);
+    if(name==='abrupt'){
+     const type=n.arguments[0]?scalar(n.arguments[0]):null;
+     if(type!=='return'){minimalGaps.push('极简模式仅支持 abrupt return');break;}
+    }else if(name!=='stop'){
+     minimalGaps.push('极简模式包含未支持的上下文调用：'+String(name));
+     break;
+    }
+   }
+  }
+  for(const n of innerNodes){
+   if(n.type!=='ReturnStatement'||owners.get(n)!==fn||!n.argument)continue;
+   const arg=n.argument;
+   if(arg.type==='CallExpression'&&arg.callee.type==='MemberExpression'&&contextMember(arg.callee,param)&&['stop','abrupt'].includes(property(arg.callee)))continue;
+   minimalGaps.push('极简模式包含异步挂起返回：第 '+lineOf(n)+' 行');
+   break;
+  }
+  const minimalDoneRefs=innerNodes.filter(n=>n.type==='Identifier'&&n.name==='$done'&&free(n,'$done'));
+  if(minimalDoneRefs.length!==1){
+   minimalGaps.push('极简模式要求恰好一个完成调用');
+  }else{
+   const ref=minimalDoneRefs[0],parent=parents.get(ref);
+   if(!(parent?.type==='CallExpression'&&parent.callee===ref)){
+    let slot=null,write=null,assignment=false;
+    if(parent?.type==='VariableDeclarator'&&parent.init===ref&&parent.id.type==='Identifier'){
+     slot=parent.id;write=parent;
+    }else if(parent?.type==='AssignmentExpression'&&parent.operator==='='&&parent.right===ref&&parent.left.type==='Identifier'){
+     slot=parent.left;write=parent;assignment=true;
+    }
+    if(!slot){
+     minimalGaps.push('极简模式完成函数必须直接调用或保存到单一标识符');
+    }else{
+     const binding=bindings.get(slot);
+     if(!binding||(assignment?(binding.writes.length!==1||binding.writes[0]!==write):binding.writes.length!==0))minimalGaps.push('极简模式保存槽有多个写入点');
+     else if(binding.refs.length!==1)minimalGaps.push('极简模式保存槽逃逸出封闭调用位置');
+     else{
+      const use=parents.get(binding.refs[0]);
+      if(!(use?.type==='CallExpression'&&use.callee===binding.refs[0]))minimalGaps.push('极简模式保存槽不是直接调用');
+     }
+    }
+   }
+  }
+  for(const slot of slots.values())if(slot.kind==='completion'&&slot.writes.length!==1)minimalGaps.push('极简模式保存槽 '+slot.name+' 有多个写入点');
+  const uniqueMinimalGaps=[...new Set(minimalGaps)];
+
   const stateNodes=[...states].sort((a,b)=>typeof a===typeof b?(a<b?-1:a>b?1:0):typeof a==='number'?-1:1).map(state=>({id:stateId(state),kind:'restore',state,line:lineOf(caseByState.get(state))}));
   const graphNodes=[{id:'invoke',kind:'dispatch',line:runtimeInfo.container?lineOf(runtimeInfo.container):lineOf(fn)},...stateNodes,...terminals];
   const adjacency=new Map();
@@ -1077,7 +1138,7 @@ export function regeneratorStateMachine(ix,source){
   const uniqueGaps=[...new Set([...gaps,...runtimeInfo.gaps])];
   machines.push({line:lineOf(call),entryState:0,proved:uniqueGaps.length===0,gaps:uniqueGaps,nodes:graphNodes,edges,
    states:states.size,reachableStates:stateNodes.filter(node=>seen.has(node.id)).length,deadStates,deadTerminals,edges_count:edges.length,saveSlots:[...slots.values()],runtime:{driveCount:runtimeInfo.driveCount,internalDrives:runtimeInfo.internalDrives,externalDrives:runtimeInfo.externalDrives},
-   release:false});
+   minimal:uniqueGaps.length===0&&uniqueMinimalGaps.length===0,minimalGaps:uniqueMinimalGaps,release:false});
  }
  const gaps=[...new Set([...runtimeInfo.gaps,...machines.flatMap(machine=>machine.gaps)])];
  return {detected:machines.length,proved:machines.length>0&&gaps.length===0,machines,gaps,release:false,

@@ -1,4 +1,4 @@
-"""regenerator 状态机阶段一只证明跨函数 CFG，不放行 .wrap 转换。"""
+"""regenerator 状态机只放行极简同步 .wrap 机器，其余形状继续拒绝。"""
 import json
 from pathlib import Path
 import subprocess
@@ -108,8 +108,14 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         machine = proof['machines'][0]
         self.assertTrue(any(edge['from'] == 'state:0' and edge['to'] == 'state:2' for edge in machine['edges']), machine)
 
-    def test_state_machine_remains_outside_conversion_release(self):
+    def test_minimal_state_machine_can_enter_conversion(self):
         source = source_with("case 0:$done({body:'ok'});return ctx.stop();")
+        self.assertTrue(prove(source)['machines'][0]['minimal'])
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertNotIn('runtime.wrap', output)
+
+    def test_exception_table_state_machine_remains_rejected(self):
+        source = source_with("case 0:return ctx.stop();", table='[[0,2]]')
         with self.assertRaises(ConversionError):
             convert_script(source, 'Fixture', URL, '', source_format='surge')
 
