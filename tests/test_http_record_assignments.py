@@ -37,6 +37,37 @@ url.url+='record';$httpClient.get(url,(e,r,b)=>$done({body:b}));'''
 send({url:'https://example.test/path',params:'a=1'});'''
         self.check(source,'', 'path?a=1')
 
+    def test_opaque_parameter_uses_closed_field_mutations_before_one_dispatch(self):
+        # 运行期解析出的请求对象可以保持不透明，但 helper 形参只能读取或改写
+        # 白名单字段，全部修改早于唯一派发，且对象身份不能被复制或转交。
+        source='''function send(t){t.headers&&delete t.headers['X-Remove'];t.params&&(t.url+='?'+t.params);
+$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+const options=JSON.parse($argument);send(options);'''
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        case={'name':'opaque forwarded request',
+              'argument':'{"url":"https://example.test/path","params":"a=1","headers":{"X-Remove":"yes","Y":"keep"}}',
+              'request':{'url':URL},
+              'http':[{'url':'https://example.test/path?a=1','body':'ok'}],
+              'expected':{'result':{'body':'ok'},
+                          'events':{'requests':[{'url':'https://example.test/path?a=1','headers':{'y':'keep'}}]}}}
+        result=compare(source,output,'loon',URL,case)
+        self.assertEqual(result['status'],'passed',result)
+
+        for rejected in [
+            '''function send(t){unknown(t);$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+const options=JSON.parse($argument);send(options);''',
+            '''function send(t){const copy=t;copy.url+='?copy';$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+const options=JSON.parse($argument);send(options);''',
+            '''function send(t){t[$argument]='x';$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+const options=JSON.parse($argument);send(options);''',
+            '''function send(t){$httpClient.get(t,(e,r,b)=>$done({body:b}));t.url+='?late'}
+const options=JSON.parse($argument);send(options);''',
+            '''function send(t){t={...t};$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+const options=JSON.parse($argument);send(options);''',
+        ]:
+            with self.subTest(source=rejected),self.assertRaises(ConversionError):
+                convert_script(rejected,'Fixture',URL,'',source_format='loon')
+
     def test_closed_parameter_snapshot_and_default_spread_before_dispatch(self):
         # 参数在入口可以重绑一次为新的展开快照；所有调用点省略默认参数，且自我展开
         # 的旧字段来自闭合实参时，字段集合仍然可枚举。

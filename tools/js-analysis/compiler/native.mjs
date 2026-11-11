@@ -1598,9 +1598,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      }
      return calls?.length&&calls.every(Boolean)?{fn,position,calls}:null;
     };
-    // 记录字段集合必须可以静态枚举。展开来源同样要递归证明；唯一例外是
-    // 参数入口的一次自我快照（如 t={...defaults,...t}），此时旧字段集合
-    // 必须由所有调用点的闭合实参共同证明。
+    // 记录字段集合优先静态枚举。实参本身可以是不透明的运行期请求值，但只有
+    // 参数绑定未复制、未逃逸、只访问白名单字段且只有一个派发点时才会走到这里。
+    // 参数入口的一次自我快照（如 t={...defaults,...t}）仍要求旧字段集合由
+    // 所有调用点的闭合实参共同证明。
     const recordFields=(node,seen=new Set(),selfFields=null)=>{
      node=resolve(node,seen);
      if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
@@ -1650,8 +1651,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      });
     };
     const sourceRecords=parameter?parameterRecords():null;
-    if(parameter&&(!sourceRecords||sourceRecords.some(record=>!record)))return false;
-    const selfFields=sourceRecords?new Set(sourceRecords.flatMap(record=>[...record])):null;
+    if(parameter&&!sourceRecords)return false;
+    const selfFields=sourceRecords?.every(Boolean)?new Set(sourceRecords.flatMap(record=>[...record])):null;
     const baseFields=parameter?selfFields:binding.init&&recordFields(binding.init);
     let finalFields=null;
     if(!parameter){
@@ -1747,13 +1748,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(q?.type==='CallExpression'&&q.callee===p)return false;
      if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='Identifier')return false;
      if(q?.type==='SpreadElement')return false;
-     if(observing(ref))continue;
+     if(observing(ref)||observing(p))continue;
     }
     const assignsField=(node,name)=>{
      if(!node||functions.has(node.type))return false;
-     if(node.type==='AssignmentExpression')return node.operator==='='&&node.left.type==='MemberExpression'&&sameBinding(node.left.object)&&property(node.left)===name;
+     if(node.type==='AssignmentExpression')return (node.operator==='='||node.operator==='+='&&name==='url')&&node.left.type==='MemberExpression'&&sameBinding(node.left.object)&&property(node.left)===name;
      if(node.type==='IfStatement')return assignsField(node.test,name)||assignsField(node.consequent,name)&&assignsField(node.alternate,name);
      if(node.type==='ConditionalExpression')return assignsField(node.test,name)||assignsField(node.consequent,name)&&assignsField(node.alternate,name);
+     if(node.type==='LogicalExpression')return assignsField(node.left,name)||assignsField(node.right,name);
      if(node.type==='ExpressionStatement')return assignsField(node.expression,name);
      if(['BlockStatement','Program'].includes(node.type))return node.body.some(statement=>assignsField(statement,name));
      if(node.type==='SequenceExpression')return node.expressions.some(expression=>assignsField(expression,name));
