@@ -406,3 +406,94 @@ return saved == null ? fallback() : finish();
 - 全量套件：624 项、38 失败、67 跳过；失败集合与既有 38 项基线 diff=0。
 - E2E：维持 **172/327 组合、58/109 URL**；相对第二十二轮 172/327 基线逐 key
   diff=0，成功数没有上升，因此本轮不记有效增益。
+
+## 第二十四轮：异常表 catch 边的最小放行（2026-11-12）
+
+本轮只放宽 `tryLocsList` 的 catch 边，不改动异步挂起、`ctx.t0`、多入口、
+保存槽逃逸、显式 `throw` 和 `finally` 的既有拒绝边界。
+
+### 放行判据
+
+在第二十三轮极简模式判据之上，异常表条目必须同时满足：
+
+1. 条目形状为 `[tryLoc, catchLoc]`，没有 `finallyLoc` / `afterLoc`；
+2. `tryLoc` 与 `catchLoc` 都是有限数值状态，且 `tryLoc < catchLoc`；
+3. `tryLoc` 唯一映射到一个保存该 `ctx.prev` 的状态，`catchLoc` 在状态图中；
+4. 每个 `catchLoc` 都能从单一入口经状态图到达；
+5. handler 区域（从 `catchLoc` 沿 switch `fallthrough` 链展开）只允许
+   `ctx.prev/next/sent` 状态控制、`ctx.stop()` 和 `ctx.abrupt('return', ...)`；
+   业务调用、对象写入、`$done`、`ctx.catch(...)`、`ctx.t0`、异步挂起和显式
+   `throw` 一律拒绝；
+6. 条目数不得超过状态数，重复 `tryLoc` 或无法映射的 try/catch 状态直接拒绝。
+
+因此“允许异常边”不等于“允许异常处理”：只有无 finally、handler 可达且 handler
+没有业务副作用的 catch 边才会进入极简候选。
+
+### 实现
+
+- `analysis/values.mjs` 枚举 `exceptionEntries` 和 `handlerStates`，继续把
+  `exception-finally` / `finally-resume`、`ctx.t0`、`ctx.catch`、显式 `throw`
+  和异步挂起写成 `minimalGaps`。
+- `transforms/specialization.mjs` 只对证明通过的 catch 边生成同步重定向：
+  外层 `for(;;)` 中包裹 `try { <原状态循环> } catch (err) { ... }`，当
+  `ctx.prev` 落在某个 `[tryLoc, catchLoc)` 时把 `ctx.next` 设为对应
+  `catchLoc`，否则重新抛出。生成的错误变量名避让输入中的已有标识符。
+- 无异常表机器仍走第二十三轮的直通改写，不引入额外 try/catch。
+
+### 反例回归
+
+既有 6 类反例全部保持拒绝：多入口、异常边、finally 副作用、完成槽重赋值、
+完成槽逃逸、动态 `next` 目标。新增 3 类异常边反例也保持拒绝：
+
+- handler 目标不可达（`异常处理目标状态不可达`）；
+- handler 内含业务副作用（`异常处理区域含业务副作用`）；
+- 异常表与状态数不一致（`异常表条目数与状态数不一致`）。
+
+正例为一条数值 catch 边：try 区内抛出、handler 只做状态重定向、正常区直接
+`$done`，整脚本完成转换且 `compare` 为 `passed`。
+
+### 全量语料覆盖
+
+对 110 个去重源文件（109 个 URL）重新扫描：
+
+- 23 个文件、40 台机器含异常表；其中 10 台通过阶段一 CFG 证明；
+- **极简 + 异常表可放行机器为 0 台**，因此可放行整脚本仍为 0；
+- 40 台全部仍缺“非控制返回/异步挂起”的恢复模型，40 台仍未通过“恰好一个
+  直接完成调用”，36 台仍含 `ctx.t0`；其余还包括显式 `throw`（7 台）、
+  `finally`（3 台）、generator 逃逸或外部驱动等。
+
+### 三份目标脚本复核
+
+本轮新增能力后，三份目标脚本的错误文本和成功状态均未变化：
+
+| 脚本 | 完成相关机器 | catch 边 | 仍缺的极简/转换条件 | 是否最接近 |
+| --- | --- | --- | --- | --- |
+| `fqzm.js` | 1 台，6 状态，阶段一可证 | `[[0,16]]`，handler 为 16/19/end | `ctx.t0` + `ctx.catch`；state 0 的 `g(x)` 异步挂起；完成经 `j.enxyb/j.QmSMo` 辅助函数，不是唯一直接调用；handler 16 含完成副作用；机器外仍有 HTTP 响应/请求整体传递 | **是** |
+| `plpl.js` / `lsp/plpl.js` | 2 台；完成机器 15 状态，阶段一可证 | `[[0,52]]`，handler 为 52/56/end | 显式 `throw`（state 5）；state 0/8/14/24 的异步挂起；`ctx.t0` + `ctx.catch`（state 52）；完成经辅助函数；handler 52 含 `$logErr`/完成副作用；另一台仍有不可达 5/end | 否 |
+| `KDF/m3u.js` | 4 台；完成机器 5 状态，阶段一不可证 | `[[0,7]]`，handler 为 7/11/end | generator 逃逸/外部驱动；state 0 异步挂起；`ctx.t0` + `ctx.catch`（state 7）；完成经辅助函数；handler 7 含业务副作用；另一台机器含 finally | 否 |
+
+精确剩余缺口：
+
+- **异步挂起**：`fqzm` state 0 返回 `v.prev=0,v.next=3,g(x)`；`plpl` state
+  0/8/14/24 返回平台 Promise；`m3u` 完成机器 state 0 返回辅助调用。极简模式
+  要求所有返回只能是 `ctx.stop()` / `ctx.abrupt('return', ...)`，因此在
+  “状态机正文返回 Promise 后由运行时恢复”这一层被拒绝。
+- **`ctx.t0`**：三者的 catch 目标分别使用 `v.t0=v.catch(0)`、`T.t0=T.catch(0)`、
+  `U.t0=U.catch(0xb)`。极简模式仍不允许 `t0` 成员和 `catch(...)` 调用，故
+  catch 目标自己就不能进入极简模式。
+- **完成调用**：三者都通过辅助函数转发 `$done`，不是唯一直接调用；即使放行
+  catch 边，也无法满足第二十三轮“完成槽单写且不逃逸”的完成数据流条件。
+- **机器外错误**：`fqzm` 仍停在 HTTP 响应/请求整体传递；`plpl` 与 `m3u`
+  仍停在 `$done` 作为值传递。这些不是异常表能力能解决的层。
+
+因此本轮没有把任何目标脚本推到整脚本 `compare passed`；按验收口径，
+这是异常表覆盖能力的阶段推进，不是有效 E2E 增益。
+
+### 验证
+
+- 定向回归：`tests.test_regenerator_state_machine` 与
+  `tests.test_minimal_regenerator_lowering` 共 24 项通过。
+- 全量套件：630 项、38 失败、67 跳过；失败集合与第二十三轮 38 项基线
+  diff=0。
+- E2E：维持 **172/327 组合、58/109 URL**；327 个 key 逐项 diff=0，成功数
+  没有上升，因此本轮不记有效增益。
