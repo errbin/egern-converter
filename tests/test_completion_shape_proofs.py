@@ -191,6 +191,35 @@ response.body=response.body+':'+request.__cachedBody;return response}
             with self.subTest(source=rejected), self.assertRaises(ConversionError):
                 convert_script(rejected, 'Fixture', URL, '', source_format='loon')
 
+    def test_destructured_host_records_round_trip_static_fields(self):
+        # 宿主请求和 HTTP 回调响应可以进入同一个立即返回的包装记录，并在所有
+        # 调用点按静态字段解构回原绑定；响应字段最终仍按宿主记录投影。
+        source = '''let response,request=$request;
+(async()=>{
+ ({$request:request,$response:response}=await (async input=>{
+  const reply=await new Promise((resolve,reject)=>{globalThis.$httpClient.get({url:input.url+'?wrapped=1'},(error,result,body)=>{
+   if(error)reject(error);else{result.body=body;result.headers['X-Wrapped']='yes';resolve(result);}
+  })});
+  return {$request:input,$response:reply};
+ })($request));
+})().catch(error=>console.error(error)).finally(()=>{
+ if(response)$done({status:response.status,headers:response.headers,body:response.body});else $done(request);
+});'''
+        self.check(source, [{'name':'wrapped host records', 'request':{'url':URL},
+            'http':[{'url':URL+'?wrapped=1','status':200,'headers':{'Content-Type':'text/plain'},'body':'reply'}],
+            'expected':{'result':{'body':'reply'}}}])
+
+        for rejected in [
+            '''let alias=$request;unknown(alias);$done({});''',
+            '''async function wrap(input){return {$request:input}}
+(async()=>{const value=await wrap($request);unknown(value);$done({})})();''',
+            '''async function wrap(input){return {$request:input}}
+(async()=>{const value=await wrap($request);$done(value[$argument])})();''',
+            '''$done({body:'text',bodyBytes:new Uint8Array([1])});''',
+        ]:
+            with self.subTest(source=rejected), self.assertRaises(ConversionError):
+                convert_script(rejected, 'Fixture', URL, '', source_format='loon')
+
 
 if __name__ == '__main__':
     unittest.main()

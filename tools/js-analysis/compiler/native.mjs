@@ -868,7 +868,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  function hostResponseShape(binding){
   const fn=nodes.find(candidate=>functions.has(candidate.type)&&candidate.params.some(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding));
   const call=fn&&parents.get(fn);
-  if(!call||call.type!=='CallExpression'||call.callee.type!=='MemberExpression'||!free(call.callee.object,'$httpClient')||!call.arguments.includes(fn))return null;
+  // globalThis.$httpClient 与裸 $httpClient 指向同一宿主注册入口；两者都必须
+  // 来自自由全局引用，局部遮蔽仍不能获得响应字段证明。
+  const client=call?.callee?.type==='MemberExpression'&&(free(call.callee.object,'$httpClient')||call.callee.object.type==='MemberExpression'&&free(call.callee.object.object,'globalThis')&&property(call.callee.object)==='$httpClient');
+  if(!call||call.type!=='CallExpression'||call.callee.type!=='MemberExpression'||!client||!call.arguments.includes(fn))return null;
   const allowed=new Set(['status','statusCode','statusText','headers','body','bodyBytes','ok']);
   const fields=new Map();
   for(const ref of binding.refs){
@@ -926,6 +929,35 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return false;
  }
+ function returnedRecordOwner(record){
+  if(record?.type!=='ObjectExpression')return null;
+  let value=record,returned=parents.get(value);
+  while(returned?.type==='SequenceExpression'&&returned.expressions.at(-1)===value){value=returned;returned=parents.get(value);}
+  return returned?.type==='ReturnStatement'&&returned.argument===value?owners.get(returned):null;
+ }
+ // 包装记录只有在所有调用点都被 await 后按同一静态字段解构时，字段值才保持
+ // 原对象身份；把包装记录交给未知代码或动态键读取仍然拒绝。
+ function returnedRecordFieldDestructured(fn,field){
+  if(!fn)return false;
+  const binding=fn.id&&bindings.get(fn.id);
+  if(binding&&(binding.writes.length||binding.refs.some(ref=>{const call=parents.get(ref);return call?.type!=='CallExpression'||call.callee!==ref;})))return false;
+  const calls=nodes.filter(call=>call.type==='CallExpression'&&target(call.callee)===fn);
+  return calls.length>0&&calls.every(call=>{
+   const awaited=parents.get(call),assignment=parents.get(awaited);
+   return awaited?.type==='AwaitExpression'&&awaited.argument===call&&assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===awaited&&assignment.left.type==='ObjectPattern'&&assignment.left.properties.some(property=>property.type==='Property'&&!property.computed&&key(property)===field&&property.value.type==='Identifier');
+  });
+ }
+ function returnsArgumentAsField(fn,position,field){
+  if(!fn)return false;
+  const parameter=fn.params[position],binding=parameter&&bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+  if(!binding||binding.writes.length)return false;
+  const returns=nodes.filter(returned=>returned.type==='ReturnStatement'&&owners.get(returned)===fn);
+  if(returns.length!==1)return false;
+  return binding.refs.some(ref=>{
+   const p=parents.get(ref);
+   return p?.type==='Property'&&p.value===ref&&!p.computed&&key(p)===field&&returnedRecordOwner(parents.get(p))===fn;
+  })&&returnedRecordFieldDestructured(fn,field);
+ }
  function closedShapeFlow(binding,seen=new Set()){
   if(!binding||seen.has(binding))return false;
   const next=new Set(seen).add(binding);
@@ -948,6 +980,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='AssignmentExpression'&&p.left===ref)return p.operator==='=';
    if(p?.type==='UpdateExpression')return false;
    if(p?.type==='SequenceExpression')return p.expressions.at(-1)===ref;
+   if(p?.type==='Property'&&p.value===ref&&!p.computed&&key(p)!==undefined){
+    const fn=returnedRecordOwner(parents.get(p));
+    if(returnedRecordFieldDestructured(fn,String(key(p))))return true;
+   }
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
     if(p.optional||p.arguments.filter(argument=>argument===ref).length!==1||p.arguments.some(argument=>argument.type==='SpreadElement'))return false;
     if(isDone(p)||target(p.callee)&&complete.has(target(p.callee)))return true;
@@ -1005,7 +1041,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return fields;
   }
   if(n.type==='Identifier'){
-   const b=bindings.get(n);if(!b||seen.has(b))fail(n,'无法静态追溯完成结果');seen.add(b);
+   const b=bindings.get(n);if(!b)fail(n,'无法静态追溯完成结果');
+   // 数据流回到正在求解的绑定形成闭包时，本次递归不贡献新字段；外层仍须
+   // 由至少一条独立写入提供可渲染字段，避免把纯自引用误认为完成结果。
+   if(seen.has(b))return new Map();seen.add(b);
    const host=hostResponseShape(b);if(host)return host;
    const callbackFn=owners.get(n),callback=parents.get(callbackFn),callbackIndex=callback?.type==='CallExpression'?callback.arguments.indexOf(callbackFn):-1;
    if(callbackIndex>=0&&callback.callee.type==='MemberExpression'&&property(callback.callee)==='finally'&&promiseValue(callback.callee.object)){
@@ -1043,6 +1082,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const definite=w=>{
       let node=w;
       for(let parent=parents.get(node);parent&&!functions.has(parent.type);node=parent,parent=parents.get(node)){
+      // 逗号表达式按从左到右求值；位于读取点之前的赋值必然先执行。
+      if(parent.type==='SequenceExpression')continue;
+      // 同一 return 表达式中的前序赋值也必然早于返回值读取。
+      if(parent.type==='ReturnStatement'&&n.start>=parent.start&&n.end<=parent.end)return true;
        if(parent.type==='LogicalExpression'||parent.type==='ConditionalExpression'&&parent.test!==node||parent.type==='IfStatement'&&parent.test!==node)return false;
        if(['WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchStatement','TryStatement'].includes(parent.type))return false;
        if(parent.type==='BlockStatement'||parent.type==='Program'){
@@ -1059,9 +1102,20 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      };
      if(!relevantWrites.some(definite)){fields.nullable=true;fields.undefinedOnly=true;}
     }
+    const destructured=write=>{
+     if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='ObjectPattern')return null;
+     const matches=write.left.properties.filter(property=>property.type==='Property'&&property.value.type==='Identifier'&&bindings.get(property.value)===b);
+     if(matches.length!==1||matches[0].computed&&key(matches[0])===undefined)return null;
+     return key(matches[0]);
+    };
     for(const w of relevantWrites){
      if(w.type!=='AssignmentExpression'||w.operator!=='=')fail(n,'完成结果变量被重新赋值，无法确定字段');
-     mergeShape(fields,shape(w.right,new Set(seen)),seen);
+     const field=destructured(w);
+     if(field===null){mergeShape(fields,shape(w.right,new Set(seen)),seen);continue;}
+     const source=shape(w.right,new Set(seen)),value=source.get(String(field));
+     if(!value)fail(n,'完成结果解构字段无法静态确定');
+     if(source.nullable)fields.nullable=true;
+     mergeShape(fields,shape(value,new Set(seen)),seen);
     }
     if(fields.nullable){
      const truthy=truthyGuarded(n)||completionTruthyGuard(n,b);
@@ -1075,6 +1129,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const p=parents.get(ref),a=parents.get(p);
      // 绑定自身的重新赋值由上面的 relevantWrites 统一求形，不再按逃逸处理。
      if(p?.type==='AssignmentExpression'&&p.left===ref&&p.operator==='=')continue;
+     // 解构赋值左侧的绑定同样是写入目标，值已按对应静态字段单独求形。
+     let pattern=ref,parent=parents.get(pattern);
+     while(parent?.type==='Property'&&parent.value===pattern&&parents.get(parent)?.type==='ObjectPattern'){pattern=parent;parent=parents.get(pattern);}
+     if(pattern?.type==='Property'&&parent?.type==='ObjectPattern'){pattern=parent;parent=parents.get(pattern);}
+     if(parent?.type==='AssignmentExpression'&&parent.left===pattern&&parent.operator==='='&&relevantWrites.includes(parent))continue;
+     // Promise 执行器只把同一对象交回其 resolver，且该 Promise 被 await 后
+     // 重新赋给同一绑定时，不构成对象身份逃逸，也不贡献新的字段来源。
+     const resolverCall=p?.type==='CallExpression'&&p.arguments.length===1&&p.arguments[0]===ref&&isPromiseResolver(p.callee)?p:null;
+     const executor=resolverCall&&nodes.find(candidate=>functions.has(candidate.type)&&bindings.get(candidate.params[0])===bindings.get(resolverCall.callee));
+     const construction=executor&&parents.get(executor),returned=construction?.type==='NewExpression'&&free(construction.callee,'Promise')&&construction.arguments[0]===executor?parents.get(construction):null;
+     const owner=returned?.type==='ReturnStatement'&&returned.argument===construction?owners.get(returned):null,ownerCall=owner&&parents.get(owner),awaited=ownerCall?.type==='CallExpression'&&ownerCall.callee===owner?parents.get(ownerCall):null,assignment=awaited?.type==='AwaitExpression'&&awaited.argument===ownerCall?parents.get(awaited):null;
+     if(assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===awaited&&assignment.left.type==='Identifier'&&bindings.get(assignment.left)===b)continue;
      if(p?.type==='MemberExpression'&&p.object===ref){
       if(property(p)===undefined)fail(p,'完成结果包含动态字段');
       if(a?.type==='UnaryExpression'&&a.operator==='delete'&&a.argument===p)fail(p,'完成结果字段被直接删除，需要先确定完成结果的数据流');
@@ -1223,14 +1289,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const value=fresh('completionResponse');
    return `((${value}) => ${value} === undefined ? {} : ${payload(fields.get('response'),true,value,fields.responseFields)})(${reference??render(n)}.response)`;
   }
-  if(fields.has('body')&&fields.has('bodyBytes'))fail(n,'body 与 bodyBytes 冲突');
+  // 宿主响应的 body/bodyBytes 是同一载荷的文本与二进制视图，完成时投影为
+  // 一个带运行期回退的 body；普通记录同时出现两个字段仍然拒绝。
+  const hostBody=!!(fields.hostResponse&&fields.has('body')&&fields.has('bodyBytes'));
+  if(fields.has('body')&&fields.has('bodyBytes')&&!hostBody)fail(n,'body 与 bodyBytes 冲突');
   let text,evaluate;
   if(!n)text='{}';
   else if(!reference&&n.type==='ObjectExpression'){
    const out=[];for(const [k,v]of fields){let val=k==='bodyBytes'?bytes(v):k==='body'?bodyValue(v):k==='status'?status(v):render(v);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=cleanHeaders(val);out.push(`${k==='bodyBytes'?'body':k}: ${val}`);}text='{'+out.join(', ')+'}';
   }else{
    // Copy only statically proven fields, preserving branches where a field is absent.
-   const input=reference??render(n),value=reference||n.type==='Identifier'?input:fresh('completionValue'),out=[];for(const [k,v]of fields){let val=k==='bodyBytes'?bytesText(value+'.bodyBytes'):`${value}.${k}`;if(k==='body'&&fields.hostResponse)val=readBody('$response','body');if(k==='bodyBytes'&&fields.hostResponse)val=readBody('$response','bodyBytes');if(k==='status')val=nativeStatus(`${value}.status`);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=`${value}.body === undefined && ${value}.bodyBytes === undefined ? ${value}.headers : ${cleanHeaders(value+'.headers')}`;out.push(`...(${value}.${k} === undefined ? {} : {${k==='bodyBytes'?'body':k}: ${val}})`);}text='{'+out.join(', ')+'}';
+   const input=reference??render(n),value=reference||n.type==='Identifier'?input:fresh('completionValue'),out=[];for(const [k,v]of fields){if(hostBody&&k==='bodyBytes')continue;let val=k==='bodyBytes'?bytesText(value+'.bodyBytes'):`${value}.${k}`;if(k==='body'&&fields.hostResponse)val=readBody('$response','body');if(k==='bodyBytes'&&fields.hostResponse)val=readBody('$response','bodyBytes');if(k==='status')val=nativeStatus(`${value}.status`);if(k==='headers'&&(fields.has('body')||fields.has('bodyBytes')))val=`${value}.body === undefined && ${value}.bodyBytes === undefined ? ${value}.headers : ${cleanHeaders(value+'.headers')}`;if(k==='body'&&hostBody){const bytes=readBody('$response','bodyBytes');out.push(`...(${value}.body === undefined && ${value}.bodyBytes === undefined ? {} : {body: ${val} === undefined ? ${bytesText(bytes)} : ${val}})`);continue;}out.push(`...(${value}.${k} === undefined ? {} : {${k==='bodyBytes'?'body':k}: ${val}})`);}text='{'+out.join(', ')+'}';
    if(!reference&&n.type!=='Identifier')evaluate={value,input};
   }
   const absent=evaluate?` || ${evaluate.value}.status === undefined`:reference||n?.type==='Identifier'?` || ${reference??render(n)}.status === undefined`:'';
@@ -2634,12 +2703,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    seen=new Set(seen);seen.add(targetBinding);
    const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===targetBinding));
    if(!fn)return stop('parameter function');
-   const read=new Set(),write=new Set();let returnsRequest=false;
+   const read=new Set(),write=new Set(),returnedFields=new Set();let returnsRequest=false,directReturn=false;
    for(const ref of targetBinding.refs){
     const p=parents.get(ref),q=parents.get(p);
-    if(p?.type==='ReturnStatement'&&p.argument===ref){returnsRequest=true;continue;}
+    if(p?.type==='ReturnStatement'&&p.argument===ref){returnsRequest=true;directReturn=true;continue;}
     if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref){
-     const statement=parents.get(p);if(statement?.type==='ReturnStatement'&&statement.argument===p){returnsRequest=true;continue;}
+     const statement=parents.get(p);if(statement?.type==='ReturnStatement'&&statement.argument===p){returnsRequest=true;directReturn=true;continue;}
+    }
+    if(p?.type==='Property'&&p.value===ref&&!p.computed&&key(p)!==undefined){
+     const record=parents.get(p),owner=returnedRecordOwner(record);
+     if(owner===fn&&returnedRecordFieldDestructured(fn,String(key(p)))){returnsRequest=true;returnedFields.add(String(key(p)));continue;}
+     return stop('parameter use:Property');
     }
     if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&p.arguments.filter(argument=>argument===ref).length===1&&!p.arguments.some(argument=>argument.type==='SpreadElement')){
      const position=p.arguments.indexOf(ref),candidates=functionCandidates(p.callee);
@@ -2667,11 +2741,45 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(q?.type==='UpdateExpression'||q?.type==='UnaryExpression'&&q.operator==='delete'||q?.type==='CallExpression'&&q.callee===p)return stop('field mutation:'+field);
     read.add(field);
    }
-   return {read,write,returnsRequest};
+   return {read,write,returnsRequest,directReturn,returnedFields};
   };
   const ignored=call=>{let node=call,parent=parents.get(node);while(parent?.type==='AwaitExpression'||parent?.type==='SequenceExpression'){node=parent;parent=parents.get(node);}return parent?.type==='ExpressionStatement';};
   const directFields=new Set(['url','method','headers','body','bodyBytes']);
   const prototypeFields=new Set(['__proto__','prototype','constructor']);
+  // 宿主请求先别名到局部变量时，只允许再次经同一请求参数、同一静态字段的
+  // 包装记录解构回写，以及完成投影或静态字段读取，避免宿主对象身份外流。
+  const aliasProof=(binding,sourceRef)=>{
+   if(!binding||!binding.refs.length)return null;
+   const writes=new Set(binding.writes);
+   for(const write of binding.writes){
+    if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='ObjectPattern')return null;
+    const fields=write.left.properties.filter(property=>property.type==='Property'&&property.value.type==='Identifier'&&bindings.get(property.value)===binding&&(!property.computed||key(property)!==undefined));
+    if(fields.length!==1)return null;
+    const field=String(key(fields[0]));
+    if(write.right.type!=='AwaitExpression'||write.right.argument.type!=='CallExpression')return null;
+    const call=write.right.argument,fn=target(call.callee),same=argument=>argument===sourceRef||sourceRef.type==='Identifier'&&argument?.type==='Identifier'&&argument.name===sourceRef.name&&free(argument,sourceRef.name),position=call.arguments.findIndex(same);
+    if(position<0||!returnsArgumentAsField(fn,position,field))return null;
+   }
+   const fields=new Set();
+   for(const ref of binding.refs){
+    const p=parents.get(ref);
+    let pattern=ref,parent=parents.get(pattern);
+    while(parent?.type==='Property'&&parent.value===pattern&&parents.get(parent)?.type==='ObjectPattern'){pattern=parent;parent=parents.get(pattern);}
+    if(pattern?.type==='Property'&&parent?.type==='ObjectPattern'){pattern=parent;parent=parents.get(pattern);}
+    if(parent?.type==='AssignmentExpression'&&writes.has(parent))continue;
+    if(p?.type==='CallExpression'&&p.arguments.filter(argument=>argument===ref).length===1&&!p.arguments.some(argument=>argument.type==='SpreadElement')&&(isDone(p)||target(p.callee)&&complete.has(target(p.callee)))){
+     for(const field of ['url','method','headers','body'])fields.add(field);
+     continue;
+    }
+    if(p?.type==='MemberExpression'&&p.object===ref&&property(p)!==undefined&&directFields.has(String(property(p)))){
+     const use=parents.get(p);
+     if(use?.type==='MemberExpression'||use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===p)return null;
+     fields.add(String(property(p)));continue;
+    }
+    return null;
+   }
+   return fields;
+  };
   const reads=new Set(),whole=[],customWrites=[];
   for(const ref of nodes.filter(n=>n.type==='Identifier'&&free(n,'$request'))){
    const p=parents.get(ref);
@@ -2683,6 +2791,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       (isDone(p)||!customWrites.length&&target(p.callee)&&complete.has(target(p.callee)))){
     for(const field of ['url','method','headers','body'])reads.add(field);
     continue;
+   }
+   if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='Identifier'){
+    const fields=aliasProof(bindings.get(p.id),ref);
+    if(!fields)return stop('request alias');
+    for(const field of fields)reads.add(field);
+    whole.push(ref);continue;
    }
    if(p?.type==='MemberExpression'&&p.object===ref){
     const field=property(p);
@@ -2702,7 +2816,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const fn=target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params[position];
     if(!functions.has(fn?.type)||!parameter)return stop('whole target:'+(fn?.type??'unknown')+'/'+(p.callee?.type??'unknown'));
     const proof=parameterProof(bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter));
-    if(!proof||proof.returnsRequest&&!ignored(p))return stop('whole proof');
+    if(!proof||proof.returnsRequest&&!ignored(p)&&(proof.directReturn||!proof.returnedFields.size))return stop('whole proof');
     for(const field of proof.read)reads.add(field);
     for(const field of proof.write)if(reads.has(field))reads.add(field);
     whole.push(ref);continue;
