@@ -998,3 +998,193 @@ export function lowerCompletionForwarders(source,ranges=null){
  return {source:output,edits,transformations:edits.map(({line})=>({kind:'completion-forwarder',line,reason:'封闭转发函数只把完成函数与载荷按原顺序转交，改写为直接完成调用'}))};
 }
 
+// 将已通过状态图证明、且只含顺序 await 恢复的 regenerator 异步机器降为普通
+// async 函数。放行条件同时要求：单 catch 边、无 finally、无 yield/try、所有
+// 挂起返回都静态指定下一个状态、等待值是本地可证明的 Promise 调用、上下文
+// 只使用 prev/next/sent/stop/abrupt/catch/t0、驱动只在该机器的封闭 IIFE 内。
+export function lowerAsyncRegenerator(source){
+ if(!source.includes('wrap')||!source.includes('$done'))return {source,transformations:[],released:[]};
+ let tree,ix,proof;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);proof=regeneratorStateMachine(ix,source);}
+ catch{return {source,transformations:[],released:[]};}
+ if(!proof.machines.some(machine=>!machine.minimal&&machine.proved))return {source,transformations:[],released:[]};
+ const {nodes,parents,bindings,owners,free}=ix;
+ const edits=[],released=[];
+ const wraps=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'&&n.arguments.length>=2&&functions.has(n.arguments[0]?.type));
+ const resolveFunction=callee=>{
+  if(callee?.type!=='Identifier')return null;
+  const binding=bindings.get(callee);
+  if(!binding||binding.writes.length)return null;
+  const value=binding.fn??binding.init;
+  return functions.has(value?.type)?value:null;
+ };
+ const promiseLike=(n,seen=new Set())=>{
+  if(!n||seen.has(n))return false;seen=new Set(seen);seen.add(n);
+  if(n.type==='NewExpression'&&free(n.callee,'Promise'))return true;
+  if(n.type==='CallExpression'){
+   if(n.callee.type==='MemberExpression'&&free(n.callee.object,'$task')&&property(n.callee)==='fetch')return true;
+   if(n.callee.type==='MemberExpression'&&free(n.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any'].includes(property(n.callee)))return true;
+   const fn=resolveFunction(n.callee);
+   if(fn?.async)return true;
+   if(fn?.body.type==='BlockStatement'&&fn.body.body.at(-1)?.type==='ReturnStatement'){
+    const returns=nodes.filter(r=>r.type==='ReturnStatement'&&owners.get(r)===fn);
+    return returns.length>0&&returns.every(r=>promiseLike(r.argument,seen));
+   }
+  }
+  return false;
+ };
+ for(let index=0;index<proof.machines.length;index++){
+  const machine=proof.machines[index],call=wraps[index];
+  if(!call||machine.minimal||!machine.proved)continue;
+  const reject=reason=>released.push({line:machine.line,released:false,reason});
+  const ret=parents.get(call);
+  if(ret?.type!=='ReturnStatement'||ret.argument!==call){reject('异步状态机必须由外层函数直接返回');continue;}
+  const block=parents.get(ret),outer=parents.get(block);
+  if(block?.type!=='BlockStatement'||block.body.at(-1)!==ret||block.body.slice(0,-1).some(statement=>statement.type!=='VariableDeclaration')||!functions.has(outer?.type)||outer.body!==block){reject('异步状态机外层函数形状未知');continue;}
+  if(outer.async||outer.generator||outer.params.length||outer.id?.type!=='Identifier'){reject('异步状态机外层函数必须是同步无参具名函数');continue;}
+  const inner=call.arguments[0];
+  if(inner.type!=='FunctionExpression'||inner.async||inner.generator||inner.id||inner.params.length!==1||inner.params[0].type!=='Identifier'||inner.body.type!=='BlockStatement'){reject('异步状态机正文形状未知');continue;}
+  const exceptions=machine.exceptions??[];
+  if(exceptions.length!==1||exceptions.some(entry=>typeof entry.tryLoc!=='number'||typeof entry.catchLoc!=='number'||entry.tryLoc>=entry.catchLoc)){reject('异步状态机要求恰好一条有序 catch 边');continue;}
+  const exception=exceptions[0];
+  const innerNodes=nodes.filter(n=>n.start>=inner.start&&n.end<=inner.end);
+  if(innerNodes.some(n=>n.type==='TryStatement'||n.type==='YieldExpression'||n.type==='AwaitExpression'||n.type==='ThisExpression'||n.type==='Super'||n.type==='MetaProperty'||n.type==='WithStatement')){reject('异步状态机正文含未支持的执行语义');continue;}
+  if(innerNodes.some(n=>n.type==='Identifier'&&n.name==='arguments'&&free(n,'arguments'))){reject('异步状态机正文读取 arguments');continue;}
+  const context=inner.params[0],contextBinding=bindings.get(context);
+  if(!contextBinding){reject('异步状态机上下文绑定未知');continue;}
+  if(contextBinding.refs.some(ref=>ref.start<inner.start||ref.end>inner.end)){reject('异步状态机上下文逃逸出正文');continue;}
+  const allowedMembers=new Set(['prev','next','sent','stop','abrupt','catch','t0']);
+  let invalid=null;
+  for(const n of innerNodes){
+   if(n.type==='MemberExpression'&&n.object.type==='Identifier'&&bindings.get(n.object)===contextBinding&&!allowedMembers.has(String(property(n)))){invalid='异步状态机上下文成员未知：'+String(property(n));break;}
+   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.callee.object.type==='Identifier'&&bindings.get(n.callee.object)===contextBinding){
+    const name=property(n.callee);
+    if(!['stop','abrupt','catch'].includes(name)){invalid='异步状态机上下文调用未知：'+String(name);break;}
+    if(name==='abrupt'&&n.arguments[0]?.type==='Literal'&&n.arguments[0].value!=='return'){invalid='异步状态机仅支持 abrupt return';break;}
+    if(name==='catch'){
+     const value=n.arguments[0];
+     if(value?.type!=='Literal'||typeof value.value!=='number'||value.value!==exception.tryLoc){invalid='异步状态机 catch 保存点不可证明';break;}
+    }
+   }
+  }
+  if(invalid){reject(invalid);continue;}
+  const dispatch=nodes.find(n=>owners.get(n)===inner&&n.type==='SwitchStatement'&&n.discriminant.type==='AssignmentExpression'&&n.discriminant.left.type==='MemberExpression'&&property(n.discriminant.left)==='prev'&&bindings.get(n.discriminant.left.object)===contextBinding&&n.discriminant.right.type==='MemberExpression'&&property(n.discriminant.right)==='next'&&bindings.get(n.discriminant.right.object)===contextBinding);
+  if(!dispatch){reject('异步状态机缺少单一分派入口');continue;}
+  let loop=dispatch;
+  while(loop&&parents.get(loop)!==inner&&!(loop.type==='ForStatement'&&owners.get(loop)===inner))loop=parents.get(loop);
+  if(loop?.type!=='ForStatement'||loop.body!==dispatch||owners.get(loop)!==inner){reject('异步状态机分派循环形状未知');continue;}
+  const returnEdits=[];
+  let returnError=null;
+  for(const n of innerNodes){
+   if(n.type!=='ReturnStatement'||owners.get(n)!==inner||!n.argument)continue;
+   const argument=n.argument;
+   if(argument.type==='CallExpression'&&argument.callee.type==='MemberExpression'&&bindings.get(argument.callee.object)===contextBinding&&['stop','abrupt','catch'].includes(property(argument.callee)))continue;
+   const parts=argument.type==='SequenceExpression'?argument.expressions:[argument];
+   const awaited=parts.at(-1);
+   let target=null;
+   const prefix=[];
+   for(const part of parts.slice(0,-1)){
+    if(part.type==='AssignmentExpression'&&part.operator==='='&&part.left.type==='MemberExpression'&&bindings.get(part.left.object)===contextBinding&&property(part.left)==='next'&&part.right.type==='Literal'&&typeof part.right.value==='number'){
+     target=part.right.value;continue;
+    }
+    if(part.type==='AssignmentExpression'&&part.operator==='='&&part.left.type==='MemberExpression'&&bindings.get(part.left.object)===contextBinding&&property(part.left)==='prev'&&part.right.type==='Literal'&&typeof part.right.value==='number'){
+     prefix.push(source.slice(part.start,part.end)+';');continue;
+    }
+    returnError='异步挂起返回含未知前置表达式：第 '+(source.slice(0,part.start).split('\n').length)+' 行';break;
+   }
+   if(returnError)break;
+   if(target===null||!machine.nodes.some(node=>node.id==='state:'+target)){returnError='异步挂起返回没有可证明的下一个状态';break;}
+   if(!promiseLike(awaited)){returnError='异步挂起返回不是本地可证明的 Promise 调用';break;}
+   returnEdits.push({start:n.start,end:n.end,replacement:[...prefix,context.name+'.next = '+target+';',context.name+'.sent = await ('+source.slice(awaited.start,awaited.end)+');','continue;'].join('\n')});
+  }
+  if(returnError){reject(returnError);continue;}
+  const mark=parents.get(outer);
+  const assigned=mark?.type==='CallExpression'&&mark.callee.type==='MemberExpression'&&property(mark.callee)==='mark'?parents.get(mark):null;
+  if(assigned?.type!=='AssignmentExpression'||assigned.operator!=='='||assigned.right!==mark||assigned.left.type!=='Identifier'){reject('异步状态机 mark 赋值形状未知');continue;}
+  const sequence=parents.get(assigned),driverCall=parents.get(sequence),driver=sequence?.type==='SequenceExpression'&&sequence.expressions.length===2&&sequence.expressions[0]===assigned?sequence.expressions[1]:null;
+  if(driverCall?.type!=='CallExpression'||driverCall.callee!==sequence||driverCall.arguments.length||!functions.has(driver?.type)||driver.params.length){reject('异步状态机驱动 IIFE 形状未知');continue;}
+  const generatorRefs=ix.nodes.filter(n=>n.type==='Identifier'&&bindings.get(n)===bindings.get(assigned.left)&&n.start>=driver.start&&n.end<=driver.end);
+  if(!generatorRefs.some(ref=>parents.get(ref)?.type==='MemberExpression'&&property(parents.get(ref))==='apply')){reject('异步状态机驱动没有消费生成器对象');continue;}
+  // 生成器绑定只允许在驱动内被消费；机器外的旧重置必须是空值字面量且在
+  // 本次赋值之前，其它读取或写入都视为逃逸。
+  const generatorBinding=bindings.get(assigned.left);
+  const inertReset=node=>node?.type==='Literal'&&node.value===null||free(node,'undefined')||node?.type==='UnaryExpression'&&node.operator==='void'&&node.argument.type==='Literal';
+  let generatorEscape=null;
+  for(const ref of generatorBinding?.refs??[]){
+   if(ref===assigned.left||ref.start>=driver.start&&ref.end<=driver.end)continue;
+   // 赋值之前的读取只能看到旧值，赋值之后的驱动外读取才可能观察降低后的生成器。
+   if(ref.start<assigned.start)continue;
+   generatorEscape='异步状态机生成器对象在驱动外逃逸';break;
+  }
+  for(const write of generatorBinding?.writes??[]){
+   if(write===assigned||write.start<assigned.start)continue;
+   generatorEscape='异步状态机生成器对象在驱动外被重新赋值';break;
+  }
+  if(generatorEscape){reject(generatorEscape);continue;}
+  // t0 是 catch 保存点的专用槽：只允许由匹配 tryLoc 的 ctx.catch 调用赋值，
+  // 不允许读出、动态访问或其它来源写入。
+  let t0Assignments=0,t0Error=null;
+  const catchCall=node=>node?.type==='CallExpression'&&node.callee.type==='MemberExpression'&&bindings.get(node.callee.object)===contextBinding&&property(node.callee)==='catch'&&node.arguments.length===1&&node.arguments[0].type==='Literal'&&node.arguments[0].value===exception.tryLoc;
+  for(const n of innerNodes){
+   if(n.type!=='MemberExpression'||bindings.get(n.object)!==contextBinding||property(n)!=='t0')continue;
+   const parent=parents.get(n);
+   if(parent?.type==='AssignmentExpression'&&parent.left===n&&parent.operator==='='&&catchCall(parent.right)){t0Assignments++;if(t0Assignments>1){t0Error='异步状态机 t0 有多个保存点写入';break;}continue;}
+   t0Error='异步状态机 t0 只允许由 catch 保存点赋值';break;
+  }
+  if(t0Error){reject(t0Error);continue;}
+  // catch 区域只允许状态控制与完成；业务调用、对象写入、抛出和挂起都拒绝。
+  // handler 区域最多完成一次，避免异常路径产生多个脚本结果。
+  const handlerClauses=[];
+  for(const state of machine.handlerStates??[]){
+   const clause=innerNodes.find(n=>n.type==='SwitchCase'&&n.test?.type==='Literal'&&n.test.value===state);
+   // "end" 是 regenerator 约定的终止状态，不一定有独立 case；终止分支本身
+   // 只返回 stop，交给正常控制流检查。
+   if(!clause){if(state==='end')continue;t0Error='异步状态机异常处理状态缺少可证明的 case';break;}
+   handlerClauses.push(clause);
+  }
+  if(t0Error){reject(t0Error);continue;}
+  let handlerCompletions=0,handlerError=null;
+  for(const clause of handlerClauses){
+   for(const n of innerNodes){
+    if(n.start<clause.start||n.end>clause.end)continue;
+    if(n.type==='CallExpression'){
+     if(free(n.callee,'$done')||closedCompletionForwarderCall(ix,n)){handlerCompletions++;continue;}
+     if(n.callee.type==='MemberExpression'&&bindings.get(n.callee.object)===contextBinding&&['abrupt','stop'].includes(property(n.callee)))continue;
+     if(catchCall(n))continue;
+     handlerError='异步状态机异常处理区域含业务调用：第 '+source.slice(0,n.start).split('\n').length+' 行';break;
+    }
+    if(n.type==='AssignmentExpression'){
+     if(n.left.type==='MemberExpression'&&bindings.get(n.left.object)===contextBinding&&(['prev','next','sent'].includes(property(n.left))||property(n.left)==='t0'&&catchCall(n.right)))continue;
+     handlerError='异步状态机异常处理区域含对象写入：第 '+source.slice(0,n.start).split('\n').length+' 行';break;
+    }
+    if(n.type==='UpdateExpression'||n.type==='AwaitExpression'||n.type==='YieldExpression'||n.type==='NewExpression'||n.type==='TaggedTemplateExpression'||n.type==='ThrowStatement'||n.type==='UnaryExpression'&&n.operator==='delete'){
+     handlerError='异步状态机异常处理区域含未支持副作用：第 '+source.slice(0,n.start).split('\n').length+' 行';break;
+    }
+   }
+   if(handlerError)break;
+  }
+  if(handlerError){reject(handlerError);continue;}
+  if(handlerCompletions>1){reject('异步状态机异常处理区域包含多个完成调用');continue;}
+  const contextName=inner.params[0].name;
+  const errorName=freshErrorName(ix);
+  const switchText=applyLocalEdits(source.slice(dispatch.start,dispatch.end),returnEdits.map(edit=>({...edit,start:edit.start-dispatch.start,end:edit.end-dispatch.start})));
+  const loopText='for(;;){try{'+switchText+'}catch('+errorName+'){if('+contextName+'.prev >= '+exception.tryLoc+' && '+contextName+'.prev < '+exception.catchLoc+'){'+contextName+'.t0 = '+errorName+';'+contextName+'.next = '+exception.catchLoc+';continue;}throw '+errorName+';}}';
+  const contextText='var '+contextName+' = {prev: 0, next: 0, sent: void 0, t0: void 0, stop() { return {done: true}; }, abrupt(type, arg) { return {done: true, type: type, arg: arg}; }, catch() { return this.t0; }};';
+  const innerStart=inner.body.start+1,innerEnd=inner.body.end-1;
+  const bodyEdits=[{start:loop.start-innerStart,end:loop.end-innerStart,replacement:loopText}];
+  const bodyText=applyLocalEdits(source.slice(innerStart,innerEnd),bodyEdits);
+  edits.push({start:ret.start,end:ret.end,replacement:contextText+'\n'+bodyText});
+  edits.push({start:driver.start,end:driver.end,replacement:'async function(){await '+assigned.left.name+'();}'});
+  edits.push({start:outer.start,end:outer.start,replacement:'async '});
+  released.push({line:machine.line,released:true,start:outer.start,end:outer.end});
+ }
+ if(!edits.length)return {source,transformations:[],released};
+ const unique=[];
+ for(const edit of edits.sort((a,b)=>a.start-b.start)){
+  if(unique.length&&edit.start<unique.at(-1).end)return {source,transformations:[],released:[...released,{released:false,reason:'异步状态机改写区间重叠'}]};
+  unique.push(edit);
+ }
+ let output=source;
+ for(const edit of unique.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return {source:output,transformations:released.filter(item=>item.released).map(item=>({kind:'async-regenerator',line:item.line})),released};
+}

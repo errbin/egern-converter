@@ -6,7 +6,7 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
@@ -36,13 +36,23 @@ function compileNative(source,format,options){
     stateMachineProof={detected:proof.detected,proved:proof.proved,release:proof.release,gaps:proof.gaps,summary:proof.summary};
    }catch(error){stateMachineProof={detected:0,proved:false,release:false,gaps:['状态机证明失败：'+error.message],summary:{machines:0,proved:0,states:0,edges:0,saveSlots:0,driveCount:0,externalDrives:0}};}
   }
-  const forwarders=lowerCompletionForwarders(dispatch.source,[]);
+  // 先探测哪些异步状态机会真正降级；完成转发器只在那些机器范围内展开，
+  // 避免把其它脚本里原本不可证的嵌入式完成路径带入原生终止分析。
+  const asyncProbe=lowerAsyncRegenerator(dispatch.source);
+  const asyncRanges=asyncProbe.released.filter(item=>item.released&&Number.isInteger(item.start)).map(item=>[item.start,item.end]);
+  const forwarders=lowerCompletionForwarders(dispatch.source,asyncRanges);
   dispatch.source=forwarders.source;
   dispatch.transformations.push(...forwarders.transformations);
   const minimalStateMachines=lowerMinimalRegenerator(dispatch.source);
   dispatch.source=minimalStateMachines.source;
   dispatch.transformations.push(...minimalStateMachines.transformations);
-  if(stateMachineProof&&minimalStateMachines.released.length)stateMachineProof.released=minimalStateMachines.released;
+  const asyncStateMachines=lowerAsyncRegenerator(dispatch.source);
+  dispatch.source=asyncStateMachines.source;
+  dispatch.transformations.push(...asyncStateMachines.transformations);
+  if(stateMachineProof&&(minimalStateMachines.released.length||asyncStateMachines.released.length)){
+   stateMachineProof.released=[...minimalStateMachines.released,...asyncStateMachines.released];
+   stateMachineProof.release=stateMachineProof.released.some(item=>item.released);
+  }
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
   return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
