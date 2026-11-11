@@ -324,6 +324,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
  const shapeHostValues=new WeakSet();
+ const hostResponseBindings=new WeakSet();
  let hostRequestSnapshot=null,hostRequestInitializers=[];
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
@@ -676,6 +677,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  // 预处理失败时保持原行为，避免把调度/字符串完成等合法路径一并拒绝。
  for(const n of nodes)if(n.type==='CallExpression'&&n.arguments.length===1&&n.arguments[0].type!=='SpreadElement'&&
   isDone(n)&&['Identifier','CallExpression','AwaitExpression','SequenceExpression','ConditionalExpression','LogicalExpression'].includes(n.arguments[0].type)){try{shape(n.arguments[0]);}catch{}}
+  // 完成包装函数可能先接收宿主响应别名；提前求解形，登记可安全投影正文写入的
+  // 参数绑定，避免 helper 正文先于完成投影渲染时漏掉本地正文变量。
+  for(const n of nodes)if(n.type==='CallExpression'&&n.arguments.length===1&&n.arguments[0].type!=='SpreadElement'&&target(n.callee)&&complete.has(target(n.callee))){try{shape(n.arguments[0]);}catch{}}
  function closedCompletionCallback(call,arg){
   const fn=target(call?.callee),position=call?.arguments.indexOf(arg),p=fn?.params[position],id=p?.type==='AssignmentPattern'?p.left:p,b=id?.type==='Identifier'?bindings.get(id):null;
   return !!b&&!b.writes.length&&b.refs.length>0&&b.refs.every(r=>{const c=parents.get(r);return c?.type==='CallExpression'&&c.callee===r&&target(r)===target(arg);});
@@ -1110,6 +1114,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const calls=nodes.filter(c=>c.type==='CallExpression'&&target(c.callee)===fn);if(calls.length){
     const values=[];
     for(const c of calls){const argument=c.arguments[param],parameter=fn.params[param],fallback=parameter.type==='AssignmentPattern'?parameter.right:undefined;const value=shape(!argument||free(argument,'undefined')?fallback:argument,new Set(seen));if(value.nullable&&argument&&truthyGuarded(argument))value.nullable=false;values.push(value);}
+    if(values.length&&values.every(value=>value.hostResponse))hostResponseBindings.add(b);
     const all=new Map();for(const value of values)mergeShape(all,value,seen);
     // 完成包装函数的各直接调用点可能位于互斥分支。保留每个调用点的闭合
     // 形状，供完成值在运行时按判别键分派；不把互斥字段合成为一个不存在的对象。
@@ -2344,6 +2349,15 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n.type==='AssignmentExpression'&&n.operator==='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+n.left.name+' = ('+render(n.right)+'), '+guardedImplicit.get(n.left.name)+' = true, '+n.left.name+')';
   if(n.type==='AssignmentExpression'&&n.operator!=='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+guardedImplicit.get(n.left.name)+' ? ('+n.left.name+' '+n.operator+' ('+render(n.right)+')) : (() => {throw new '+(referenceError??'ReferenceError')+'('+JSON.stringify(n.left.name+' is not defined')+');})())';
   if(n.type==='Property'&&n.shorthand&&free(n.value)&&guardedImplicit.has(n.value.name))return n.value.name+': '+render(n.value);
+  // 已证明为宿主响应别名的参数，其 body 读写统一落到本地正文变量；这样
+  // 闭合 helper 的正文修改能进入完成投影，同时不直接改写宿主响应对象。
+  if(n.type==='MemberExpression'&&property(n)==='body'&&n.object.type==='Identifier'&&hostResponseBindings.has(bindings.get(n.object))){
+   const parent=parents.get(n);
+   if(parent?.type==='AssignmentExpression'&&parent.left===n&&parent.operator!=='=')fail(n,'宿主响应正文只支持简单赋值');
+   if(parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')fail(n,'宿主响应正文字段被直接修改');
+   if(parent?.type==='AssignmentExpression'&&parent.left===n)bodyWrites.add('response:body');
+   return readBody('$response','body');
+  }
 
   if(n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.init?.type==='Identifier'){
    const info=httpReplies.get(bindings.get(n.init));if(info&&!info.snapshot){
@@ -2563,8 +2577,61 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  // 该对象，返回值被忽略方可接受，字段写入只允许静态普通赋值。
  const proveHostRequestSnapshot=()=>{
   const stop=()=>null;
-  const parameterProof=targetBinding=>{
-   if(!targetBinding||targetBinding.writes.length)return stop('parameter binding');
+  const astChildren=value=>Array.isArray(value)?value.filter(item=>item&&typeof item==='object'&&typeof item.type==='string'):value&&typeof value==='object'&&typeof value.type==='string'?[value]:[];
+  const callSites=fn=>{
+   const parent=parents.get(fn);
+   if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&!parent.arguments.some(a=>a.type==='SpreadElement'))return [parent];
+   return nodes.filter(n=>n.type==='CallExpression'&&!n.optional&&!n.arguments.some(a=>a.type==='SpreadElement')&&target(n.callee)===fn);
+  };
+  // 解析一个表达式可能求值到的本地闭合函数集合。只在每个分支都落到已知
+  // 函数或确定不可调用的空值时成功；未知调用、动态值或逃逸一律拒绝。
+  const functionCandidates=expression=>{
+   const resolved=new Set(),seen=new Set();let nonFunction=false;
+   const visitReturns=fn=>{
+    if(!functions.has(fn?.type))return false;
+    let found=false,ok=true;
+    const walk=node=>{
+     if(!node||!ok)return;
+     if(functions.has(node.type)&&node!==fn)return;
+     if(node.type==='ReturnStatement'){found=true;if(node.argument){if(!visit(node.argument))ok=false;}else nonFunction=true;return;}
+     for(const value of Object.values(node))for(const child of astChildren(value))walk(child);
+    };
+    walk(fn.body);return ok&&found||ok&&!found;
+   };
+   const visit=node=>{
+    if(!node)return false;
+    if(functions.has(node.type)){resolved.add(node);return true;}
+    if(node.type==='Identifier'&&node.name==='undefined'&&free(node,'undefined')){nonFunction=true;return true;}
+    if(node.type==='Identifier'){
+     const binding=bindings.get(node);if(!binding||binding.writes.length||seen.has(binding))return false;
+     seen.add(binding);
+     const result=(()=>{
+      const init=binding.fn??binding.init;if(init)return visit(init);
+      const owner=nodes.find(candidate=>functions.has(candidate.type)&&candidate.params.some(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding));
+      if(!owner)return false;
+      const position=owner.params.findIndex(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding);
+      const calls=callSites(owner);if(!calls.length)return false;
+      return calls.every(call=>{const argument=call.arguments[position];if(!argument){nonFunction=true;return true;}return visit(argument);});
+     })();
+     seen.delete(binding);return result;
+    }
+    if(node.type==='ConditionalExpression')return visit(node.consequent)&&visit(node.alternate);
+    if(node.type==='LogicalExpression')return visit(node.left)&&visit(node.right);
+    if(node.type==='SequenceExpression')return visit(node.expressions.at(-1));
+    if(node.type==='AssignmentExpression')return visit(node.right);
+    if(node.type==='Literal'&&(node.value===null||node.value===undefined)){nonFunction=true;return true;}
+    if(node.type==='UnaryExpression'&&node.operator==='void'){nonFunction=true;return true;}
+    if(node.type==='CallExpression'){
+     if(functions.has(node.callee.type))return visitReturns(node.callee);
+     const fn=target(node.callee);return !!fn&&visitReturns(fn);
+    }
+    return false;
+   };
+   return visit(expression)?{ok:true,functions:[...resolved],nonFunction}:{ok:false,functions:[],nonFunction:false};
+  };
+  const parameterProof=(targetBinding,seen=new Set())=>{
+   if(!targetBinding||targetBinding.writes.length||seen.has(targetBinding))return stop('parameter binding');
+   seen=new Set(seen);seen.add(targetBinding);
    const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===targetBinding));
    if(!fn)return stop('parameter function');
    const read=new Set(),write=new Set();let returnsRequest=false;
@@ -2573,6 +2640,19 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(p?.type==='ReturnStatement'&&p.argument===ref){returnsRequest=true;continue;}
     if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref){
      const statement=parents.get(p);if(statement?.type==='ReturnStatement'&&statement.argument===p){returnsRequest=true;continue;}
+    }
+    if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&p.arguments.filter(argument=>argument===ref).length===1&&!p.arguments.some(argument=>argument.type==='SpreadElement')){
+     const position=p.arguments.indexOf(ref),candidates=functionCandidates(p.callee);
+     if(!candidates.ok)return stop('forward target');
+     for(const candidate of candidates.functions){
+      const parameter=candidate.params[position];if(!parameter)continue;
+      const nested=parameterProof(bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter),seen);
+      if(!nested)return stop('forward proof');
+      if(nested.returnsRequest&&!ignored(p))return stop('forward return');
+      for(const field of nested.read)read.add(field);
+      for(const field of nested.write)if(read.has(field))read.add(field);
+     }
+     continue;
     }
     if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return stop('parameter use:'+(p?.type??'none'));
     const field=String(property(p));
@@ -2591,21 +2671,31 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   };
   const ignored=call=>{let node=call,parent=parents.get(node);while(parent?.type==='AwaitExpression'||parent?.type==='SequenceExpression'){node=parent;parent=parents.get(node);}return parent?.type==='ExpressionStatement';};
   const directFields=new Set(['url','method','headers','body','bodyBytes']);
-  const reads=new Set(),whole=[];
+  const prototypeFields=new Set(['__proto__','prototype','constructor']);
+  const reads=new Set(),whole=[],customWrites=[];
   for(const ref of nodes.filter(n=>n.type==='Identifier'&&free(n,'$request'))){
    const p=parents.get(ref);
+   // 裸引用只用于保留原有求值/报错时机，不读取也不转交宿主对象。
+   if(p?.type==='ExpressionStatement'&&p.expression===ref)continue;
    // 整体请求直接交给已证明的完成包装函数时，完成值本身仍走 shape/payload
    // 的字段投影；这里只把投影需要的只读字段加入快照，不把宿主对象本身放行。
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&!p.arguments.some(a=>a.type==='SpreadElement')&&
-      (isDone(p)||target(p.callee)&&complete.has(target(p.callee)))){
+      (isDone(p)||!customWrites.length&&target(p.callee)&&complete.has(target(p.callee)))){
     for(const field of ['url','method','headers','body'])reads.add(field);
     continue;
    }
    if(p?.type==='MemberExpression'&&p.object===ref){
     const field=property(p);
-    if(field===undefined||!directFields.has(field)||parents.get(p)?.type==='MemberExpression')return stop('direct field:'+(field??'dynamic'));
+    if(field===undefined||parents.get(p)?.type==='MemberExpression')return stop('direct field:'+(field??'dynamic'));
     const use=parents.get(p);
-    if(use?.type==='AssignmentExpression'&&use.left===p||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===p)return stop('direct mutation:'+field);
+    if(use?.type==='AssignmentExpression'&&use.left===p){
+     // 宿主对象上的自定义字段只在静态键、简单赋值且值不是宿主对象本身时
+     // 允许降为本地快照写入；文档字段的写入仍需要单独的数据流证明。
+     if(use.operator!=='='||directFields.has(field)||prototypeFields.has(field)||use.right===ref)return stop('direct mutation:'+field);
+     customWrites.push(use);reads.add(field);continue;
+    }
+    if(use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===p)return stop('direct mutation:'+field);
+    if(!directFields.has(field)&&!reads.has(field))return stop('direct field:'+field);
     reads.add(field);continue;
    }
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&!p.arguments.some(a=>a.type==='SpreadElement')){
@@ -2619,7 +2709,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    return stop('whole use:'+(p?.type??'none'));
   }
-  if(!whole.length)return null;
+  if(!whole.length||customWrites.some(write=>whole.some(ref=>write.start>parents.get(ref).start)))return null;
   return reads;
  };
  const hostRequestReads=proveHostRequestSnapshot();

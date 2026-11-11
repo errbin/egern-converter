@@ -88,6 +88,32 @@ const result=await finish($request,response);$done({body:result.body})})();'''
             with self.subTest(source=source),self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'',source_format='loon')
 
+    def test_host_request_custom_fields_stay_in_the_closed_snapshot(self):
+        # 宿主请求上的自定义元数据只写入本地快照，并在闭合 helper 内读取；
+        # 写入必须早于整对象转交，字段键静态可枚举，值不能回指宿主对象。
+        source='''function prepare(request){return request.__cachedBody}
+(async()=>{$request.__cachedBody='meta';$done({body:await prepare($request)})})();'''
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        self.assertIn('hostRequest',output)
+        self.assertIn('"__cachedBody"',output)
+        case={'name':'host request custom field','request':{'url':URL},
+              'expected':{'result':{'body':'meta'}}}
+        result=compare(source,output,'loon',URL,case)
+        self.assertEqual(result['status'],'passed',result)
+
+        for rejected in [
+            '''function prepare(request){return request.url}
+(async()=>{const value=prepare($request);$request.__cachedBody='late';$done({body:value})})();''',
+            '''function prepare(request){return request.url}
+(async()=>{$request.__cachedBody=$request;$done({body:await prepare($request)})})();''',
+            '''function prepare(request){return 'x'}
+(async()=>{$request[$argument]='x';$done({body:await prepare($request)})})();''',
+            '''function prepare(request){return 'x'}
+(async()=>{$request.constructor='x';$done({body:await prepare($request)})})();''',
+        ]:
+            with self.subTest(source=rejected),self.assertRaises(ConversionError):
+                convert_script(rejected,'Fixture',URL,'',source_format='loon')
+
     def test_live_projection_preserves_request_headers(self):
         # 优先级必须保证 headers 的 ?? 先求值，否则请求会被错误地投影为空头。
         source='''const options={url:'https://example.test/path',headers:{Y:'base'}};

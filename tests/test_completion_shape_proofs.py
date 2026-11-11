@@ -167,6 +167,30 @@ $done(finish($response));''',
             with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '完成结果|支持|response'):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_closed_host_response_helper_projects_body_writes(self):
+        # helper 参数在所有调用点都来自宿主响应时，正文写入落到本地正文变量，
+        # 完成投影读取同一值；宿主对象本身不复制、不转交、不写回。
+        source = '''function decorate(request,response){request.__cachedBody='meta';
+response.body=response.body+':'+request.__cachedBody;return response}
+(async()=>{$done(await decorate($request,$response))})();'''
+        self.check(source, [{'name':'host response helper body write',
+            'request':{'url':URL},
+            'response':{'status':200,'body':'base'},
+            'expected':{'result':{'body':'base:meta'}}}])
+
+        for rejected in [
+            '''function decorate(response){response.body+='x';return response}
+(async()=>{$done(await decorate($response))})();''',
+            '''function decorate(response){delete response.body;return response}
+(async()=>{$done(await decorate($response))})();''',
+            '''function decorate(response){response.body++;return response}
+(async()=>{$done(await decorate($response))})();''',
+            '''function decorate(response){response.body='x';unknown(response);return response}
+(async()=>{$done(await decorate($response))})();''',
+        ]:
+            with self.subTest(source=rejected), self.assertRaises(ConversionError):
+                convert_script(rejected, 'Fixture', URL, '', source_format='loon')
+
 
 if __name__ == '__main__':
     unittest.main()
