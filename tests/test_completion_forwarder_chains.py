@@ -108,6 +108,24 @@ class CompletionForwarderChainTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(lower(source)['transformations'], [])
 
+    def test_forwarder_table_escape_in_a_closed_dead_branch_is_ignored(self):
+        source = ("const flags={mode:'live'},table={forward:function(f,v){return f(v)}};"
+                  "function dispatch(f,v){return table.forward(f,v)}"
+                  "if(flags.mode==='dead')unknown(table);dispatch($done,{body:'ok'});")
+        lowered = lower(source)
+        self.assertEqual(len(lowered['transformations']), 1, lowered)
+        self.check(source)
+
+    def test_live_unknown_and_written_forwarder_table_escapes_remain_rejected(self):
+        prefix = "const table={forward:function(f,v){return f(v)}};function dispatch(f,v){return table.forward(f,v)}"
+        for source in [
+            "const flags={mode:'live'};" + prefix + "if(flags.mode==='live')unknown(table);dispatch($done,{body:'ok'});",
+            "const flags={mode:'live'};" + prefix + "if($argument==='dead')unknown(table);dispatch($done,{body:'ok'});",
+            "const flags={mode:'live'};" + prefix + "flags.mode='dead';if(flags.mode==='dead')unknown(table);dispatch($done,{body:'ok'});",
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(lower(source)['transformations'], [])
+
     def test_identity_wrapper_requires_unique_definition_and_original_return(self):
         for source in [
             "const A={};A.mark=function(fn){return function(){}};"

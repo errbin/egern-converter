@@ -914,6 +914,57 @@ function applyLocalEdits(source,edits){
 // 表逐层转发到同样的纯函数。参数不得重写、函数体不得有其它语句。
 function completionForwarderContext(ix){
  const {nodes,parents,bindings,free}=ix;
+ // 闭合字面量表只能通过静态成员读取；条件求值期间遇到自身引用时跳过重复
+ // 校验，由外层完整遍历所有引用，避免死分支判断递归回环。
+ const checkingTables=new Set();
+ const closedValue=node=>{
+  if(node?.type==='Literal')return {value:node.value};
+  if(node?.type!=='MemberExpression'||node.object.type!=='Identifier'||property(node)===undefined)return null;
+  const binding=bindings.get(node.object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  if(!checkingTables.has(binding)){
+   checkingTables.add(binding);
+   for(const ref of binding.refs){
+    const use=parents.get(ref);
+    if(use?.type==='MemberExpression'&&use.object===ref){
+     const parent=parents.get(use);
+     if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete'){checkingTables.delete(binding);return null;}
+     continue;
+    }
+    if(deadReference(ref))continue;
+    checkingTables.delete(binding);return null;
+   }
+   checkingTables.delete(binding);
+  }
+  const name=property(node),entries=binding.init.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+  if(entries.length!==1||entries[0].value.type!=='Literal')return null;
+  return {value:entries[0].value.value};
+ };
+ const testValue=node=>{
+  if(!node)return null;
+  if(node.type==='Literal')return typeof node.value==='boolean'?node.value:null;
+  if(node.type==='UnaryExpression'&&node.operator==='!'){const value=testValue(node.argument);return value===null?null:!value;}
+  if(node.type==='BinaryExpression'&&['===','==','!==','!='].includes(node.operator)){
+   const left=closedValue(node.left),right=closedValue(node.right);
+   if(!left||!right)return null;
+   const equal=left.value===right.value;
+   return ['===','=='].includes(node.operator)?equal:!equal;
+  }
+  return null;
+ };
+ const deadReference=ref=>{
+  for(let child=ref,parent=parents.get(child);parent;child=parent,parent=parents.get(parent)){
+   if(parent.type==='IfStatement'){
+    if(child===parent.consequent&&testValue(parent.test)===false)return true;
+    if(child===parent.alternate&&testValue(parent.test)===true)return true;
+   }
+   if(parent.type==='ConditionalExpression'){
+    if(child===parent.consequent&&testValue(parent.test)===false)return true;
+    if(child===parent.alternate&&testValue(parent.test)===true)return true;
+   }
+  }
+  return false;
+ };
  const functionAt=(callee,seen=new Set())=>{
   if(callee?.type==='Identifier'){
    const binding=bindings.get(callee);
@@ -931,6 +982,7 @@ function completionForwarderContext(ix){
     // 查表对象必须是完全闭合的字面量：只允许通过静态属性读取，不能再写入
     // 任何成员，也不能作为整体传给其它代码。
     for(const ref of binding.refs){
+     if(deadReference(ref))continue;
      const use=parents.get(ref);
      if(use?.type!=='MemberExpression'||use.object!==ref||property(use)===undefined||use.computed&&use.property.type!=='Literal')return null;
      const parent=parents.get(use);
