@@ -535,7 +535,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const fresh=base=>{let n=base,i=2;while(names.has(n))n=base+i++;names.add(n);return n;};
  const context=fresh('ctx');
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
- const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap();
+ const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap(),httpMethodSelections=new WeakSet();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
  const shapeHostValues=new WeakSet();
  const hostResponseBindings=new WeakSet();
@@ -797,6 +797,151 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b?.init&&!b.writes.length&&!seen.has(b)){seen.add(b);return compressionMethod(b.init,seen);}}
   return null;
  }
+ // 闭合字面量表的整体引用只有在可证死分支里才可忽略；条件表必须只通过
+ // 静态成员读取，否则表中的值可能在求值前已被改写。
+ const checkingConstants=new Set();
+ function closedConstant(node){
+  if(node?.type==='Literal')return {value:node.value};
+  if(node?.type!=='MemberExpression'||node.object.type!=='Identifier'||property(node)===undefined)return null;
+  const binding=bindings.get(node.object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  if(!checkingConstants.has(binding)){
+   checkingConstants.add(binding);
+   for(const ref of binding.refs){
+    const use=parents.get(ref);
+    if(use?.type==='MemberExpression'&&use.object===ref){
+     const parent=parents.get(use);
+     if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete'){checkingConstants.delete(binding);return null;}
+     continue;
+    }
+    if(deadReference(ref))continue;
+    checkingConstants.delete(binding);return null;
+   }
+   checkingConstants.delete(binding);
+  }
+  const name=property(node),entries=binding.init.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name);
+  if(entries.length!==1||entries[0].value.type!=='Literal')return null;
+  return {value:entries[0].value.value};
+ }
+ function constantBoolean(node){
+  if(!node)return null;
+  if(node.type==='Literal')return typeof node.value==='boolean'?node.value:null;
+  if(node.type==='UnaryExpression'&&node.operator==='!'){const value=constantBoolean(node.argument);return value===null?null:!value;}
+  if(node.type==='BinaryExpression'&&['===','==','!==','!='].includes(node.operator)){
+   const left=closedConstant(node.left),right=closedConstant(node.right);
+   if(!left||!right)return null;
+   const equal=left.value===right.value;
+   return ['===','=='].includes(node.operator)?equal:!equal;
+  }
+  return null;
+ }
+ function deadReference(ref){
+  for(let child=ref,parent=parents.get(child);parent;child=parent,parent=parents.get(parent)){
+   if(parent.type==='IfStatement'){
+    if(child===parent.consequent&&constantBoolean(parent.test)===false)return true;
+    if(child===parent.alternate&&constantBoolean(parent.test)===true)return true;
+   }
+   if(parent.type==='ConditionalExpression'){
+    if(child===parent.consequent&&constantBoolean(parent.test)===false)return true;
+    if(child===parent.alternate&&constantBoolean(parent.test)===true)return true;
+   }
+  }
+  return false;
+ }
+ // 方法选择只接受 $httpClient 的静态方法引用，或由它们组成的条件/短路选择。
+ // 任一分支不是静态方法就返回 null，调用方继续按未知值拒绝。
+ function methodSelection(node){
+  if(node?.type==='MemberExpression'&&free(node.object,'$httpClient')){
+   const method=clientMethod(node);return typeof method==='string'?method:null;
+  }
+  if(node?.type==='LogicalExpression'&&node.operator==='||')return methodSelection(node.left);
+  if(node?.type==='ConditionalExpression'){
+   const left=methodSelection(node.consequent),right=methodSelection(node.alternate);
+   return left&&right?[left,right]:null;
+  }
+  return null;
+ }
+ function markMethodSelections(node){
+  if(node?.type==='ConditionalExpression'){
+   httpMethodSelections.add(node);markMethodSelections(node.consequent);markMethodSelections(node.alternate);
+  }
+ }
+ // 闭合三参转发器：函数体只做 `return 方法(请求, 回调)`。表属性必须唯一、
+ // 不可写且不能通过动态键访问，表对象的整体引用也只能出现在可证死分支中。
+ function forwarderFunction(callee){
+  if(functions.has(callee?.type))return callee;
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(binding&&!binding.writes.length){const value=resolve(binding.fn??binding.init);if(functions.has(value?.type))return value;}
+   return null;
+  }
+  if(callee?.type==='MemberExpression'){
+   const name=property(callee);if(name===undefined)return null;
+   const object=resolve(callee.object);if(object?.type!=='ObjectExpression')return null;
+   if(callee.object.type==='Identifier'){
+    const binding=bindings.get(callee.object);if(!binding||binding.writes.length)return null;
+    for(const ref of binding.refs){
+     const member=parents.get(ref);
+     if(member?.type==='MemberExpression'&&member.object===ref){
+      const memberName=property(member);
+      if(memberName===undefined)return null;
+      if(memberName===name){
+       const use=parents.get(member);
+       if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')return null;
+      }
+      continue;
+     }
+     if(deadReference(ref))continue;
+     return null;
+    }
+   }
+   const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&!entry.computed&&key(entry)===name);
+   if(entries.length!==1||!functions.has(entries[0].value.type))return null;
+   return entries[0].value;
+  }
+  return null;
+ }
+ function closedForwarder(call){
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==3||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  const fn=forwarderFunction(call.callee);
+  if(!fn||fn.async||fn.generator||fn.params.length!==3||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
+  const [first,second,third]=fn.params,firstBinding=bindings.get(first),secondBinding=bindings.get(second),thirdBinding=bindings.get(third);
+  if(!firstBinding||!secondBinding||!thirdBinding||firstBinding.writes.length||secondBinding.writes.length||thirdBinding.writes.length)return false;
+  const body=fn.body.type==='BlockStatement'
+   ?fn.body.body.length===1&&fn.body.body[0].type==='ReturnStatement'?fn.body.body[0].argument:null
+   :fn.body;
+  if(!body||body.type!=='CallExpression'||body.optional||body.arguments.length!==2||body.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(body.callee.type!=='Identifier'||bindings.get(body.callee)!==firstBinding)return false;
+  return body.arguments[0].type==='Identifier'&&bindings.get(body.arguments[0])===secondBinding&&
+   body.arguments[1].type==='Identifier'&&bindings.get(body.arguments[1])===thirdBinding;
+ }
+ // 条件方法别名只有在所有引用都是直接 HTTP 调用，或作为首参交给上述闭合
+ // 转发器时才成立；写回、复制、比较或交给未知代码都拒绝。
+ function httpMethodAlias(binding,ref){
+  if(!binding||binding.writes.length||!binding.init||binding.init.type!=='ConditionalExpression')return null;
+  if(!methodSelection(binding.init))return null;
+  for(const use of binding.refs){
+   const call=parents.get(use);
+   if(call?.type==='CallExpression'&&call.callee===use){
+    if(call.optional||call.arguments.length<2||call.arguments.some(argument=>argument.type==='SpreadElement'))return null;
+    continue;
+   }
+   if(call?.type==='CallExpression'&&call.arguments[0]===use&&closedForwarder(call))continue;
+   return null;
+  }
+  markMethodSelections(binding.init);
+  return {value:ref,selection:binding.init};
+ }
+ // 声明渲染早于调用点识别，因此这里从分支反向找到别名根并复用同一证明；
+ // 只有根是条件表达式且所有引用都通过调用/转发器检查时才标记。
+ function provenMethodRoot(node){
+  let root=node;
+  while(parents.get(root)?.type==='ConditionalExpression')root=parents.get(root);
+  if(httpMethodSelections.has(root))return true;
+  const declarator=parents.get(root);
+  const binding=declarator?.type==='VariableDeclarator'&&declarator.init===root&&declarator.id.type==='Identifier'?bindings.get(declarator.id):null;
+  return !!binding&&!!httpMethodAlias(binding,null);
+ }
  function clientMethod(n,seen=new Set()){
   if(n?.type==='MemberExpression'&&free(n.object,'$httpClient')){
    const methodValue=(value,seen=new Set())=>{
@@ -813,9 +958,28 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(n.computed){if(!dynamicMethods.has(n))dynamicMethods.set(n,{expression:n.property});return dynamicMethods.get(n);}
    return null;
   }
-  if(n?.type==='Identifier'){const b=bindings.get(n);if(b?.init&&!b.writes.length&&!seen.has(b)){seen.add(b);return clientMethod(b.init,seen);}}
+  if(n?.type==='ConditionalExpression'&&methodSelection(n)){markMethodSelections(n);return {value:n,selection:n};}
+  if(n?.type==='Identifier'){
+   const b=bindings.get(n);
+   if(b?.init&&!b.writes.length&&!seen.has(b)){
+    const alias=httpMethodAlias(b,n);
+    if(alias)return alias;
+    seen.add(b);return clientMethod(b.init,seen);
+   }
+  }
   if(n?.type==='LogicalExpression'&&n.operator==='||')return clientMethod(n.left,new Set(seen));
   return null;
+ }
+ function httpDispatch(n){
+  if(n?.type!=='CallExpression'||n.optional||n.arguments.some(argument=>argument.type==='SpreadElement'))return null;
+  const method=clientMethod(n.callee);
+  if(method)return {method,request:n.arguments[0],callback:n.arguments[1],call:n};
+  if(n.arguments.length!==3||!closedForwarder(n))return null;
+  const forwarded=clientMethod(n.arguments[0]);
+  if(!forwarded)return null;
+  // 完成回调经转发器时还没有完成流证明，保持失败关闭，不让回调绕过终止分析。
+  if(complete.has(target(n.arguments[2])))return null;
+  return {method:forwarded,request:n.arguments[1],callback:n.arguments[2],call:n};
  }
  function terminal(n){
   if(n?.type!=='CallExpression')return false;
@@ -1844,8 +2008,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
        if(call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')){calls.push(call);continue;}
        // 函数存在性观察不构成调用点，也不会把函数值交给未知代码；其余非
        // 调用引用仍拒绝，避免参数实参来源无法闭合。
+       const member=call?.type==='MemberExpression'&&call.object===ref&&property(call)!==undefined&&!['call','apply','bind','constructor','prototype'].includes(String(property(call)));
+       const memberParent=member&&parents.get(call);
        const observed=call?.type==='UnaryExpression'&&['typeof','!'].includes(call.operator)||
-        ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(call?.type)&&call.test===ref;
+        ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(call?.type)&&call.test===ref||
+        member&&!(memberParent?.type==='AssignmentExpression'&&memberParent.left===call||memberParent?.type==='UpdateExpression'||memberParent?.type==='UnaryExpression'&&memberParent.operator==='delete');
        if(!observed)return null;
       }
      }
@@ -1961,6 +2128,63 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      });
      return ok;
     };
+    const rootObjectBinding=node=>{
+     if(node?.type!=='Identifier')return null;
+     let binding=bindings.get(node),seen=new Set();
+     while(binding&&!seen.has(binding)){
+      seen.add(binding);
+      if(binding.init?.type==='ObjectExpression')return binding;
+      if(binding.init?.type==='Identifier'&&!binding.writes.length){binding=bindings.get(binding.init);continue;}
+      return null;
+     }
+     return null;
+    };
+    // 字段值交由未知函数处理时，只有能证明该值在运行时恒为 undefined 才安全。
+    // 这覆盖直接缺席的参数字段，以及由这种字段逐项装配的局部记录字段。
+    const fieldValueAbsent=(node,seen=new Set())=>{
+     if(!node)return false;
+     if(free(node,'undefined'))return true;
+     if(node.type==='UnaryExpression'&&node.operator==='void'&&node.argument.type==='Literal')return true;
+     if(node.type!=='MemberExpression'||property(node)===undefined)return false;
+     const field=String(property(node));
+     if(node.object.type==='Identifier'){
+      const source=bindings.get(node.object),site=source&&parameterCallSites(source);
+      if(site&&!seen.has(source)){
+       const next=new Set(seen);next.add(source);
+       const result=site.calls.every(call=>{
+        let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+        if(!actual||free(actual,'undefined'))actual=formal?.type==='AssignmentPattern'?formal.right:null;
+        if(!actual)return true;
+        if(!safeRecordSource(actual,call))return false;
+        const record=recordFields(actual,new Set(),null,call);
+        return !!record&&!record.has(field);
+       });
+       return result;
+      }
+     }
+     const root=rootObjectBinding(node.object);
+     if(!root)return false;
+     let write=null;
+     for(const candidate of nodes){
+      if(candidate.type!=='AssignmentExpression'||candidate.operator!=='='||candidate.left.type!=='MemberExpression')continue;
+      if(bindings.get(candidate.left.object)!==root||property(candidate.left)!==field)continue;
+      if(candidate.end>node.start||owners.get(candidate)!==owners.get(node))continue;
+      if(write)return false;
+      write=candidate;
+     }
+     if(!write){
+      if(root.init.properties.some(entry=>entry.type!=='Property'||entry.kind!=='init'||key(entry)===undefined))return false;
+      return !root.init.properties.some(entry=>key(entry)===field);
+     }
+     const ancestors=new Set();for(let item=node;item;item=parents.get(item))ancestors.add(item);
+     let common=write;while(common&&!ancestors.has(common))common=parents.get(common);
+     if(!common)return false;
+     const control=new Set(['IfStatement','ConditionalExpression','LogicalExpression','WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchCase','TryStatement']);
+     if(control.has(common.type))return false;
+     for(let item=write;item&&item!==common;item=parents.get(item))if(control.has(item.type))return false;
+     const result=fieldValueAbsent(write.right,seen);
+     return result;
+    };
     const parameterRecords=()=>{
      if(!parameter)return null;
      const site=parameterCallSites(binding);
@@ -1980,7 +2204,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     let finalFields=null;
     if(!parameter){
      if(!binding.init||binding.writes.length)return false;
-     finalFields=recordFields(input);
+     // 局部别名可以在别名建立前由源记录逐项装配字段；以别名读取点为界，
+     // 只吸收此前、同一语句列表内完成的静态写入。
+     finalFields=recordFields(binding.init,new Set(),null,input);
      if(!finalFields)return false;
     }else{
      if(binding.writes.length>1)return false;
@@ -1993,9 +2219,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     }
     const dispatchOf=ref=>{
      const call=parents.get(ref);
-     if(call?.type!=='CallExpression'||!call.arguments.includes(ref)||call.callee.type!=='MemberExpression')return null;
-     if(free(call.callee.object,'$httpClient'))return call;
-     if(free(call.callee.object,'$task')&&property(call.callee)==='fetch')return call;
+     if(call?.type!=='CallExpression'||!call.arguments.includes(ref))return null;
+     if(call.callee.type==='MemberExpression'){
+      if(free(call.callee.object,'$httpClient'))return call;
+      if(free(call.callee.object,'$task')&&property(call.callee)==='fetch')return call;
+     }
+     // 请求记录作为闭合三参转发器的第二个实参时，转发器本身已证明只做
+     // 方法(请求, 回调)的原序转交，因此仍是唯一派发点。
+     if(call.arguments[1]===ref&&closedForwarder(call)&&httpDispatch(call))return call;
      return null;
     };
     const dispatches=binding.refs.map(dispatchOf).filter(Boolean);
@@ -2132,6 +2363,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<firstDispatch.start))return false;continue;}
      if(q?.type==='CallExpression'&&q.arguments.includes(p)){
       if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<firstDispatch.start))return false;continue;}
+      // 所有闭合调用点都缺席的字段值恒为 undefined；把该值交给未知函数只会
+      // 观察一个不可变的基本值，不可能借此修改请求记录。
+      if(absent||fieldValueAbsent(p))continue;
       if(['url','method','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode'].includes(field))continue;
       return false;
      }
@@ -2184,9 +2418,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(!(value?.type==='Literal'&&value.value===false))fail(input,'HTTP 请求的 '+name+' 必须静态证明未启用');
      }
     }
-    const request=fresh('httpRequest'),dynamicMethod=!!method?.expression||qx&&live&&!method,selector=dynamicMethod?fresh('httpMethod'):null;
+    const request=fresh('httpRequest'),dynamicMethod=!method?.value&&(!!method?.expression||qx&&live&&!method),selector=dynamicMethod?fresh('httpMethod'):null;
     const methodValue=method?.expression?render(method.expression):`${request}?.method`;
-    const callee=dynamicMethod?`((${selector}) => {${selector}=String(${selector} ?? 'get').toLowerCase();if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${methodValue}).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
+    const callee=method?.value?render(method.value):dynamicMethod?`((${selector}) => {${selector}=String(${selector} ?? 'get').toLowerCase();if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${methodValue}).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
     const url=`typeof ${request} === 'string' ? ${request} : ${request}.url`;
     const headers=`${request}?.headers ?? ${request}?.header`,body=`${request}?.bodyBytes ?? ${request}?.body`,policy=`${request}?.policy ?? ${request}?.node`;
     // QX 未设置 timeout 时由平台使用缺省 5000ms；省略字段与写出缺省值等价。
@@ -2230,7 +2464,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   for(const k of f.keys())if(!allowed.includes(k))fail(input,'未适配 HTTP 参数：'+k);
   if(!f.has('url'))fail(input,'HTTP 请求缺少 URL');
   const declaredMethod=f.get('method'),dynamicMethod=!!callbackSelector||qx&&!method&&fieldValues.has(declaredMethod)&&resolve(declaredMethod)?.type!=='Literal';
-  method=method??resolve(declaredMethod)?.value??'GET';if(!dynamicMethod&&(typeof method!=='string'||!['get','post','put','delete','head','options','patch'].includes(method.toLowerCase())))fail(input,'HTTP 方法必须可静态确定');
+  if(!method?.value)method=method??resolve(declaredMethod)?.value??'GET';
+  if(!method?.value&&!dynamicMethod&&(typeof method!=='string'||!['get','post','put','delete','head','options','patch'].includes(method.toLowerCase())))fail(input,'HTTP 方法必须可静态确定');
   const out=[];if(f.has('headers')){const captured=fresh('httpHeaders');let h=captured;if(f.has('body')||f.has('bodyBytes'))h=cleanHeaders(h,['content-length','transfer-encoding']);out.push(`...((${captured}) => ${captured} == null ? {} : {headers: ${h}})(${render(f.get('headers'))})`);}
   if(f.has('bodyBytes'))out.push(optionalHTTPFields.has(f.get('bodyBytes'))?`...(${render(f.get('bodyBytes'))} === undefined ? {} : {body: ${bytes(f.get('bodyBytes'))}})`:'body: '+bytes(f.get('bodyBytes')));else if(f.has('body'))out.push(optionalHTTPFields.has(f.get('body'))?`...(${render(f.get('body'))} === undefined ? {} : {body: ${bodyValue(f.get('body'))}})`:'body: '+bodyValue(f.get('body')));
   const flag=(m,k,fallback)=>{if(!m.has(k))return fallback;const v=resolve(m.get(k));if(v.type!=='Literal'||typeof v.value!=='boolean')fail(v,'HTTP 布尔参数必须可静态确定：'+k);return v.value;};
@@ -2245,9 +2480,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    out.push(`redirect: '${flag(f,'auto-redirect',true)?'follow':'manual'}'`,`credentials: '${flag(f,'auto-cookie',true)?'include':'omit'}'`);if(f.has('insecure'))out.push('insecureTls: '+flag(f,'insecure',false));
   }
   const selector=dynamicMethod?fresh('httpMethod'):null;
-  const url=render(f.get('url')),options=`{${out.join(', ')}}`,callee=dynamicMethod?`((${selector}) => {if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${callbackSelector?render(callbackSelector):render(declaredMethod)+'.toLowerCase()'}).bind(${context}.http)`:`${context}.http.${method.toLowerCase()}`;
+  const url=render(f.get('url')),options=`{${out.join(', ')}}`,callee=method?.value?render(method.value):dynamicMethod?`((${selector}) => {if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${callbackSelector?render(callbackSelector):render(declaredMethod)+'.toLowerCase()'}).bind(${context}.http)`:`${context}.http.${method.toLowerCase()}`;
   const call=`${callee}(${url}, ${options})`,runtime=f.runtimeRequest,guard=runtime?.binaryGuard?`if (${runtime.name} && typeof ${runtime.name} === 'object' && (${runtime.name}["binary-mode"] === true || ${runtime.name}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');`:'',code=runtime?`((${runtime.name}) => {${guard}return ${call};})(${render(runtime.expression)})`:call;
-  return {code,url,options,callee,dynamic:dynamicMethod,binary:flag(f,'binary-mode',false),full:flag(f,'full-header-mode',false),runtimeRequest:f.runtimeRequest};
+  return {code,url,options,callee,dynamic:method?.value?false:dynamicMethod,binary:flag(f,'binary-mode',false),full:flag(f,'full-header-mode',false),runtimeRequest:f.runtimeRequest};
  }
  function forwardedHTTPFields(input,qx){
   const parsedRequest=input?.type==='CallExpression'&&input.arguments.length===1&&input.callee.type==='MemberExpression'&&free(input.callee.object,'JSON')&&property(input.callee)==='parse';
@@ -3022,6 +3257,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(o.type==='MemberExpression'&&free(o.object,'$network')&&['v4','v6'].includes(property(o))){const fields={primaryAddress:'address',primaryInterface:'interface',primaryRouter:'gateway'};if(!fields[k])fail(n,'未知网络地址字段');return `${context}.device.${property(o)==='v4'?'ipv4':'ipv6'}.${fields[k]}`;}
    if(free(o,'$httpClient')){
     const m=clientMethod(n);let alias=n;
+    if(typeof m==='string'){
+     if(provenMethodRoot(parents.get(n)))return context+'.http.'+m;
+    }else if(m?.selection){
+     if(provenMethodRoot(parents.get(n)))return patch(source,m.selection,render);
+     fail(n,'HTTP 方法条件别名存在未证明的引用');
+    }
     if(m?.expression)fail(n,'动态 HTTP 方法引用必须直接调用，不能在未确定求值时机时保存为别名');
     while(parents.get(alias)?.type==='LogicalExpression'&&parents.get(alias).operator==='||')alias=parents.get(alias);
     const p=parents.get(alias),b=p?.type==='VariableDeclarator'&&p.init===alias?bindings.get(p.id):null;
@@ -3098,18 +3339,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const fn=target(n.callee),p=parents.get(n);
    if(!structured&&!bundled&&fn&&(complete.has(fn)&&asyncFns.has(fn)||lifted.has(fn)&&!fn.async)&&p?.type!=='AwaitExpression'&&!(p?.type==='MemberExpression'&&['then','catch'].includes(property(p))))return '(await '+patch(source,n,render)+')';
   }
-  if(n.type==='ReturnStatement'&&n.argument?.type==='CallExpression'&&clientMethod(n.argument.callee)){
-   const completing=complete.has(target(n.argument.arguments[1]));
-   return callback(n.argument)+(completing?'':'\nreturn;');
+  if(n.type==='ReturnStatement'&&n.argument?.type==='CallExpression'&&httpDispatch(n.argument)){
+   const dispatch=httpDispatch(n.argument),completing=complete.has(target(dispatch.callback));
+   return callback(n.argument,undefined,undefined,dispatch)+(completing?'':'\nreturn;');
   }
   if(n.type==='ExpressionStatement'){
    const e=n.expression;
    if(e.type==='SequenceExpression'){
     const flat=x=>x.type==='SequenceExpression'?x.expressions.flatMap(flat):[x],parts=flat(e);
-    if(parts.some(x=>x.type==='CallExpression'&&clientMethod(x.callee)))return parts.map(x=>emit({...n,start:x.start,end:x.end,expression:x})).join('\n');
+    if(parts.some(x=>x.type==='CallExpression'&&httpDispatch(x)))return parts.map(x=>emit({...n,start:x.start,end:x.end,expression:x})).join('\n');
    }
    if(pending?.calls.has(e))return '{'+pendingResult+' = '+patch(source,e,render)+'; if ('+pendingFinished+') return await '+pendingResult+';}';
-   if(e.type==='CallExpression'&&clientMethod(e.callee))return callback(e);
+   if(e.type==='CallExpression'&&httpDispatch(e))return callback(e,undefined,undefined,httpDispatch(e));
    if(terminal(e)||e.type==='AwaitExpression'&&terminal(e.argument))return 'return '+render(e)+';';
    if(e.type==='ConditionalExpression'&&terminalExpression(e)){
     const branch=x=>x.type==='ConditionalExpression'?`if (${render(x.test)}) {${branch(x.consequent)}} else {${branch(x.alternate)}}`:'return '+render(x)+';';
@@ -3163,9 +3404,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return patch(source,n,render);
  }
- function callback(n,completionGuard,detached){
-  const fn=target(n.arguments[1]);if(!fn||fn.params.some(p=>p.type!=='Identifier')||fn.params.length>3)fail(n,'HTTP 回调必须是可追溯的简单函数');
-  const h=http(n.arguments[0],clientMethod(n.callee),false),r=fresh('httpResponse'),e=fresh('httpError'),b=fresh('httpBody'),caught=fresh('networkError');
+ function callback(n,completionGuard,detached,dispatch){
+  const requestNode=dispatch?.request??n.arguments[0];
+  const callbackNode=dispatch?.callback??n.arguments[1];
+  const fn=target(callbackNode);if(!fn||fn.params.some(p=>p.type!=='Identifier')||fn.params.length>3)fail(n,'HTTP 回调必须是可追溯的简单函数');
+  const h=http(requestNode,dispatch?.method??clientMethod(n.callee),false),r=fresh('httpResponse'),e=fresh('httpError'),b=fresh('httpBody'),caught=fresh('networkError');
   const response=fn.params[1]&&bindings.get(fn.params[1]),snapshot=httpReplies.get(response)?.snapshot;
   const owner=owners.get(n);
   if(parents.get(n)?.type==='ReturnStatement'&&owner.async&&!complete.has(fn)){
@@ -3202,8 +3445,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    // network error passed to the callback of a detached async function.
    const url=fresh('httpURL'),options=fresh('httpOptions'),handler=fresh('httpCallback'),send=h.dynamic?fresh('httpSend'):null;
    const requestBody=h.runtimeRequest
-    ? `const ${handler} = ${render(n.arguments[1])}; const ${url} = ${h.url}; const ${options} = ${h.options};`
-    : `const ${url} = ${h.url}; const ${options} = ${h.options}; const ${handler} = ${render(n.arguments[1])};`;
+    ? `const ${handler} = ${render(callbackNode)}; const ${url} = ${h.url}; const ${options} = ${h.options};`
+    : `const ${url} = ${h.url}; const ${options} = ${h.options}; const ${handler} = ${render(callbackNode)};`;
    const requestCall=send?`${send}(${url}, ${options})`:`${h.callee}(${url}, ${options})`;
    const dispatch=`{${requestBody} void (async () => {let ${e} = null, ${r} = null, ${b} = null;try {${r} = await ${requestCall}; ${b} = ${h.binary?`new Uint8Array(await ${r}.arrayBuffer())`:`await ${r}.text()`};} catch (${caught}) {${e} = String(${caught}.message ?? ${caught}); ${r} = null;} ${detached?`if (${detached.completion}) return; await `:''}${handler}(${e}, ${responseValue}, ${b});})()${detached?`.catch(${detached.reject})`:''};}`;
    const callee=send?`const ${send} = ${h.callee}; `:'';
@@ -3213,7 +3456,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    return `{${callee}${dispatch.slice(1)}`;
   }
-  return `{let ${e} = null, ${r} = null, ${b} = null;\ntry {${r} = await ${h.code}; ${b} = ${h.binary?`new Uint8Array(await ${r}.arrayBuffer())`:`await ${r}.text()`};} catch (${caught}) {${e} = String(${caught}.message ?? ${caught}); ${r} = null;}\n${completionGuard?'':'return '}await (${render(n.arguments[1])})(${e}, ${responseValue}, ${b});${completionGuard??''}}`;
+  return `{let ${e} = null, ${r} = null, ${b} = null;\ntry {${r} = await ${h.code}; ${b} = ${h.binary?`new Uint8Array(await ${r}.arrayBuffer())`:`await ${r}.text()`};} catch (${caught}) {${e} = String(${caught}.message ?? ${caught}); ${r} = null;}\n${completionGuard?'':'return '}await (${render(callbackNode)})(${e}, ${responseValue}, ${b});${completionGuard??''}}`;
  }
  // 宿主请求只有经过闭合 helper 的静态字段读写时，才降为一次本地快照。快照
  // 保留字段值而不把可变宿主对象交给业务代码；helper 不得复制、转发或返回

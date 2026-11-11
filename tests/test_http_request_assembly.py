@@ -44,6 +44,31 @@ $httpClient.get(options,(e,r,b)=>$done({body:b}));'''
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_absent_field_can_be_observed_but_mixed_unknown_records_are_rejected(self):
+        source = '''function send(t){
+  t.params&&(t.url+='?'+t.params);
+  function observe(value){return value}
+  observe(t.body);
+  $httpClient.get(t,(e,r,b)=>$done({body:b}));
+}
+send({url:'https://example.test/path',params:'a=1'});'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        fixture = {'name': 'absent field observation', 'request': {'url': URL},
+                   'http': [{'url': 'https://example.test/path?a=1', 'body': 'ok'}],
+                   'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'loon', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+        for rejected in [
+            '''function send(t){function observe(value){return value}observe(t.body);
+$httpClient.get(t,(e,r,b)=>$done({body:b}))}
+send($argument?{url:'https://example.test/a',body:{value:1}}:{url:'https://example.test/b'});''',
+            '''function send(t){function observe(value){return value}observe(t.body);
+$httpClient.get(t,(e,r,b)=>$done({body:b}))}send(makeRecord());''',
+        ]:
+            with self.subTest(source=rejected), self.assertRaises(ConversionError):
+                convert_script(rejected, 'Fixture', URL, '', source_format='loon')
+
 
 if __name__ == '__main__':
     unittest.main()
