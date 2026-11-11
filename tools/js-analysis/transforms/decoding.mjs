@@ -528,6 +528,68 @@ function cachedDecoderShape(fn,ix){
  const second=inner.body.body[1];
  return second?.type==='VariableDeclaration'&&second.declarations.length===1;
 }
+// 原始表访问器：内层只做常量偏移、表读取和返回，没有 Base64/RC4、写入或
+// 自防御安装分支。它只能把常量索引还原为静态字符串，不能产生其他副作用。
+function rawAccessorShape(fn,ix){
+ if(fn?.type!=='FunctionDeclaration'||fn.params.length!==2||fn.params.some(p=>p.type!=='Identifier'))return false;
+ const body=fn.body?.body;if(body?.length!==2)return false;
+ const [decl,ret]=body;
+ if(decl.type!=='VariableDeclaration'||decl.declarations.length!==1)return false;
+ const init=decl.declarations[0].init;
+ if(init?.type!=='CallExpression'||init.arguments.length||init.callee.type!=='Identifier')return false;
+ const factory=ix.bindings.get(init.callee)?.init;
+ if(factory?.type!=='FunctionDeclaration'||factory.body.body.length!==3)return false;
+ if(ret.type!=='ReturnStatement'||ret.argument?.type!=='SequenceExpression'||ret.argument.expressions.length!==2)return false;
+ const [assign,call]=ret.argument.expressions;
+ if(assign?.type!=='AssignmentExpression'||assign.operator!=='='||assign.left.type!=='Identifier'||assign.left.name!==fn.id?.name)return false;
+ const inner=assign.right;
+ if(inner?.type!=='FunctionExpression'||inner.async||inner.generator||inner.params.length!==2||inner.params.some(p=>p.type!=='Identifier'))return false;
+ if(call?.type!=='CallExpression'||call.callee.type!=='Identifier'||call.callee.name!==fn.id?.name||call.arguments.length!==2)return false;
+ const statements=inner.body?.body;
+ if(statements?.length!==3)return false;
+ const [offset,read,result]=statements,param=ix.bindings.get(inner.params[0]);
+ if(offset.type!=='ExpressionStatement'||offset.expression.type!=='AssignmentExpression'||offset.expression.operator!=='=')return false;
+ const right=offset.expression.right;
+ if(offset.expression.left.type!=='Identifier'||offset.expression.left.name!==inner.params[0].name||right.type!=='BinaryExpression'||right.operator!=='-')return false;
+ if(right.left.type!=='Identifier'||right.left.name!==inner.params[0].name||right.right.type!=='Literal'||!Number.isInteger(right.right.value))return false;
+ if(!param||read.type!=='VariableDeclaration'||read.declarations.length!==1)return false;
+ const value=read.declarations[0],member=value.init;
+ if(value.id.type!=='Identifier'||member?.type!=='MemberExpression'||!member.computed)return false;
+ if(ix.bindings.get(member.object)!==ix.bindings.get(decl.declarations[0].id)||ix.bindings.get(member.property)!==param)return false;
+ return result.type==='ReturnStatement'&&result.argument?.type==='Identifier'&&result.argument.name===value.id.name;
+}
+// 原始访问器的严格证明：除自缓存赋值和常量偏移外不得写任何绑定；表来源必须
+// 是同一闭合表工厂；首次递归调用必须把同一组参数交给自身。
+function proveRawAccessor(decoder,ix){
+ const bad=why=>fail('字符串表原始访问器结构不匹配：'+why);
+ if(!rawAccessorShape(decoder,ix))bad('形状');
+ const body=decoder.body.body,[decl,ret]=body,td=decl.declarations[0];
+ const tableBinding=ix.bindings.get(td.id),decoderBinding=ix.bindings.get(decoder.id);
+ if(!tableBinding||!decoderBinding)bad('绑定');
+ if(tableBinding.writes.length)bad('字符串表被重绑');
+ const [assign,call]=ret.argument.expressions;
+ if(!bindingIs(ix,assign.left,decoderBinding))bad('自缓存赋值');
+ const inner=assign.right;
+ if(!bindingIs(ix,call.callee,decoderBinding))bad('首次递归目标');
+ if(decoderBinding.writes.some(write=>write!==assign))bad('解码器被外部重绑');
+ if(decoder.params.some((param,index)=>!bindingIs(ix,call.arguments[index],ix.bindings.get(param))))bad('首次递归参数');
+ const statements=inner.body.body,param=ix.bindings.get(inner.params[0]),offset=statements[0].expression;
+ const value=statements[1].declarations[0],valueBinding=ix.bindings.get(value.id);
+ if(!valueBinding)bad('表值绑定');
+ if(valueBinding.writes.length||valueBinding.refs.some(ref=>ref!==statements[2].argument))bad('表值逃逸');
+ if(param.writes.length!==1||param.writes[0]!==offset)bad('偏移参数被改写');
+ if(inner.params[1]&&ix.bindings.get(inner.params[1]).refs.length)bad('原始访问器不能读取第二个参数');
+ return {raw:true};
+}
+// 同表工厂的所有成员必须使用同一个常量偏移，否则校验和与业务查表会错位。
+function cachedDecoderOffset(fn){
+ const statements=fn?.body?.body;
+ if(statements?.length!==2)return null;
+ const inner=statements[1]?.argument?.expressions?.[0]?.right;
+ const offset=inner?.body?.body?.[0]?.expression;
+ if(offset?.type!=='AssignmentExpression'||offset.operator!=='='||offset.right?.type!=='BinaryExpression'||offset.right.operator!=='-')return null;
+ try{const value=number(offset.right.right);return Number.isInteger(value)?value:null;}catch{return null;}
+}
 // 轮转调用的结构识别：两参、首参绑定到本地表工厂、被调函数体含 while 与 try。
 // 轮转步数仍由 rotateKS 用校验和数值复算确认，结构匹配本身不产生信任。
 function cachedRotationShape(call,ix,tableBinding){
@@ -694,7 +756,7 @@ function collect(source,variant,only){
  const decoders=nodes.filter(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===decoderHash||(variant==='ks'&&cachedDecoderShape(n,ix)))&&(!only||n.id?.name===only));
  if(decoders.length!==1)fail('已识别标记，但解码器语法数量不唯一');
  const decoder=decoders[0],decoderBinding=bindings.get(decoder.id);
- let tableBinding,tableFactory=null,values,offset=0,rotationCall,rotationFn,rotationStatement,rotationSteps=0,alphabet=null,shells=new Set();
+ let tableBinding,tableFactory=null,values,offset=0,rotationCall,rotationFn,rotationStatement,rotationSteps=0,alphabet=null,shells=new Set(),decoderRoles=new Map();
  if(variant==='ks'){
   const first=decoder.body.body[0],factory=first?.type==='VariableDeclaration'&&first.declarations.length===1?first.declarations[0].init:null;
   tableFactory=factory?.type==='CallExpression'&&!factory.arguments.length&&functions.has(bindings.get(factory.callee)?.init?.type)?bindings.get(factory.callee).init:null;
@@ -716,16 +778,22 @@ function collect(source,variant,only){
   alphabet=decoderAlphabet(decoder);
   // 共用同一表工厂的同形外壳（如 a0d 与 a0e）共享偏移与表，按解码器身份求值
   shells=new Set(nodes.filter(n=>n!==decoder&&functions.has(n.type)&&!n.async&&!n.generator&&cachedDecoderShape(n,ix)&&tableFactoryName(n,ix)===tableFactory?.id?.name));
+  for(const fn of [decoder,...shells])if(cachedDecoderOffset(fn)!==offset)fail('同表工厂解码器偏移不一致');
+  // 若族代表是原始访问器，Base64/RC4 字母表仍应从同族的完整解码器读取。
+  if(!alphabet)for(const fn of shells){alphabet=decoderAlphabet(fn);if(alphabet)break;}
+  // 同表工厂内可能同时存在完整解码器与原始访问器；校验和必须按被调身份选择
+  // Base64/RC4 或原始表读取，不能按整个族统一套用解码步骤。
+  for(const fn of [decoder,...shells])decoderRoles.set(fn,rawAccessorShape(fn,ix)?'raw':'decoder');
   if(nested.length){
    const shape=nested[0];
    rotationCall=shape.call;rotationFn=shape.inner;rotationStatement=shape.statement;
-   const rotated=rotateNested(shape,values,decoder,offset,ix,alphabet,shells);
+   const rotated=rotateNested(shape,values,decoder,offset,ix,alphabet,shells,decoderRoles);
    values=rotated.values;rotationSteps=rotated.steps;
   }else{
    rotationCall=direct[0];rotationFn=rotationCall.callee;
    if(rotationCall.arguments.length!==2||rotationCall.arguments[0].type!=='Identifier'||bindings.get(rotationCall.arguments[0])!==tableBinding)fail('轮转没有使用本地字符串表工厂');
    rotationStatement=narrowRotationStatement(topStatement(rotationCall,parents,tree),rotationCall,parents);
-   rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells);
+   rotationSteps=rotateKS(rotationFn,rotationCall,values,decoder,offset,ix,source,alphabet,shells,decoderRoles);
   }
  }else{
   if(!source.includes('jsjiami.com.v6'))fail('缺少 jsjiami v6 哨兵');
@@ -743,7 +811,7 @@ function collect(source,variant,only){
   rotationSteps=rotatePdd(rotationFn,values,ix,source);
  }
  if(values.length<3||values.length>LIMIT||values.some(v=>typeof v!=='string')||values.reduce((n,v)=>n+v.length,0)>1048576)fail('字符串表为空或超过静态边界');
- return {tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationCall,rotationFn,rotationStatement,rotationSteps,variant,alphabet,shells};
+ return {tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationCall,rotationFn,rotationStatement,rotationSteps,variant,alphabet,shells,decoderRoles};
 }
 
 // 只读诊断入口：验证嵌套 IIFE 轮转的结构与数值校验和，不展开业务调用，
@@ -890,14 +958,14 @@ function narrowRotationStatement(statement,node,parents){
  return statement.expression.expressions.includes(child)?child:statement;
 }
 
-function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
+function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells,decoderRoles){
  const target=number(call.arguments[1]),loop=ix.nodes.find(n=>n.type==='TryStatement'&&n.start>=fn.start&&n.end<=fn.end),checksum=loop?.block.body[0]?.declarations?.[0]?.init;
  if(!Number.isFinite(target)||!checksum||!ix.nodes.some(n=>n.type==='WhileStatement'&&n.start>=fn.start&&n.end<=fn.end))fail('js-obfuscator 校验循环不匹配');
  const wrappers=decoderWrappers(ix,decoder);
  // 轮转校验和可能经由同族外壳或本地别名调用解码器，先把外壳并入可解析集合
  if(shells)for(const shell of shells)wrappers.add(shell);
  for(let i=0;i<values.length;i++){
-  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks',alphabet,shells});if(checksumValue===target)return i;}
+  try{const checksumValue=evaluate(checksum,new Map(),{ix,values,offset,decoder,wrappers,variant:'ks',alphabet,shells,decoderRoles});if(checksumValue===target)return i;}
   catch{}
   values.push(values.shift());
  }
@@ -906,7 +974,7 @@ function rotateKS(fn,call,values,decoder,offset,ix,source,alphabet,shells){
 
 // 嵌套 IIFE 轮转按原循环语义先去表头两条哨兵，再在密文项上逐轮左移并复算
 // 校验和。结构判据已证明循环只有这一条终止路径；这里仍要求数值匹配唯一。
-function rotateNested(shape,values,decoder,offset,ix,alphabet,shells){
+function rotateNested(shape,values,decoder,offset,ix,alphabet,shells,decoderRoles){
  const version=values[0],marker=values[1];
  if(typeof version!=='string'||!/^jsjiami\.(?:com|cn)\.v7$/.test(version))fail('字符串表版本哨兵不匹配');
  if(typeof marker!=='string'||marker.replace(shape.regex,'')!==version)fail('字符串表版本自检不匹配');
@@ -918,7 +986,7 @@ function rotateNested(shape,values,decoder,offset,ix,alphabet,shells){
  for(let r=0;r<cipher.length;r++){
   const rotated=cipher.slice(r).concat(cipher.slice(0,r));
   try{
-   const value=evaluate(shape.checksum,new Map(),{ix,values:rotated,offset,decoder,wrappers,variant:'ks',alphabet,shells});
+   const value=evaluate(shape.checksum,new Map(),{ix,values:rotated,offset,decoder,wrappers,variant:'ks',alphabet,shells,decoderRoles});
    if(value===shape.target)matches.push(r);
   }catch{}
  }
@@ -1535,7 +1603,7 @@ function decoderWrappers(ix,decoder){
 }
 
 function evaluate(n,env,ctx,depth=0){
- if(depth>32)throw Error('decoder call depth exceeded');const {ix,values,offset,decoder,wrappers,variant}=ctx;
+ if(depth>32)throw Error('decoder call depth exceeded');const {ix,values,offset,decoder,wrappers,variant,decoderRoles}=ctx;
  if(!n)throw Error('missing expression');
  if(n.type==='Literal')return n.value;
  if(n.type==='Identifier'){
@@ -1565,6 +1633,7 @@ function evaluate(n,env,ctx,depth=0){
    if(variant==='ks')index=Number(callArgs[0])-offset;
   else{const raw=callArgs[0],marker=typeof raw==='string'?raw.charCodeAt(0):0;if(typeof raw!=='string'||marker<0x202a||marker>0x202e||!/^[0-9a-f]+$/i.test(raw.slice(1)))throw Error('v6 lookup index is not a bidi-prefixed hex literal');index=Number.parseInt('0x'+raw.slice(1));}
    if(!Number.isInteger(index)||index<0||index>=values.length)throw Error('lookup outside rotated table');
+  if(decoderRoles?.get(fn)==='raw')return values[index];
    const ksAlphabet=variant==='ks'?(ctx.alphabet||'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='):'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
    // 无密钥调用走 Base64 还原；有密钥时按既有 RC4 路径
    if(variant==='ks'&&(callArgs[1]===undefined||callArgs[1]===null))return decodeBase64Alphabet(values[index],ksAlphabet);
@@ -1622,7 +1691,7 @@ function foldObfuscatedTables(source,only){
  const ks=scan.nodes.some(n=>n.type==='FunctionDeclaration'&&(methodContract(n)===KS_DECODER||cachedDecoderShape(n,scan))),pdd=source.includes('jsjiami.com.v6');
  if(!ks&&!pdd)return {source,transformations:[]};
  if(ks&&pdd)fail('一个文件包含多个不兼容的表格式');
- const data=collect(source,ks?'ks':'pdd',only),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant}=data;
+ const data=collect(source,ks?'ks':'pdd',only),{tree,ix,nodes,parents,bindings,decoder,decoderBinding,tableBinding,tableFactory,values,offset,rotationStatement,rotationSteps,variant,decoderRoles}=data;
  const wrappers=decoderWrappers(ix,decoder),replace=new Map(),removed=new WeakSet(),removedRanges=[];
  const alphabet=data.alphabet,shells=data.shells;
  let family=[decoder];
@@ -1636,7 +1705,7 @@ function foldObfuscatedTables(source,only){
  const isRemoved=n=>removedRanges.some(r=>n.start>=r.start&&n.end<=r.end);
  for(const n of nodes){
   if(n.type!=='CallExpression')continue;const fn=resolveCallable(n.callee,ix,wrappers);if(!fn)continue;
-  try{const value=evaluate(n,new Map(),{ix,values,offset,decoder,wrappers,variant,alphabet,shells});if(typeof value==='string')replace.set(n,JSON.stringify(value));}
+  try{const value=evaluate(n,new Map(),{ix,values,offset,decoder,wrappers,variant,alphabet,shells,decoderRoles});if(typeof value==='string')replace.set(n,JSON.stringify(value));}
   catch(error){if(fn===decoder||wrappers.has(fn)){
     const inShell=rotationStatement&&n.start>=rotationStatement.start&&n.end<=rotationStatement.end;
     if(!inShell&&variant==='pdd'&&n.start<decoder.start)continue;
@@ -1666,12 +1735,18 @@ function foldObfuscatedTables(source,only){
    mark(shell);mark(child);mark(shellCall);
   }else{
    family=[decoder,...shells].filter(fn=>fn.type==='FunctionDeclaration');
-   // 同族必须统一：任一解码器带独立外壳时按整族外壳证明；全部不带外壳时
-   // 按内联自防御结构证明。混用两种形态会因数量或角色不符而整体拒绝。
-   if(family.some(fn=>shellSites(fn,ix).length)){
-    if(!proveEmbeddedShellFamily(family,source,ix))fail('js-obfuscator 自防御壳与已审查契约不同');
-   }else if(!proveInlineDecoderFamily(family,ix)){
-    fail('js-obfuscator 自防御壳与已审查契约不同');
+   // 同表工厂允许混合两类成员：完整解码器（Base64/RC4）与只读原始访问器。
+   // 原始访问器逐项证明为纯常量读取；完整解码器仍按原有外壳或内联证明整族
+   // 统一。任一类成员证明失败都拒绝整个族，不做部分折叠。
+   const raw=family.filter(fn=>rawAccessorShape(fn,ix));
+   for(const fn of raw)proveRawAccessor(fn,ix);
+   const decoders=family.filter(fn=>!raw.includes(fn));
+   if(decoders.length){
+    if(decoders.some(fn=>shellSites(fn,ix).length)){
+     if(!proveEmbeddedShellFamily(decoders,source,ix))fail('js-obfuscator 自防御壳与已审查契约不同');
+    }else if(!proveInlineDecoderFamily(decoders,ix)){
+     fail('js-obfuscator 自防御壳与已审查契约不同');
+    }
    }
    for(const fn of family)mark(fn);
   }

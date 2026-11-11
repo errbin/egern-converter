@@ -251,3 +251,48 @@
 按上述保守排序，本轮选择第 1 项：**混淆字符串表原始访问器族**。它已经有可复算的
 静态证明和实测三格式转换结果，且单元边界可以落在“原始表访问器 + 同表工厂角色”
 这一个契约内；不触碰平台探测折叠、`.wrap` 放行或任何脚本特例。
+
+## 第二十轮单元结果：字符串表原始访问器族
+
+### 实现
+
+- `tools/js-analysis/transforms/decoding.mjs`
+  - 新增 `rawAccessorShape`：只接受“常量偏移 + 表读取 + 返回表值”的三语句内层
+    访问器，不接受 Base64/RC4、额外写入或自防御安装分支。
+  - 新增 `proveRawAccessor`：证明表来源属于同一闭合表工厂、除自缓存赋值外没有
+    绑定重写、偏移参数只写一次、表值不逃逸、第二个参数不被读取。
+  - 新增 `decoderRoles`：同表工厂内按函数身份区分“原始访问器”和“完整解码器”；
+    校验和求值不再把整个族统一当成 Base64/RC4。
+  - 新增同表工厂偏移一致性检查：任一成员偏移不一致即拒绝整个族。
+  - 同族证明允许“原始访问器 + 完整解码器”混合，但每一类成员都必须通过自己的
+    严格证明；任一成员失败即整族拒绝，不做部分折叠。
+- 没有修改平台探测折叠、`isSurge` 判定、`.wrap` 放行或任何脚本名/URL/作者特例。
+
+### 双向回归
+
+- `tests/test_raw_accessor_family.py`
+  - 正例：原始访问器轮转折叠为 `"333c"`，转换后 `compare` 为 `passed`，
+    `observable_change=true`。
+  - 负例：同表工厂成员带额外副作用、偏移不一致、外部重绑、读取第二参数、
+    表值逃逸，均不得折叠或必须抛错。
+  - 真实语料（`EGERN_INLINE_DECODER_CORPUS`）：`ChatGPTPlusCrack` 三格式
+    转换且 `compare` 全部 `passed`；`NoAds` 只推进到 `window`，保持拒绝。
+- `tests/test_inline_decoder_family.py` 的语料期望更新为：109 个文件中
+  68 个可折叠，轮转错误 0，语法错误仍为 1。
+
+### E2E 与全量套件
+
+- E2E：`55/109 URL`、`164/327 组合` → **`56/109 URL`、`167/327 组合`**。
+- 逐组合 diff：6 个 key 变化，其中 `ChatGPTPlusCrack` 三格式由失败变为成功，
+  `NoAds` 三格式只改变错误文本（仍失败）；成功 URL 回退 0。
+- 新增成功 URL：`https://raw.githubusercontent.com/yqc007/QuantumultX/master/ChatGPTPlusCrack.js`。
+- 真实语料转换结果：69 次字面量替换、`rotation_steps=20`；三格式 `compare`
+  均为 `passed`、`differences=[]`、`observable_change=true`。
+- 全量套件：609 tests，38 failures，失败集合与第十九轮 601 tests / 38 failures
+  基线 diff=0；默认跳过 67 项（新增的两项真实语料测试需要
+  `EGERN_INLINE_DECODER_CORPUS`）。
+
+### 判定
+
+本单元为**有效增益**：E2E 成功 URL +1、成功组合 +3，且无成功回退。`NoAds` 的
+阶段推进不计入收益，其后续 `window` 阻塞属于运行环境全局族，不在本单元放行。

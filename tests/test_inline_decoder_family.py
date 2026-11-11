@@ -95,8 +95,8 @@ class InlineDecoderFamilyTests(unittest.TestCase):
         )
         data = json.loads(result.stdout)
         self.assertEqual(data['files'], 109)
-        self.assertEqual(data['folded'], 66)
-        self.assertEqual(data['errors'].get('js-obfuscator 轮转校验在一轮内没有匹配'), 2)
+        self.assertEqual(data['folded'], 68)
+        self.assertNotIn('js-obfuscator 轮转校验在一轮内没有匹配', data['errors'])
         self.assertEqual(data['errors'].get('Unexpected token (103:0)'), 1)
         self.assertFalse([reason for reason in data['errors'] if '自防御壳' in reason or '内联缓存式解码器' in reason])
 
