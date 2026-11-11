@@ -101,6 +101,61 @@ class ClosedFetchResponseTests(unittest.TestCase):
                 result = compare(source, output, source_format, URL, fixture)
                 self.assertEqual(result['status'], 'passed', result)
 
+    def test_rebound_host_response_finishes_from_local_snapshot(self):
+        source = '''(async()=>{
+ $response=await async function(request,reply){
+  if(!request?.url||!reply)return reply;
+  const body=String(reply.body||"");
+  if(body.includes("change"))return {...reply,body:body.replace("change","changed")};
+  return reply;
+ }($request,$response);
+})().finally(()=>{
+ function finish(value={}){ $done(value); }
+ finish($response??{});
+});'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        fixture = {'name': 'rebound response',
+                   'request': {'url': URL},
+                   'response': {'status': 200, 'headers': {'x-a': 'b'}, 'body': 'change'}}
+        result = compare(source, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+        self.assertIn('changed', output)
+
+    def test_rebound_host_response_rejects_multiple_or_early_writes(self):
+        helpers = '''async function pass(request,reply){return reply}'''
+        sources = [
+            '(async()=>{$response=await '+helpers+'($request,$response);'
+            '$response=await '+helpers+'($request,$response)})()'
+            '.finally(()=>{function finish(value={}){$done(value)}finish($response??{})});',
+            helpers+'function early(){return $response}(async()=>{'
+            '$response=await pass($request,$response)})()'
+            '.finally(()=>{function finish(value={}){$done(value)}finish($response??{})});',
+        ]
+        for source in sources:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='surge')
+
+    def test_host_response_snapshot_rejects_unclosed_fields_and_calls(self):
+        def source(body):
+            return ('(async()=>{$response=await async function(request,reply){'
+                    'if(!request?.url||!reply)return reply;'+body+
+                    'return reply}($request,$response)})()'
+                    '.finally(()=>{function finish(value={}){$done(value)}'
+                    'finish($response??{})});')
+        bodies = [
+            'const value=reply[$argument];',
+            'const value=reply.cookies;',
+            'unknown(reply);',
+            'const alias=reply;unknown(alias);',
+            'delete reply.status;',
+            'reply.status+=1;',
+            'reply.body();',
+            'const value=reply.headers[$argument];',
+        ]
+        for body in bodies:
+            with self.subTest(body=body), self.assertRaises(ConversionError):
+                convert_script(source(body), 'Fixture', URL, '', source_format='surge')
+
 
 if __name__ == '__main__':
     unittest.main()

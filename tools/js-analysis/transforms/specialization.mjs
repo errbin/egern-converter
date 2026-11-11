@@ -367,6 +367,40 @@ export function lowerClosedMessageObjects(source){
  return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
+// 旧响应脚本有时会把修改后的回复重新写回宿主 `$response`。这里只本地化唯一
+// 一次无条件写入：被该写入支配的读取看到本地结果，而写入之前求值的读取
+// （包括赋值右侧）仍保留宿主全局。
+export function lowerReboundHostGlobals(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const {nodes,parents,free,owners}=ix,changes=new Map(),declarations=[],rebindings=[],names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let name=base,i=2;while(names.has(name))name=base+i++;names.add(name);return name;};
+ for(const kind of ['$request','$response']){
+  const writes=nodes.filter(n=>n.type==='Identifier'&&free(n,kind)&&parents.get(n)?.type==='AssignmentExpression'&&parents.get(n).left===n);
+  if(writes.length!==1)continue;
+  const write=writes[0],assignment=parents.get(write),statement=parents.get(assignment);
+  if(assignment.operator!=='='||statement?.type!=='ExpressionStatement')continue;
+  const reads=nodes.filter(n=>n!==write&&n.type==='Identifier'&&free(n,kind));
+  const base=owners.get(statement);
+  // 赋值之后创建的非提升闭包不可能提前运行；同一作用域的读取也必须位于赋值
+  // 语句之后。提升函数声明和赋值右侧创建的闭包仍按宿主读取处理。
+  const follows=read=>{
+   let owner=owners.get(read);
+   while(owner&&owner!==base&&owner!==tree){
+    if(!owner||owner.type==='FunctionDeclaration'||owner.start<statement.end)return false;
+    owner=owners.get(parents.get(owner));
+   }
+   return read.start>=statement.end;
+  };
+  const dominated=reads.filter(read=>initializedAfter(ix,statement,read)||follows(read));
+  if(!dominated.length)continue;
+  const local=fresh(kind.slice(1)+'Result');
+  changes.set(write,local);for(const read of dominated)changes.set(read,local);declarations.push(local);rebindings.push({kind,name:local});
+ }
+ if(!changes.size)return {source,rebindings};
+ const prefix=declarations.map(name=>`let ${name};`).join('\n')+'\n';
+ return {source:prefix+renderTree(source,tree,n=>changes.has(n)?{direct:true,value:changes.get(n)}:null),rebindings};
+}
+
 // A closed callback helper can have different completion contracts at different
 // call sites. Clone its declaration, not its arguments: evaluation, closures and
 // defaults still belong to the original calls. No callback runtime is injected.

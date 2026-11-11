@@ -226,11 +226,12 @@ export function protectLibraries(source,{sourceType='script'}={}){
  }
  const render=n=>renderTree(source,n,node=>replace.has(node)?{direct:true,value:replace.get(node)}:null);
  const restore=(code,{globalReceiver=true}={})=>{
-  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set(),implicit=new Set();
+  const t=parse(code,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),i=index(t),replacements=new WeakMap(),found=new Set(),placeholderBindings=new Set(),placeholderOwners=new Set(),implicit=new Set();
   for(const n of i.nodes)if(n.type==='VariableDeclaration'){
    const b=blocks.get(n.declarations[0]?.id?.name);if(!b)continue;
    if(found.has(n.declarations[0].id.name))throw Error('Duplicate public library placeholder');
    found.add(n.declarations[0].id.name);for(const name of b.placeholderBindings)placeholderBindings.add(name);
+   placeholderOwners.add(i.owners.get(n));
    // 若库外业务仍读取库内声明，IIFE 包装会让这些绑定失联；此时必须按原
    // 字节直出，让库与业务继续共享作者原本的词法作用域。
    const referenced=b.placeholderBindings.some(name=>i.nodes.some(x=>x.type==='Identifier'&&x.name===name&&i.reference(x)));
@@ -243,7 +244,9 @@ export function protectLibraries(source,{sourceType='script'}={}){
   if(found.size!==blocks.size)throw Error('Public library placeholder lost during compilation');
   let output=renderTree(code,t,n=>{
    if(replacements.has(n))return {direct:true,value:replacements.get(n)};
-   if(n.type==='VariableDeclaration'){
+   // 只清理与库占位符同属一个顶层作用域的合成导出声明。业务代码里同名的
+   // 局部变量属于不同函数作用域，不能被库导出名误删。
+   if(n.type==='VariableDeclaration'&&placeholderOwners.has(i.owners.get(n))){
     const declarations=n.declarations.filter(d=>!placeholderBindings.has(d.id.type==='Identifier'?d.id.name:null));
     if(declarations.length!==n.declarations.length)return declarations.length?{children:declarations,render:child=>n.kind+' '+declarations.map(child).join(', ')+';'}:{direct:true,value:''};
    }

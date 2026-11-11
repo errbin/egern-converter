@@ -6,7 +6,7 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
@@ -118,7 +118,8 @@ function compile(original,format,options,libraries){
   libraries.transformations.push(...alternate.transformations);
   const messageSource=lowerMessageParameters(factories.source);
   const closedSource=lowerClosedMessageObjects(messageSource);
-  const result=emitNative(closedSource,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures});
+  const rebound=lowerReboundHostGlobals(closedSource);
+  const result=emitNative(rebound.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
   libraries.transformations.push(...factories.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
@@ -511,7 +512,7 @@ function lowerDirectPlatformForwarders(source){
  for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
  return {source:output,transformations:edits.map(({api})=>({kind:'direct-platform-value-forwarder',api}))};
 }
-function emitNative(source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures}){
+function emitNative(source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures,hostRebinds=[]}){
  const compressionFallback=lowerCompressionFallbacks(source);
  source=compressionFallback.source;
  libraries.transformations.push(...compressionFallback.transformations);
@@ -539,7 +540,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
  const shapeHostValues=new WeakSet();
  const hostResponseBindings=new WeakSet();
- let hostRequestSnapshot=null,hostRequestInitializers=[];
+ const closedHostResponseSnapshotBindings=new WeakSet();
+ let hostRequestSnapshot=null,hostRequestInitializers=[],hostResponseSnapshot=null,hostResponseInitializers=[];
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
  const argumentObject=options.argument_object&&nodes.some(n=>free(n,'$argument'))?fresh('scriptArgument'):null;
@@ -1173,7 +1175,20 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
   }
   n=resolve(n);if(n?.type!=='ObjectExpression')fail(n??tree,label+' 必须是可静态追溯的对象');
-  const fields=new Map();for(const p of n.properties){if(p.type!=='Property'||p.kind!=='init'||p.computed&&key(p)===undefined)fail(p,label+' 含动态字段或展开，无法证明可原生转换');fields.set(String(key(p)),p.value);}return fields;
+  const fields=new Map();
+  for(const p of n.properties){
+   if(p.type==='SpreadElement'){
+    const binding=p.argument.type==='Identifier'&&bindings.get(p.argument);
+    if(binding&&closedHostResponseSnapshotBindings.has(binding)){
+     for(const [k,v] of shape(p.argument))fields.set(k,v);
+     continue;
+    }
+    fail(p,label+' 含动态字段或展开，无法证明可原生转换');
+   }
+   if(p.type!=='Property'||p.kind!=='init'||p.computed&&key(p)===undefined)fail(p,label+' 含动态字段或展开，无法证明可原生转换');
+   fields.set(String(key(p)),p.value);
+  }
+  return fields;
  }
  function promiseValue(n,seen=new Set()){
   if(!n||seen.has(n))return false;seen.add(n);
@@ -1304,6 +1319,56 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return false;
  }
+ // 静态表中所有候选函数都没有返回值时，动态键调用只可能得到 undefined。
+ // 这里仅接受不可改写的局部字面量表；任何写入、删除、逃逸或未知候选都拒绝。
+ function noValueFunction(fn){
+  if(!functions.has(fn?.type)||fn.async||fn.generator)return false;
+  return nodes.filter(statement=>statement.type==='ReturnStatement'&&owners.get(statement)===fn)
+   .every(statement=>!statement.argument||statement.argument.type==='UnaryExpression'&&statement.argument.operator==='void');
+ }
+ function closedNoValueTableCall(binding){
+  if(!binding||binding.writes.length||binding.init?.type!=='MemberExpression'||property(binding.init)!==undefined)return false;
+  const tableName=binding.init.object,table=resolve(tableName);
+  if(!tableName||table.type!=='ObjectExpression'||!table.properties.length)return false;
+  if(tableName.type==='Identifier'){
+   const owner=bindings.get(tableName);
+   if(!owner||owner.writes.length||!owner.refs.length)return false;
+   const readable=owner.refs.every(ref=>{
+    const member=parents.get(ref),use=parents.get(member);
+    return member?.type==='MemberExpression'&&member.object===ref&&(property(member)!==undefined||member===binding.init)&&
+     !(use?.type==='AssignmentExpression'&&use.left===member)&&use?.type!=='UpdateExpression'&&
+     !(use?.type==='UnaryExpression'&&use.operator==='delete')&&!(use?.type==='CallExpression'&&use.callee===member);
+   });
+   if(!readable)return false;
+  }
+  const result=table.properties.every(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)!==undefined&&entry.value.type!=='SpreadElement'&&noValueFunction(target(entry.value)));
+  return result;
+ }
+ function knownUndefined(n,seen=new Set()){
+  if(!n||seen.has(n))return false;seen.add(n);
+  if(n.type==='UnaryExpression'&&n.operator==='void')return true;
+  if(n.type==='Identifier'){
+   const binding=bindings.get(n);
+   return !!binding&&!binding.writes.length&&knownUndefined(binding.init,seen);
+  }
+  if(n.type==='CallExpression'){
+   if(n.callee.type==='Identifier'&&closedNoValueTableCall(bindings.get(n.callee)))return true;
+   return noValueFunction(target(n.callee));
+  }
+  return false;
+ }
+ function knownBoolean(n){
+  if(!n)return null;
+  if(n.type==='Literal')return !!n.value;
+  if(knownUndefined(n))return false;
+  if(n.type==='UnaryExpression'&&n.operator==='!'){const value=knownBoolean(n.argument);return value===null?null:!value;}
+  if(n.type==='LogicalExpression'&&n.operator==='&&'){
+   const left=knownBoolean(n.left);
+   if(left===false)return false;
+   if(left===true)return knownBoolean(n.right);
+  }
+  return null;
+ }
  function typeGuarded(n,type){
   const binding=bindings.get(n);
   if(!binding)return false;
@@ -1352,6 +1417,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  }
  function closedShapeFlow(binding,seen=new Set()){
   if(!binding||seen.has(binding))return false;
+  // 宿主响应参数已在调用边界被证明只按固定字段读取、展开或返回；快照替换后
+  // 它已是本地纯数据记录，无需再要求其内部成员继续流向未知代码。
+  if(closedHostResponseSnapshotBindings.has(binding))return true;
   const next=new Set(seen).add(binding);
   return binding.refs.every(ref=>{
    const p=parents.get(ref);
@@ -1395,7 +1463,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(free(n,'$response')){
    shapeHostValues.add(n);
    const fields=new Map([['status',n],['headers',n],['body',n]]);
-   fields.hostResponse=true;
+   // 重绑快照已把宿主响应替换为本地纯数据，完成投影应读取 helper 返回的
+   // 本地正文；没有快照时仍按宿主实时载荷读取。
+   fields.hostResponse=!hostResponseSnapshot;
    return fields;
   }
   if(free(n,'$request')){
@@ -1419,6 +1489,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='ObjectExpression')return object(n,'完成结果');
   if(n.type==='ConditionalExpression'){
+   const known=knownBoolean(n.test);
+   if(known===true)return shape(n.consequent,new Set(seen));
+   if(known===false)return shape(n.alternate,new Set(seen));
    const fields=new Map();
    const consequent=shape(n.consequent,new Set(seen)),alternate=shape(n.alternate,new Set(seen));
    mergeShape(fields,consequent,seen);mergeShape(fields,alternate,seen);
@@ -1472,8 +1545,59 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const fields=b.init?shape(b.init,new Set(seen)):new Map();
     if(!b.init){
      const definite=w=>{
+      const writeStatement=parents.get(w);
+      // 含 await/yield 的写入可能挂起；之后创建的闭包仍可能先于赋值完成运行，
+      // 不能据此认定读取一定看到新值。
+      const pending=node=>!!node&&(['AwaitExpression','YieldExpression'].includes(node.type)||children(node).some(pending));
+      const pendingWrite=pending(w.right);
+      // 写入语句本身必须无条件执行；若被条件、循环或异常边界包围，闭包内读取
+      // 可能看到未初始化值，仍按可空处理。
+      let unconditional=true;
+      for(let node=writeStatement;node&&node!==owners.get(writeStatement);node=parents.get(node)){
+       const parent=parents.get(node);
+       if(['IfStatement','ConditionalExpression','LogicalExpression','WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchStatement','TryStatement'].includes(parent?.type)){unconditional=false;break;}
+      }
+      // 读取位于写入语句之后创建的闭包中时，闭包分配必然晚于写入语句；提升
+      // 函数声明仍可能提前运行，因此不在此放宽。
+      if(!pendingWrite&&unconditional&&n.start>=writeStatement?.end){
+       let owner=owners.get(n);
+       while(owner&&owner!==owners.get(writeStatement)&&owner!==tree){
+        if(!functions.has(owner.type)||owner.type==='FunctionDeclaration'||owner.start<writeStatement.end)break;
+        owner=owners.get(parents.get(owner));
+       }
+       if(owner===tree||owner===owners.get(writeStatement))return true;
+      }
       let node=w;
       for(let parent=parents.get(node);parent&&!functions.has(parent.type);node=parent,parent=parents.get(node)){
+      // 写入语句在文本上先于读取，且读取位于其后创建的闭包或后续语句时，
+      // 该写入支配读取；这覆盖先声明局部结果、再在完成回调中读取的形态。
+      const after=!pendingWrite&&writeStatement&&initializedAfter(ix,writeStatement,n);
+      if(after)return true;
+      if(pendingWrite){
+       // 含 await 的写入只有在承载它的异步函数立即调用、且该调用本身在读取前
+       // 被 await 时，才能确定读取发生在赋值完成之后。
+       const fn=owners.get(w),call=fn&&parents.get(fn),awaited=call&&parents.get(call);
+       if(functions.has(fn?.type)&&call?.type==='CallExpression'&&call.callee===fn&&awaited?.type==='AwaitExpression'&&awaited.argument===call){
+        let boundary=awaited;
+        while(boundary&&!['ExpressionStatement','VariableDeclaration'].includes(boundary.type))boundary=parents.get(boundary);
+        if(boundary&&initializedAfter(ix,boundary,n))return true;
+       }
+       // Promise.finally/then 回调只在承载异步写入的立即调用 Promise 结算后
+       // 运行；读取位于该回调内时同样满足写入完成。catch 可继续链路，但其
+       // 回调本身可能在赋值前运行，不能作为完成证明。
+       let chained=call;
+       while(functions.has(fn?.type)&&call?.type==='CallExpression'&&call.callee===fn){
+        const member=parents.get(chained);
+        if(member?.type!=='MemberExpression'||member.object!==chained)break;
+        const method=property(member),next=parents.get(member);
+        if(!['then','catch','finally'].includes(method)||next?.type!=='CallExpression'||next.callee!==member)break;
+        if(method!=='catch'){
+         const callback=next.arguments[0],callbackFn=callback&&(functions.has(callback.type)?callback:target(callback));
+         if(functions.has(callbackFn?.type)&&n.start>=callbackFn.start&&n.end<=callbackFn.end)return true;
+        }
+        chained=next;
+       }
+      }
       // 逗号表达式按从左到右求值；位于读取点之前的赋值必然先执行。
       if(parent.type==='SequenceExpression')continue;
       // 同一 return 表达式中的前序赋值也必然早于返回值读取。
@@ -1512,7 +1636,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(fields.nullable){
      const truthy=truthyGuarded(n)||completionTruthyGuard(n,b);
      const objectGuard=typeGuarded(n,'object');
-     if(!truthy&&!(objectGuard&&fields.undefinedOnly))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     if(!truthy&&!(objectGuard&&fields.undefinedOnly)){
+      fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     }
      fields.nullable=false;fields.undefinedOnly=false;
     }
     const closed=closedShapeFlow(b);
@@ -1548,7 +1674,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(b.init){
     const fields=shape(b.init,seen);
     if(fields.nullable){
-     if(!truthyGuarded(n)&&!completionTruthyGuard(n,b))fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     if(!truthyGuarded(n)&&!completionTruthyGuard(n,b)){
+      fail(n,'完成结果可能为空，无法证明完成调用位于同一真值分支');
+     }
      fields.nullable=false;
     }
     const closed=closedShapeFlow(b);
@@ -3331,6 +3459,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='Identifier'&&free(n)){
    if(n.name==='$request'&&hostRequestSnapshot)return hostRequestSnapshot;
+   if(n.name==='$response'&&hostResponseSnapshot)return hostResponseSnapshot;
    if(guardedImplicit.has(n.name)){
     const p=parents.get(n);
     if(p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UnaryExpression'&&p.operator==='typeof')return n.name;
@@ -3361,6 +3490,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(hostRequestSnapshot&&free(o,'$request')){
     if(k===undefined)fail(n,'宿主请求字段必须是静态成员');
     return hostRequestSnapshot+'['+JSON.stringify(k)+']';
+   }
+   if(hostResponseSnapshot&&free(o,'$response')){
+    if(k===undefined)fail(n,'宿主响应字段必须是静态成员');
+    return hostResponseSnapshot+'['+JSON.stringify(k)+']';
    }
    if(o.type==='MemberExpression'&&free(o.object,'$network')&&['v4','v6'].includes(property(o))){const fields={primaryAddress:'address',primaryInterface:'interface',primaryRouter:'gateway'};if(!fields[k])fail(n,'未知网络地址字段');return `${context}.device.${property(o)==='v4'?'ipv4':'ipv6'}.${fields[k]}`;}
    if(free(o,'$httpClient')){
@@ -3569,6 +3702,43 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  // 宿主请求只有经过闭合 helper 的静态字段读写时，才降为一次本地快照。快照
  // 保留字段值而不把可变宿主对象交给业务代码；helper 不得复制、转发或返回
  // 该对象，返回值被忽略方可接受，字段写入只允许静态普通赋值。
+ const responseSnapshotFields=new Set(['status','statusCode','headers','body','bodyBytes','ok','statusText']);
+ const snapshotStringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr','split','includes','startsWith','endsWith','match','matchAll','search','indexOf','lastIndexOf','slice']);
+ // 直接内联 helper 的宿主参数只在已证明的静态字段上使用；快照在调用边界
+ // 建立，后续包装记录与返回值只携带本地数据，不再保留宿主对象身份。
+ const inlineHostSnapshotProof=(binding,directFields,{allowedWrites=null,allowDone=false}={})=>{
+  if(!binding)return false;
+  for(const ref of binding.refs){
+   const p=parents.get(ref),q=parents.get(p),other=p?.left===ref?p.right:p?.right===ref?p.left:null;
+   if(p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator))continue;
+   if(p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')))continue;
+   if(p?.type==='LogicalExpression'&&p.left===ref||['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(p?.type)&&p.test===ref)continue;
+   if(p?.type==='MemberExpression'&&p.object===ref){
+    const field=property(p);if(field===undefined||!directFields.has(String(field)))return false;
+    if(q?.type==='MemberExpression'&&q.object===p){
+     const nested=property(q);
+     if(String(field)==='headers'){
+      if(nested===undefined||parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)return false;
+      continue;
+     }
+     if(['url','method'].includes(String(field))&&nested!==undefined&&snapshotStringMethods.has(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)continue;
+     return false;
+    }
+    if(q?.type==='CallExpression'&&q.callee===p)return false;
+    if(q?.type==='UpdateExpression')return false;
+    if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p)return false;
+    if(q?.type==='AssignmentExpression'&&q.left===p&&(q.operator!=='='||allowedWrites&&!allowedWrites.has(String(field))))return false;
+    continue;
+   }
+   if(p?.type==='Property'&&p.value===ref&&!p.computed&&key(p)!==undefined)continue;
+   if(p?.type==='SpreadElement'&&p.argument===ref)continue;
+   if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref)continue;
+   if(p?.type==='ReturnStatement'&&p.argument===ref||p?.type==='ArrowFunctionExpression'&&p.body===ref)continue;
+   if(allowDone&&p?.type==='CallExpression'&&(isDone(p)||target(p.callee)&&complete.has(target(p.callee))))continue;
+   return false;
+  }
+  return true;
+ };
  const proveHostRequestSnapshot=()=>{
   const stop=()=>null;
   const astChildren=value=>Array.isArray(value)?value.filter(item=>item&&typeof item==='object'&&typeof item.type==='string'):value&&typeof value==='object'&&typeof value.type==='string'?[value]:[];
@@ -3745,8 +3915,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)&&!p.arguments.some(a=>a.type==='SpreadElement')){
     const fn=target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params[position];
     if(!functions.has(fn?.type)||!parameter)return stop('whole target:'+(fn?.type??'unknown')+'/'+(p.callee?.type??'unknown'));
-    const proof=parameterProof(bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter));
-    if(!proof||proof.returnsRequest&&!ignored(p)&&(proof.directReturn||!proof.returnedFields.size))return stop('whole proof');
+    const parameterBinding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+    const proof=parameterProof(parameterBinding);
+    if(!proof){
+     if(functions.has(p.callee.type)&&inlineHostSnapshotProof(parameterBinding,directFields)){for(const field of directFields)reads.add(field);whole.push(ref);continue;}
+     return stop('whole proof');
+    }
+    if(proof.returnsRequest&&!ignored(p)&&(proof.directReturn||!proof.returnedFields.size))return stop('whole proof');
     for(const field of proof.read)reads.add(field);
     for(const field of proof.write)if(reads.has(field))reads.add(field);
     whole.push(ref);continue;
@@ -3757,10 +3932,40 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return reads;
  };
  const hostRequestReads=proveHostRequestSnapshot();
+ const proveHostResponseSnapshot=()=>{
+  const reboundNames=new Set(hostRebinds.filter(rebind=>rebind.kind==='$response').map(rebind=>rebind.name));
+  if(!reboundNames.size)return null;
+  const refs=[],closed=[];
+  for(const assignment of nodes.filter(node=>node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'&&reboundNames.has(node.left.name))){
+   const awaited=assignment.right.type==='AwaitExpression'?assignment.right.argument:assignment.right;
+   if(awaited.type!=='CallExpression'||awaited.arguments.some(argument=>argument.type==='SpreadElement'))return null;
+   const passed=awaited.arguments.filter(argument=>argument.type==='Identifier'&&free(argument,'$response'));
+   if(passed.length!==1)return null;
+   const fn=target(awaited.callee),position=awaited.arguments.indexOf(passed[0]),parameter=fn?.params[position];
+   if(!functions.has(awaited.callee.type)||!parameter)fail(passed[0],'宿主响应重绑目标无法证明只访问固定字段');
+   const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+   if(!inlineHostSnapshotProof(binding,responseSnapshotFields,{allowedWrites:new Set(['body','status'])}))fail(passed[0],'宿主响应重绑后含未闭合字段或调用');
+   refs.push(passed[0]);closed.push(binding);
+  }
+  if(!refs.length)return null;
+  // 重绑之外的宿主读取仍可能观察实时对象；此类形态保留原有保守判据。
+  const expected=new Set(refs);
+  const unexpected=nodes.find(node=>node.type==='Identifier'&&free(node,'$response')&&!expected.has(node)&&!(parents.get(node)?.type==='ExpressionStatement'));
+  if(unexpected)fail(unexpected,'宿主响应重绑之外的实时读取无法与本地快照保持一致');
+  for(const binding of closed)closedHostResponseSnapshotBindings.add(binding);
+  return new Set(responseSnapshotFields);
+ };
+ const hostResponseReads=proveHostResponseSnapshot();
  if(hostRequestReads){
   hostRequestSnapshot=fresh('hostRequest');
   const headers=`(() => {const value = ${context}.request.headers;if (value && typeof value.entries === 'function') {const result = {};for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return {...(value ?? {})};})()`;
   hostRequestInitializers=[`const ${hostRequestSnapshot} = {${[...hostRequestReads].map(field=>field==='body'?`body: ${readBody('$request','body')}`:field==='bodyBytes'?`bodyBytes: ${readBody('$request','bodyBytes')}`:field==='headers'?`headers: ${headers}`:`${JSON.stringify(field)}: ${context}.request[${JSON.stringify(field)}]`).join(', ')}};`];
+ }
+ if(hostResponseReads){
+  hostResponseSnapshot=fresh('hostResponse');
+  const headers=`(() => {const value = ${context}.response?.headers;if (value && typeof value.entries === 'function') {const result = {};for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return {...(value ?? {})};})()`;
+  const raw=`${context}.response`;
+  hostResponseInitializers=[`const ${hostResponseSnapshot} = ${raw} == null ? null : {status: ${raw}.status, statusCode: ${raw}.status, headers: ${headers}, body: ${readBody('$response','body')}, bodyBytes: ${readBody('$response','bodyBytes')}, ok: /^2\\d\\d$/.test(String(${raw}.status)), statusText: ${raw}.statusText ?? ''};`];
  }
  // Only attribution/legal information joins the generated native usage header.
  // Code-local business comments remain in place for readable source layouts.
@@ -3781,6 +3986,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   else reads.push(`${declaration} ${a} = ${msg}?.body == null ? undefined : await ${msg}.text();`);
  }
  if(hostRequestSnapshot)reads.push(...hostRequestInitializers);
+ if(hostResponseSnapshot)reads.push(...hostResponseInitializers);
  const guard=options.enabled_env?`if (${context}.env._hub_enabled === 'false') return;\n`:'';
  // Egern scheduled scripts may finish by returning from the default function;
  // HTTP, response, and generic entries still need a proven completion value.

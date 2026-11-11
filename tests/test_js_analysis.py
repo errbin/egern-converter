@@ -167,7 +167,7 @@ import assert from 'node:assert/strict';
 import {parse} from './tools/js-analysis/core/syntax.mjs';
 import {methodContract} from './tools/js-analysis/platform/clients.mjs';
 import {libraryContracts,protectLibraries} from './tools/js-analysis/analysis/libraries.mjs';
-const source='const MESSAGE_TYPE = "protobuf-ts/unknown"; class Runtime { constructor(){} fromBinary(){} toBinary(){} internalBinaryRead(){} internalBinaryWrite(){} mergePartial(){} } $done({body:MESSAGE_TYPE});';
+const source='const MESSAGE_TYPE = "protobuf-ts/unknown"; class Runtime { constructor(){} fromBinary(){} toBinary(){} internalBinaryRead(){} internalBinaryWrite(){} mergePartial(){} } function local(){const MESSAGE_TYPE="nested";return MESSAGE_TYPE} $done({body:local()+MESSAGE_TYPE});';
 const tree=parse(source,{ecmaVersion:'latest'}),body=tree.body.slice(0,2);
 const contract=methodContract({type:'Program',sourceType:'script',start:body[0].start,end:body.at(-1).end,body});
 libraryContracts.set(contract,{name:'protobuf-ts fixture runtime',source:'https://example.test/library'});
@@ -176,8 +176,10 @@ assert.ok(marker);
 const formatted=library.source.replace(marker[0],`var ${marker[1]};\\nvar MESSAGE_TYPE;\\nvar Runtime;`);
 const restored=library.restore(formatted);
 parse(restored,{ecmaVersion:'latest',sourceType:'module'});
-assert.equal((restored.match(/(?:const|let|var)\\s+MESSAGE_TYPE\\b/g)||[]).length,1);
+assert.equal((restored.match(/(?:const|let|var)\\s+MESSAGE_TYPE\\b/g)||[]).length,2);
 assert.equal((restored.match(/class Runtime\\b/g)||[]).length,1);
+assert.match(restored,/const MESSAGE_TYPE="nested"/);
+assert.doesNotMatch(restored,/\\bvar\\s+(?:MESSAGE_TYPE|Runtime)\\b/);
 console.log(JSON.stringify({ok:true}));
 """
         result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
