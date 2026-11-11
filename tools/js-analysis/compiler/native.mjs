@@ -2850,6 +2850,25 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(parent?.type==='MemberExpression'&&parent.object===current){
     return ['status','statusCode','headers'].includes(property(parent));
    }
+   // 宿主响应可以先赋给局部别名，再只读取投影字段。别名必须是单次写入，
+   // 且所有引用都是静态字段读取；整体再传递或动态字段仍拒绝。
+   if(parent?.type==='AssignmentExpression'&&parent.operator==='='&&parent.right===current&&parent.left.type==='Identifier'){
+    const alias=bindings.get(parent.left);
+    return !!alias&&alias.writes.length===1&&alias.refs.length>0&&alias.refs.every(ref=>{
+     const use=parents.get(ref);
+     if(use===parent&&use.left===ref)return true;
+     const member=use?.type==='MemberExpression'&&use.object===ref?use:null;
+     const field=member?property(member):undefined;
+     if(field===undefined||!['status','statusCode','headers','body','bodyBytes'].includes(field))return false;
+     // 别名只能读取投影字段；写回、删除、更新或把字段当函数调用都会改变
+     // 宿主响应语义，必须继续拒绝。
+     const memberUse=parents.get(member);
+     if(memberUse?.type==='AssignmentExpression'&&memberUse.left===member)return false;
+     if(memberUse?.type==='UpdateExpression'||memberUse?.type==='UnaryExpression'&&memberUse.operator==='delete')return false;
+     if(memberUse?.type==='CallExpression'&&memberUse.callee===member)return false;
+     return true;
+    });
+   }
    if(parent?.type==='SequenceExpression'&&parent.expressions.includes(current)){
     if(parent.expressions.at(-1)!==current)return true;
     current=parent;continue;
