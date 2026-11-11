@@ -352,6 +352,32 @@ $done({body:JSON.stringify([text,pattern.source,String(big),result()===undefined
         result = compare(source,output,'qx','https://example.test/source.js',fixture)
         self.assertEqual(result['status'],'passed',result)
 
+    def test_qx_dynamic_request_omits_absent_timeout_and_keeps_explicit_values(self):
+        from tools.egern_hub.verify import compare
+        prefix = 'const request={url:"https://api.example"'
+        suffix = ';request.url+="?x=1";$task.fetch(request).then(r=>$done({body:r.body}));'
+        cases = [
+            ('absent', prefix + '}' + suffix, None),
+            ('literal', prefix + ',timeout:15000}' + suffix, 15000),
+            ('runtime write', prefix + '};request.timeout=15000;request.url+="?x=1";$task.fetch(request).then(r=>$done({body:r.body}));', 15000),
+        ]
+        for name, source, timeout in cases:
+            with self.subTest(name=name):
+                output = compile_source(source, source_format='qx')
+                if timeout is None:
+                    self.assertNotIn('timeout:', output)
+                else:
+                    self.assertIn('timeout:', output)
+                    observed = self.execute(source, source_format='qx', ast=True, http=[{'body':'ok'}])
+                    self.assertEqual(observed['requests'][0]['options']['timeout'], timeout)
+                fixture = {'name':name,'request':{'url':'https://example.test/'},
+                           'http':[{'status':200,'body':'ok'}], 'expected':{'result':{'body':'ok'}}}
+                result = compare(source, output, 'qx', 'https://example.test/source.js', fixture)
+                self.assertEqual(result['status'], 'passed', result)
+        # 非 QX 动态请求仍保留平台缺省 timeout，证明省略契约只作用于 QX。
+        callback = 'const request={url:"https://api.example"};request.url+="?x=1";$httpClient.get(request,(e,r,b)=>{if(e)throw Error(e);$done({body:b});});'
+        self.assertIn('timeout:5000', compile_source(callback, source_format='surge'))
+
     def test_unknown_flow_and_api_shapes_are_build_errors(self):
         sources = [
             'const finish=()=>{$done({})};[1].forEach(finish);$done({});',
