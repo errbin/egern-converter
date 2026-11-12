@@ -401,6 +401,115 @@ export function lowerReboundHostGlobals(source){
  return {source:prefix+renderTree(source,tree,n=>changes.has(n)?{direct:true,value:changes.get(n)}:null),rebindings};
 }
 
+// 旧脚本常在入口覆盖 `$done`，先保存原函数，再包一层只改字段的同步函数。
+// 只有当 QX 折叠已经把包装器压成“纯丢弃平台对象 + 一次原样委托”时，这层
+// 包装才是恒等函数：保存点唯一且不逃逸，参数不重绑、不保存、不传播，
+// 所有完成调用都保持一参契约。默认值 `{}` 由无参调用和显式 undefined
+// 调用改写补回；其它可能为 undefined 的实参形状继续拒绝。
+export function lowerClosedCompletionWrappers(source,format){
+ if(format!=='qx'||!source.includes('$done'))return {source,transformations:[]};
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return {source,transformations:[]};}
+ const {nodes,parents,bindings,free}=ix,replace=new WeakMap(),remove=new Set();
+ const doneRefs=nodes.filter(n=>n.type==='Identifier'&&free(n,'$done'));
+ const writes=doneRefs.filter(ref=>parents.get(ref)?.type==='AssignmentExpression'&&parents.get(ref).left===ref);
+ if(writes.length!==1)return {source,transformations:[]};
+ const write=writes[0],assignment=parents.get(write),wrapper=assignment.right;
+ const assignmentStatement=parents.get(assignment);
+ if(assignment.operator!=='='||assignmentStatement?.type!=='ExpressionStatement'||parents.get(assignmentStatement)!==tree)return {source,transformations:[]};
+ if(wrapper?.type!=='ArrowFunctionExpression'||wrapper.async||wrapper.generator||wrapper.params.length!==1)return {source,transformations:[]};
+ const parameter=wrapper.params[0],id=parameter.type==='AssignmentPattern'?parameter.left:parameter;
+ if(id.type!=='Identifier'||parameter.type==='AssignmentPattern'&&(parameter.right.type!=='ObjectExpression'||parameter.right.properties.length))return {source,transformations:[]};
+ const parameterBinding=bindings.get(id);
+ if(!parameterBinding||parameterBinding.writes.length||parameterBinding.refs.length!==1)return {source,transformations:[]};
+ // 保存原始完成函数的声明必须位于顶层、恰好一个声明符，且只被包装器
+ // 的委托调用读取。读取点同时决定包装器唯一返回路径的位置。
+ const snapshots=doneRefs.filter(ref=>{
+  const d=parents.get(ref);return ref!==write&&d?.type==='VariableDeclarator'&&d.init===ref;
+ });
+ if(snapshots.length!==1)return {source,transformations:[]};
+ const snapshot=snapshots[0],declarator=parents.get(snapshot),declaration=parents.get(declarator),snapshotBinding=bindings.get(declarator.id);
+ if(declarator.id.type!=='Identifier'||!snapshotBinding||snapshotBinding.writes.length||snapshotBinding.refs.length!==1)return {source,transformations:[]};
+ if(declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1||parents.get(declaration)!==tree||declaration.start>=assignmentStatement.start)return {source,transformations:[]};
+ // 除保存点和唯一重绑定外，剩余 `$done` 引用只能是直接调用；作为值保存、
+ // 传参、返回、typeof 探测或成员接收者都会改变消除后的语义，保持拒绝。
+ const calls=doneRefs.filter(ref=>{
+  const p=parents.get(ref);return ref!==write&&ref!==snapshot&&p?.type==='CallExpression'&&p.callee===ref;
+ }).map(ref=>parents.get(ref));
+ if(doneRefs.some(ref=>ref!==write&&ref!==snapshot&&!calls.includes(parents.get(ref))))return {source,transformations:[]};
+ const delegation=parents.get(snapshotBinding.refs[0]);
+ if(delegation?.type!=='CallExpression'||delegation.callee!==snapshotBinding.refs[0]||delegation.arguments.length!==1||delegation.arguments[0]!==parameterBinding.refs[0])return {source,transformations:[]};
+ if(wrapper.body.type!=='BlockStatement'||wrapper.body.body.length<1)return {source,transformations:[]};
+ const last=wrapper.body.body.at(-1);
+ if(last.type!=='ExpressionStatement'||last.expression!==delegation||parents.get(last)!==wrapper.body)return {source,transformations:[]};
+ // 包装器只允许在委托前读取并丢弃 QX 平台对象。读取本身无副作用，删除
+ // 不会改变完成结果；任何业务表达式、调用或字段访问仍需进一步证明。
+ for(const statement of wrapper.body.body.slice(0,-1))if(statement.type!=='ExpressionStatement'||statement.expression.type!=='Identifier'||!free(statement.expression,'$prefs'))return {source,transformations:[]};
+ const hasDefault=parameter.type==='AssignmentPattern';
+ const definitelyNotUndefined=n=>n?.type==='Literal'&&!n.regex||['ObjectExpression','ArrayExpression','FunctionExpression','ArrowFunctionExpression','ClassExpression','NewExpression','TemplateLiteral'].includes(n?.type)||n?.type==='UnaryExpression'&&['!','typeof','+','-','~'].includes(n.operator)||n?.type==='BinaryExpression'||n?.type==='SequenceExpression'&&definitelyNotUndefined(n.expressions.at(-1));
+ for(const call of calls){
+  if(call.optional||call.arguments.length>1||call.arguments.some(argument=>argument.type==='SpreadElement'))return {source,transformations:[]};
+  const argument=call.arguments[0];
+  if(!hasDefault)continue;
+  if(!argument){replace.set(call,`$done({})`);continue;}
+  const undefinedArgument=free(argument,'undefined')||argument.type==='UnaryExpression'&&argument.operator==='void'&&argument.argument.type==='Literal';
+  if(undefinedArgument){replace.set(call,`$done({})`);continue;}
+  if(!definitelyNotUndefined(argument))return {source,transformations:[]};
+ }
+ remove.add(declaration);remove.add(assignmentStatement);
+ const output=renderTree(source,tree,n=>remove.has(n)?{direct:true,value:''}:replace.has(n)?{direct:true,value:replace.get(n)}:null);
+ return {source:output,transformations:[{kind:'closed-completion-wrapper',line:source.slice(0,assignment.start).split('\n').length,reason:'QX 折叠后包装器只丢弃平台对象并原样委托唯一完成快照'}]};
+}
+
+// QX 兼容层常把 `$prefs` / `$persistentStore` 的选择封装成局部 store 门面。
+// 只有门面对象是顶层唯一声明、没有别名或写入，且每个引用都是 `get(key)` /
+// `set(value,key)` 直接调用时，才能把请求参数按原顺序投影到 QX 存储方法。
+// 这样不需要把平台对象本身作为值传出，也不会遗漏动态成员或方法别名。
+export function lowerClosedStorageFacades(source,format){
+ if(format!=='qx'||!source.includes('$prefs'))return {source,transformations:[]};
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return {source,transformations:[]};}
+ const {nodes,parents,bindings,free}=ix,replace=new WeakMap(),remove=new Set();
+ const storageMember=(node,name)=>{
+  if(node?.type!=='ChainExpression')return node?.type==='MemberExpression'&&free(node.object,'$prefs')&&property(node)===name?node:null;
+  const member=node.expression;
+  return member?.type==='MemberExpression'&&member.optional&&free(member.object,'$prefs')&&property(member)===name?member:null;
+ };
+ const selector=(node,memberName,persistentName)=>node?.type==='LogicalExpression'&&node.operator==='??'&&storageMember(node.left,memberName)&&node.right?.type==='MemberExpression'&&free(node.right.object,'$persistentStore')&&property(node.right)===persistentName;
+ const propertyValue=(object,name)=>object.properties.filter(p=>p.type==='Property'&&!p.computed&&p.kind==='init'&&(p.key.name??p.key.value)===name);
+ for(const statement of tree.body){
+  if(statement.type!=='VariableDeclaration'||statement.kind!=='const'||statement.declarations.length!==1)continue;
+  const declarator=statement.declarations[0],binding=declarator.id.type==='Identifier'?bindings.get(declarator.id):null,object=declarator.init;
+  if(!binding||binding.writes.length||object?.type!=='ObjectExpression')continue;
+  const get=propertyValue(object,'get'),set=propertyValue(object,'set');
+  if(get.length!==1||set.length!==1||object.properties.length!==2||set[0].value.type!=='ArrowFunctionExpression')continue;
+  if(!selector(get[0].value,'valueForKey','read'))continue;
+  const setter=set[0].value;
+  if(setter.async||setter.generator||setter.params.length!==2||setter.params.some(param=>param.type!=='Identifier')||setter.body.type!=='CallExpression'||setter.body.arguments.length!==2||!selector(setter.body.callee,'setValueForKey','write'))continue;
+  const sameParameter=(argument,parameter)=>argument?.type==='Identifier'&&parameter?.type==='Identifier'&&bindings.get(argument)===bindings.get(parameter);
+  if(!sameParameter(setter.body.arguments[0],setter.params[1])||!sameParameter(setter.body.arguments[1],setter.params[0]))continue;
+  const calls=[];
+  if(!binding.refs.length||binding.refs.some(ref=>{
+   const member=parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref||member.computed||!['get','set'].includes(property(member)))return true;
+   const call=parents.get(member);
+   if(call?.type!=='CallExpression'||call.callee!==member||call.optional||call.arguments.some(argument=>argument.type==='SpreadElement'))return true;
+   if(property(member)==='get'&&call.arguments.length!==1||property(member)==='set'&&call.arguments.length!==2)return true;
+   calls.push({call,kind:property(member)});return false;
+  }))continue;
+  for(const {call,kind} of calls){
+   const args=call.arguments.map(argument=>source.slice(argument.start,argument.end));
+   // 门面 setter 已证明把调用参数 `(key,value)` 转成存储 API 的
+   // `(value,key)`；改写时必须保持同一顺序，不能直接照搬实参列表。
+   replace.set(call,kind==='get'?`$prefs.valueForKey(${args[0]})`:`$prefs.setValueForKey(${args[1]}, ${args[0]})`);
+  }
+  remove.add(statement);
+  const output=renderTree(source,tree,n=>remove.has(n)?{direct:true,value:''}:replace.has(n)?{direct:true,value:replace.get(n)}:null);
+  return {source:output,transformations:[{kind:'closed-storage-facade',line:source.slice(0,statement.start).split('\n').length,reason:'存储门面只被闭合的 get/set 调用消费'}]};
+ }
+ return {source,transformations:[]};
+}
+
 // A closed callback helper can have different completion contracts at different
 // call sites. Clone its declaration, not its arguments: evaluation, closures and
 // defaults still belong to the original calls. No callback runtime is injected.

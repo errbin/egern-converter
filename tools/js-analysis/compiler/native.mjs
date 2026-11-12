@@ -6,7 +6,7 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
@@ -119,8 +119,10 @@ function compile(original,format,options,libraries){
   const messageSource=lowerMessageParameters(factories.source);
   const closedSource=lowerClosedMessageObjects(messageSource);
   const rebound=lowerReboundHostGlobals(closedSource);
-  const result=emitNative(rebound.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
-  libraries.transformations.push(...factories.transformations);return result;
+  const wrapped=lowerClosedCompletionWrappers(rebound.source,format);
+  const storage=lowerClosedStorageFacades(wrapped.source,format);
+  const result=emitNative(storage.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
+  libraries.transformations.push(...factories.transformations,...wrapped.transformations,...storage.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
  // been lowered. Expanding the earlier class input misses newly exposed calls.
@@ -1952,7 +1954,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const statements=[`const ${resultName} = {};`,`const ${urlName} = ${optionsName}?.url ?? ${optionsName}?.openUrl ?? ${optionsName}?.["open-url"];`,`if (${optionsName}?.action === "clipboard") { if (${optionsName}?.text !== undefined) ${resultName}.action = {type: "clipboard", text: ${optionsName}.text}; } else if (${urlName} !== undefined) ${resultName}.action = {type: "openUrl", url: ${urlName}};`,`const ${mediaUrlName} = ${optionsName}?.["media-url"] ?? ${optionsName}?.mediaUrl;`,`if (${mediaUrlName} !== undefined) ${resultName}.attachment = {url: ${mediaUrlName}}; else { const ${base64Name} = ${optionsName}?.["media-base64"]; if (${base64Name} !== undefined) { const ${mimeName} = ${optionsName}?.["media-base64-mime"]; if (${mimeName} === undefined) throw new Error("Base64 notification attachment requires MIME type"); ${resultName}.attachment = {base64: ${base64Name}, mimeType: ${mimeName}}; } }`,`const ${dismissName} = ${optionsName}?.["auto-dismiss"];`,`if (${dismissName} !== undefined) { if (${dismissName} === true) ${resultName}.duration = 10; else if (${dismissName} !== false) { if (typeof ${dismissName} !== "number" || !Number.isFinite(${dismissName}) || ${dismissName} < 0) throw new TypeError("Notification auto-dismiss must be boolean or non-negative seconds"); ${resultName}.duration = ${dismissName}; } }`,`if (${optionsName}?.sound !== undefined) { if (typeof ${optionsName}.sound !== "boolean") throw new TypeError("Notification sound must be boolean"); ${resultName}.sound = ${optionsName}.sound; }`,`return ${resultName};`];
      out.push(`...(((${optionsName}) => {${statements.join(' ')}})(${argument(3)}))`);
     }else{
-    const urls=['url','openUrl','open-url'].filter(k=>f.has(k));if(urls.length>1)fail(a[3],'通知 URL 字段冲突');
+    const urls=['url','openUrl','open-url'].filter(k=>f.has(k));
+    // 多平台脚本会同时写 QX 的 open-url 和通用 url。只有所有字段都是同一个
+    // 静态字面量时，选中任意一个才不影响通知目标；其它组合仍是冲突。
+    if(urls.length>1){
+     const first=resolve(f.get(urls[0]));
+     if(!(first?.type==='Literal'&&typeof first.value==='string'&&urls.every(k=>{const v=resolve(f.get(k));return v?.type==='Literal'&&v.value===first.value;})))fail(a[3],'通知 URL 字段冲突');
+    }
     const url=urls.length?f.get(urls[0]):null,clip=f.get('update-pasteboard')??(resolve(f.get('action'))?.value==='clipboard'?f.get('text'):null);
     if(url&&clip)fail(a[3],'通知操作冲突');
     if(url)add(urls[0],`action: {type: 'openUrl', url: ${value(urls[0])}}`);else if(clip){if(mutable)fail(a[3],'可变剪贴板通知参数尚无确定的操作分支');const k=f.has('update-pasteboard')?'update-pasteboard':'text';add(k,`action: {type: 'clipboard', text: ${value(k)}}`);}else if(f.has('action')||f.has('text'))fail(a[3],'通知操作不完整');
