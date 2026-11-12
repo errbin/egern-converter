@@ -2163,6 +2163,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      let calls;
      if(fnParent?.type==='MethodDefinition')calls=closedMethodCalls(fnParent);
      else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[fnParent];
+     else if(fnParent?.type==='Property'&&fnParent.value===fn&&!fnParent.computed&&key(fnParent)!==undefined)calls=replyCallers(fn);
      else{
       if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
       calls=[];
@@ -2193,11 +2194,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       const source=bindings.get(node);
       if(!source||source.writes.length||seen.has(source))return null;
       if(!source.init){
-       // 参数默认值只有在每个调用点都省略该实参时才会生效；此时字段集合
-       // 由默认对象本身稳定决定，混入任一显式实参即拒绝。
-       const site=parameterCallSites(source),formal=site?.fn.params[site.position];
-       if(!site||formal?.type!=='AssignmentPattern'||site.calls.some(call=>call.arguments.length>site.position&&!free(call.arguments[site.position],'undefined')))return null;
-       return recordFields(formal.right,new Set(seen).add(source),null,boundary);
+       // 局部函数的参数只有在所有调用点都能闭合到静态记录时，字段集合才
+       // 能由实参共同证明。默认值仍按原规则只接受全部省略的调用点。
+       const site=parameterCallSites(source);if(!site)return null;
+       const all=new Set();
+       for(const call of site.calls){
+        let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+        if(!actual||free(actual,'undefined'))actual=formal?.type==='AssignmentPattern'?formal.right:null;
+        if(!actual)return null;
+        const values=recordFields(actual,new Set(seen).add(source),null,call);
+        if(!values)return null;for(const name of values)all.add(name);
+       }
+       return all;
       }
       const result=recordFields(source.init,new Set(seen).add(source),null,boundary);
       if(!result||!boundary)return result;
@@ -3410,13 +3418,189 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
  }
  function replyPrelude(info,name){const out=[];if(info.bytes)out.push(`const ${info.bytes} = await ${name}.arrayBuffer();`);if(info.body)out.push(`const ${info.body} = ${info.bytes?`new TextDecoder().decode(${info.bytes})`:`await ${name}.text()`};`);return out.join('\n');}
+ // Promise 执行器把宿主响应整体交给 resolver 时，响应对象会穿过局部工厂和
+ // 对象方法。只有整条 Promise 消费链都能闭合到固定字段时，才在 resolver
+ // 调用处生成纯数据快照；否则继续按未知整体传递拒绝。
+ const closedShellCache=new WeakMap();
+ function staticObjectShell(n,seen=new Set()){
+  if(!n||seen.has(n))return null;
+  if(n.type==='Identifier'){
+   const b=bindings.get(n);if(!b||b.writes.length)return null;
+   seen=new Set(seen);seen.add(b);return b.init?staticObjectShell(b.init,seen):null;
+  }
+  if(n.type==='SequenceExpression')return staticObjectShell(n.expressions.at(-1),seen);
+  if(n.type==='ObjectExpression'){
+   const keys=n.properties.map(p=>p.type==='Property'&&p.kind==='init'?key(p):undefined);
+   if(keys.some(k=>k===undefined||k==='__proto__')||new Set(keys).size!==keys.length)return null;
+   return n;
+  }
+  if(n.type==='NewExpression'){const returned=factoryReturnObject(n);return returned?staticObjectShell(returned,seen):null;}
+  if(n.type==='MemberExpression'&&property(n)!==undefined){
+   const object=staticObjectShell(n.object,seen);if(!object)return null;
+   const entry=object.properties.find(p=>p.type==='Property'&&p.kind==='init'&&key(p)===String(property(n)));
+   return entry?staticObjectShell(entry.value,seen):null;
+  }
+  return null;
+ }
+ function closedObjectShell(object){
+  if(!object)return false;
+  if(closedShellCache.has(object))return closedShellCache.get(object);
+  closedShellCache.set(object,false);
+  const closed=!nodes.some(n=>{
+   const left=n.type==='AssignmentExpression'&&n.left.type==='MemberExpression'?n.left:
+    n.type==='UpdateExpression'&&n.argument.type==='MemberExpression'?n.argument:
+    n.type==='UnaryExpression'&&n.operator==='delete'&&n.argument.type==='MemberExpression'?n.argument:null;
+   if(!left)return false;
+   return staticObjectShell(left.object)===object;
+  });
+  closedShellCache.set(object,closed);return closed;
+ }
+ function staticFunctionValue(n,seen=new Set()){
+  if(functions.has(n?.type))return n;
+  if(n?.type==='Identifier'){
+   const b=bindings.get(n);if(!b||b.writes.length||seen.has(b))return null;
+   seen=new Set(seen);seen.add(b);return b.fn??(b.init?staticFunctionValue(b.init,seen):null);
+  }
+  if(n?.type==='MemberExpression'&&property(n)!==undefined){
+   const object=staticObjectShell(n.object,seen);if(!object)return null;
+   const entry=object.properties.find(p=>p.type==='Property'&&p.kind==='init'&&key(p)===String(property(n)));
+   return entry?staticFunctionValue(entry.value,seen):null;
+  }
+  return null;
+ }
+ function replyCallers(fn){
+  const calls=new Set(nodes.filter(call=>call.type==='CallExpression'&&target(call.callee)===fn));
+  const propertyNode=parents.get(fn);
+  if(propertyNode?.type==='Property'&&propertyNode.value===fn&&!propertyNode.computed&&key(propertyNode)!==undefined){
+   const object=parents.get(propertyNode),name=String(key(propertyNode));
+   if(object?.type==='ObjectExpression'&&closedObjectShell(object))for(const call of nodes){
+    if(call.type==='CallExpression'&&call.callee.type==='MemberExpression'&&!call.callee.optional&&property(call.callee)===name&&staticObjectShell(call.callee.object)===object)calls.add(call);
+   }
+  }
+  return [...calls];
+ }
+ function promiseRefContext(ref){
+  let current=ref,parent=parents.get(current);
+  while(parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===current){current=parent;parent=parents.get(current);}
+  while(parent?.type==='ChainExpression'&&parent.expression===current){current=parent;parent=parents.get(current);}
+  return [current,parent];
+ }
+ function tracePromiseResolved(awaitNode,fields,state,seen){
+  const parent=parents.get(awaitNode);
+  if(parent?.type==='VariableDeclarator'&&parent.init===awaitNode&&parent.id.type==='Identifier')return replyProjection(bindings.get(parent.id),fields,state,seen);
+  if(parent?.type==='AssignmentExpression'&&parent.right===awaitNode&&parent.left.type==='Identifier')return replyProjection(bindings.get(parent.left),fields,state,seen);
+  if(parent?.type==='ExpressionStatement')return true;
+  return false;
+ }
+ function tracePromiseFunction(fn,fields,state,seen){
+  if(!functions.has(fn?.type))return false;
+  const calls=replyCallers(fn);
+  return calls.length>0&&calls.every(call=>tracePromiseValue(call,fields,state,seen));
+ }
+ function tracePromiseBinding(binding,fields,state,seen){
+  if(!binding)return false;
+  for(const ref of binding.refs){
+   const [current,parent]=promiseRefContext(ref);
+   if(parent?.type==='AwaitExpression'&&parent.argument===current){if(!tracePromiseResolved(parent,fields,state,seen))return false;continue;}
+   if(parent?.type==='MemberExpression'&&parent.object===current){
+    const name=property(parent),call=parents.get(parent);
+    if(['then','catch','finally'].includes(name)&&call?.type==='CallExpression'&&call.callee===parent){
+     if(name==='then'&&call.arguments[0]){
+      const fn=target(call.arguments[0]);if(!fn?.params[0]||fn.params[0].type!=='Identifier')return false;
+      if(!replyProjection(bindings.get(fn.params[0]),fields,state,seen))return false;
+      if(state.write)return false;
+     }
+     continue;
+    }
+    return false;
+   }
+   if(parent?.type==='ReturnStatement'&&parent.argument===current){if(!tracePromiseFunction(owners.get(parent),fields,state,seen))return false;continue;}
+   if(parent?.type==='ArrowFunctionExpression'&&parent.body===current){if(!tracePromiseFunction(parent,fields,state,seen))return false;continue;}
+   if(parent?.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier'){if(!tracePromiseBinding(bindings.get(parent.id),fields,state,seen))return false;continue;}
+   if(parent?.type==='ExpressionStatement')continue;
+   return false;
+  }
+  return true;
+ }
+ function tracePromiseValue(expression,fields,state,seen=new Set()){
+  if(!expression||seen.has(expression))return true;
+  seen=new Set(seen);seen.add(expression);
+  const [current,parent]=promiseRefContext(expression);
+  if(parent?.type==='ArrowFunctionExpression'&&parent.body===current)return tracePromiseFunction(parent,fields,state,seen);
+  if(parent?.type==='ReturnStatement'&&parent.argument===current)return tracePromiseFunction(owners.get(parent),fields,state,seen);
+  if(parent?.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return tracePromiseBinding(bindings.get(parent.id),fields,state,seen);
+  if(parent?.type==='AssignmentExpression'&&parent.right===current&&parent.left.type==='Identifier')return tracePromiseBinding(bindings.get(parent.left),fields,state,seen);
+  if(parent?.type==='AwaitExpression'&&parent.argument===current)return tracePromiseResolved(parent,fields,state,seen);
+  if(parent?.type==='MemberExpression'&&parent.object===current){
+   const name=property(parent),call=parents.get(parent);
+   if(['then','catch','finally'].includes(name)&&call?.type==='CallExpression'&&call.callee===parent){
+    if(name==='then'&&call.arguments[0]){
+     const fn=target(call.arguments[0]);if(!fn?.params[0]||fn.params[0].type!=='Identifier')return false;
+     if(!replyProjection(bindings.get(fn.params[0]),fields,state,seen))return false;
+     if(state.write)return false;
+    }
+    return true;
+   }
+   return false;
+  }
+  if(parent?.type==='ExpressionStatement')return true;
+  return false;
+ }
+ function sameReplyMember(left,right){
+  return left?.type==='MemberExpression'&&right?.type==='MemberExpression'&&left.object.type==='Identifier'&&right.object.type==='Identifier'&&bindings.get(left.object)===bindings.get(right.object)&&property(left)!==undefined&&property(left)===property(right);
+ }
+ function forwardedReply(binding,fn){
+  if(!binding)return null;
+  const fields=new Set(),state={write:false,whole:false},resolvers=[];
+  for(const ref of binding.refs){
+   const [current,parent]=replyValueContext(ref);
+   if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
+   const other=parent?.left===current?parent.right:parent?.right===current?parent.left:null;
+   if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')))continue;
+   if(parent?.type==='LogicalExpression'&&parent.left===current||['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(parent?.type)&&parent.test===current||parent?.type==='UnaryExpression'&&parent.operator==='!')continue;
+   if(parent?.type==='MemberExpression'&&parent.object===current){
+    if(!replyFieldUse(current,fields,state))return null;
+    const use=parents.get(parent);
+    if(use?.type==='AssignmentExpression'&&use.left===parent&&!sameReplyMember(use.right,parent))fail(parent,'Promise 转发的 HTTP 响应字段写入无法证明为本地快照');
+    continue;
+   }
+   if(parent?.type==='CallExpression'&&parent.arguments.length===1&&parent.arguments[0]===current&&isPromiseResolver(parent.callee)){resolvers.push(parent);continue;}
+   return null;
+  }
+  if(!resolvers.length)return null;
+  const constructions=new Set();
+  for(const call of resolvers){
+   const resolver=bindings.get(call.callee);if(!resolver)return null;
+   const executor=nodes.find(candidate=>functions.has(candidate.type)&&bindings.get(candidate.params[0])===resolver);
+   const construction=executor&&parents.get(executor);
+   if(construction?.type!=='NewExpression'||!free(construction.callee,'Promise')||construction.arguments[0]!==executor)return null;
+   constructions.add(construction);
+  }
+  if(constructions.size!==1)return null;
+  const downstream={write:false,whole:false};
+  if(!tracePromiseValue([...constructions][0],fields,downstream,new Set()))return null;
+  if(downstream.write)return null;
+  const info={uses:fields,body:fields.has('body')?fresh('responseText'):null,bytes:fields.has('bodyBytes')||fields.has('body')?fresh('responseBytes'):null,snapshot:true,promiseForward:true,fn};
+  httpReplies.set(binding,info);if(info.body||info.bytes)asyncFns.add(fn);return info;
+ }
+ function forwardedHeaders(raw){return `Object.fromEntries([...${raw}.headers.entries()].map(([name, value]) => [name, ${raw}.headers.getAll(name).length > 1 ? ${raw}.headers.getAll(name) : value]))`;}
+ function forwardedSnapshot(info,raw){
+  const out=[];
+  for(const name of ['status','statusCode','headers','body','bodyBytes','ok','statusText'])if(info.uses.has(name)){
+   const value=name==='body'?info.body:name==='bodyBytes'?info.bytes:
+    name==='headers'?forwardedHeaders(raw):name==='status'?`${raw}.status`:
+    name==='statusCode'?`${raw}.status ?? ${raw}.statusCode`:name==='ok'?`${raw}.ok`:`${raw}.statusText`;
+   out.push(`${name}: ${value}`);
+  }
+  return `{${out.join(', ')}}`;
+ }
  // Register awaited QX replies and Promise callback parameters before rendering.
  for(const n of nodes){
   if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init?.type==='AwaitExpression'&&(isAPI(n.init.argument,'$task','fetch')||bundled&&n.init.argument.type==='CallExpression'&&n.init.argument.callee.type==='MemberExpression'&&n.init.argument.callee.object.type==='MemberExpression'&&free(n.init.argument.callee.object.object,'$native')&&property(n.init.argument.callee.object)==='http')){const b=bindings.get(n.id),info=reply(b,null,true);if(!info.snapshot)extraAfter.set(n,()=>replyPrelude(info,n.id.name));}
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='then'&&isAPI(n.callee.object,'$task','fetch')){
    const fn=target(n.arguments[0]);if(!fn)fail(n,'HTTP 响应处理函数必须可静态追溯');
    if(fn.params[0]&&fn.params[0].type!=='Identifier')fail(fn.params[0],'HTTP 响应参数必须是简单局部变量，不能保留旧响应解构');
-   if(fn.params[0])reply(bindings.get(fn.params[0]),fn,false);
+   if(fn.params[0]){const binding=bindings.get(fn.params[0]),forwarded=binding&&forwardedReply(binding,fn);if(!forwarded)reply(binding,fn,false);}
   }
   if(n.type==='CallExpression'&&clientMethod(n.callee)){
    const fn=target(n.arguments[1]),p=fn?.params[1];
@@ -3465,6 +3649,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.callee.name===device.deviceTypeToken&&!n.arguments.length)return `(${context}.env.EGH_DEVICE_TYPE || 'iPhone')`;
   if(n.type==='CallExpression'&&free(n.callee,'setTimeout')&&n.arguments.length===2&&n.arguments[0]?.type==='CallExpression'&&n.arguments[1].type==='Literal'&&typeof n.arguments[1].value==='number'&&target(n.arguments[0].callee)&&parents.get(n)?.type==='ExpressionStatement')return render(n.arguments[0]);
+  if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='Identifier'){
+   const info=httpReplies.get(bindings.get(n.left.object));
+   if(info?.promiseForward&&sameReplyMember(n.right,n.left))return property(n.left)==='bodyBytes'?info.bytes:info.body;
+  }
   if(n.type==='AssignmentExpression'&&n.operator==='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+n.left.name+' = ('+render(n.right)+'), '+guardedImplicit.get(n.left.name)+' = true, '+n.left.name+')';
   if(n.type==='AssignmentExpression'&&n.operator!=='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+guardedImplicit.get(n.left.name)+' ? ('+n.left.name+' '+n.operator+' ('+render(n.right)+')) : (() => {throw new '+(referenceError??'ReferenceError')+'('+JSON.stringify(n.left.name+' is not defined')+');})())';
   if(n.type==='Property'&&n.shorthand&&free(n.value)&&guardedImplicit.has(n.value.name))return n.value.name+': '+render(n.value);
@@ -3583,6 +3771,15 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(!['url','method','status','headers'].includes(k))fail(n,'未知请求 / 响应字段');
    }
    const info=o.type==='Identifier'?httpReplies.get(bindings.get(o)):null;
+   if(info?.promiseForward){
+    if(k==='body')return info.body;
+    if(k==='bodyBytes')return info.bytes;
+    if(k==='headers')return forwardedHeaders(render(o));
+    if(k==='status')return `${render(o)}.status`;
+    if(k==='statusCode')return `${render(o)}.status ?? ${render(o)}.statusCode`;
+    if(k==='ok')return `${render(o)}.ok`;
+    if(k==='statusText')return `${render(o)}.statusText`;
+   }
    if(info&&!info.snapshot){if(k==='body')return info.body;if(k==='bodyBytes')return info.bytes;if(k==='statusCode')return render(o)+'.status';if(k==='headers'&&info.full)return `Object.entries(${render(o)}.headers).flatMap(([field, value]) => (Array.isArray(value) ? value : [value]).map(value => ({field, value})))`;}
    if(free(o,'$script')){if(k==='name')return context+'.script.name';if(k==='binaryBodyMode')return String(!!options.binary);if(k==='startTime'){if(!started){started=fresh('scriptStarted');prefix.push(`const ${started} = Date.now();`);}return format==='loon'?started:`(${started} / 1000)`;}}
    if(free(o,'$environment'))return k==='language'?context+'.app.language':context+'.env';
@@ -3597,6 +3794,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const compression=compressionMethod(n.callee);
    if(compression){if(n.arguments.length!==1||n.arguments[0].type==='SpreadElement')fail(n,'压缩 API 必须接收一个二进制参数');return `(await ${context}.compress.${compression}(${bytes(n.arguments[0])}))`;}
    if(isDone(n)){const value=payload(n.arguments[0]);return pending?`((value) => (${pendingFinished} = true, value))(${value})`:value;}
+   if(n.arguments.length===1&&n.arguments[0].type==='Identifier'&&isPromiseResolver(n.callee)){
+    const info=httpReplies.get(bindings.get(n.arguments[0]));
+    if(info?.promiseForward)return `${render(n.callee)}(${forwardedSnapshot(info,n.arguments[0].name)})`;
+   }
    if(isAPI(n,'$notify')||isAPI(n,'$notification','post'))return notification(n);
    if(isAPI(n,'$log'))return `console.log(${n.arguments.map(a=>a.type==='SpreadElement'?'...'+render(a.argument):render(a)).join(', ')})`;
    if(isAPI(n,'$task','fetch'))return http(n.arguments[0],null,true).code+`.catch(error => {throw {error: String(error.message ?? error)};})`;

@@ -76,6 +76,45 @@ class ClosedFetchResponseTests(unittest.TestCase):
             with self.subTest(tail=tail), self.assertRaises(ConversionError):
                 convert(closed_reply_source(tail))
 
+    def test_promise_resolver_forwards_only_proven_response_fields(self):
+        def source(tail, callback='res.body=res.body;resolve(res)'):
+            return f'''function Env(){{
+ const http={{get:o=>send(o,'GET')}};
+ const send=(o,m)=>new Promise((resolve,reject)=>{{
+  const opt=o;opt.method=m;
+  $task.fetch(opt).then(res=>{{{callback}}}).catch(reject);
+ }});
+ return {{http}};
+}}
+const $=new Env();
+(async()=>{{
+ const r=await $.http.get({{url:"https://api.test/a",headers:{{X:"1"}}}});
+ {tail}
+}})();'''
+
+        positive = source("$done({body:r.body+':'+r.headers['x-a']});")
+        output = convert(positive)
+        self.assertNotIn('$task', output)
+        fixture = {'name': 'promise resolver projection',
+                   'request': {'url': URL},
+                   'http': [{'url': 'https://api.test/a', 'status': 200, 'body': 'ok',
+                             'headers': {'x-a': 'one'}}],
+                   'expected': {'result': {'body': 'ok:one'}}}
+        result = compare(positive, output, 'qx', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+        rejected = [
+            source('$done({body:String(r.cookies)});'),
+            source('unknown(r);$done({});'),
+            source('$done({body:r.headers[$argument]});'),
+            source("unknown($.http.get({url:'https://api.test/b'}));$done({});"),
+            source('$done({body:r.body});', 'res.body=String(res.body)+"!";resolve(res)'),
+            source('$done({body:r.body});', 'const finish=resolve;finish(res)'),
+        ]
+        for case in rejected:
+            with self.subTest(case=case), self.assertRaises(ConversionError):
+                convert(case)
+
     def test_host_request_url_and_method_allow_only_string_methods(self):
         positive = ('async function handle(request){return request.url.replace(/^https?:\\/\\/[^/]+/,"")}'
                     '(async()=>{if($response){$done({body:handle($request)})}else{$done($request)}})();')
