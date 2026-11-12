@@ -649,6 +649,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const entry=obj.properties.find(p=>p.type==='Property'&&key(p)===property(n)&&p.kind==='init');
     return entry?target(entry.value,seen):null;
    }
+  // 本地构造函数显式返回对象字面量时，实例成员仍来自同一份静态属性表。
+  // 只接受实例绑定未重绑、所有读取均为已知成员调用的闭合形状；这样既能
+  // 解析 `const $ = new Env(); $.done(v)`，又不会把可变外壳当成方法身份。
+  const factory=obj?.type==='NewExpression'&&factoryReturnObject(obj);
+  if(factory&&immutableFactoryInstance(n.object,obj,factory,property(n))){
+   const entry=factory.properties.find(p=>p.type==='Property'&&key(p)===property(n)&&p.kind==='init');
+   return entry?target(entry.value,seen):null;
+  }
    const cls=classOf(obj);
    if(cls&&!cls.superClass&&immutableClass(cls)){
     const method=cls.body.body.find(m=>m.type==='MethodDefinition'&&key(m)===property(n)&&m.kind==='method'&&m.static===(obj.type!=='NewExpression'&&obj.type!=='ThisExpression'));
@@ -656,6 +664,33 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
   }
   return null;
+ }
+ function factoryReturnObject(instance){
+  const factory=resolve(instance.callee);
+  if(!factory||factory.type!=='FunctionDeclaration'||factory.async||factory.generator)return null;
+  const binding=bindings.get(factory.id);
+  if(!binding||binding.writes.length||!factory.body||factory.body.type!=='BlockStatement')return null;
+  const returns=nodes.filter(n=>n.type==='ReturnStatement'&&owners.get(n)===factory);
+  if(returns.length!==1||!returns[0].argument)return null;
+  const returned=resolve(returns[0].argument);
+  return returned?.type==='ObjectExpression'?returned:null;
+ }
+ function immutableFactoryInstance(ref,instance,factory,name){
+  if(ref.type!=='Identifier')return false;
+  const binding=bindings.get(ref);
+  if(!binding||binding.writes.length)return false;
+  const keys=factory.properties.map(p=>p.type==='Property'&&p.kind==='init'?key(p):undefined);
+  if(keys.some(k=>k===undefined||k==='__proto__')||new Set(keys).size!==keys.length)return false;
+  return binding.refs.every(ref=>{
+   const member=parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)return false;
+   let outer=member;
+   while(parents.get(outer)?.type==='MemberExpression'&&parents.get(outer).object===outer)outer=parents.get(outer);
+   const use=parents.get(outer);
+   const write=use?.type==='AssignmentExpression'&&use.left===outer||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete';
+   if(write){const written=property(outer);return written!==undefined&&written!==name;}
+   return property(member)!==name||use?.type==='CallExpression'&&use.callee===outer;
+  });
  }
  // Method resolution is restricted to closed local objects/classes. A dynamic
  // write or escaped receiver invalidates the proof instead of guessing a target.
