@@ -34,7 +34,7 @@ export const contracts = {
   "msg": {
     "8fb53172a015de45e7cd89f14cc911e8fbf1b4dc49f671f7e3a97151a580d8a0": "conditional-url",
     "25c4da6f290bb166ac15495e74e135418a66be10f0555dd81703fc6dd2b0966c": "conditional-url",
-    "448ad8f2eebde0cc64c6cdc00da527fb308155c98776900ee0e76118f39627b2": "conditional-url",
+    "448ad8f2eebde0cc64c6cdc00da527fb308155c98776900ee0e76118f39627b2": "always-url",
     "4c532802cfc95117e37ee93789f1e373880281fadb4c3f6a7ceec52ac8be2fde": "empty-url"
   },
   "debug": {
@@ -143,7 +143,7 @@ export function clientInventory(source){
 export function lowerClients(source,format='surge'){
  const {tree,ix,resolve,families}=clientInventory(source);
  if(!families.length)return {source,lowered:false};
- const {nodes,parents,bindings,free}=ix,removed=new Set(),replacements=new WeakMap(),instances=new Map(),notes=[];
+ const {nodes,parents,bindings,free}=ix,removed=new Set(),replacements=new WeakMap(),instances=new Map(),adapters=new Map(),notes=[];
  const fail=(n,reason)=>{throw Error(`客户端展开第 ${source.slice(0,n.start).split('\n').length} 行：${reason}`);};
  if(nodes.some(n=>free(n,'$native')))fail(tree,'输入占用了编译器内部标识符');
  const isRemoved=n=>{for(let p=n;p;p=parents.get(p))if(removed.has(p))return true;return false;};
@@ -170,7 +170,8 @@ export function lowerClients(source,format='surge'){
   // Only families actually instantiated by a local singleton factory qualify.
   const calls=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='getInstance'&&resolve(n.callee.object)===root);
   if(!calls.length)continue;
-  if(!['surge','loon'].includes(format))fail(root,'该客户端展开目前要求已确定的 Surge 或 Loon 源平台');
+  const factoryKey={surge:'Surge',loon:'Loon',qx:'QuanX'}[format];
+  if(!factoryKey)fail(root,'该客户端展开目前要求已确定的 Surge、Loon 或 QX 源平台');
   if(root.superClass)fail(root,'客户端基类不能继承未知外部类');
   for(const c of members){
    const keys=c.body.body.map(m=>String(m.static)+':'+key(m));
@@ -180,32 +181,34 @@ export function lowerClients(source,format='surge'){
    else if(m.type!=='PropertyDefinition'||m.static||m.computed||!['_times','name','isDebug','className','request','response'].includes(key(m))||m.value&&!(key(m)==='_times'&&m.value.type==='NewExpression'&&free(m.value.callee,'Map')&&!m.value.arguments.length))fail(m,'未知客户端字段初始化');
    }
   }
-  function metadata(name,value){
+  function metadata(owner,name,value){
    if(value?.type!=='ObjectExpression'||value.properties.some(p=>p.type!=='Property'||p.kind!=='init'||p.computed)||new Set(value.properties.map(key)).size!==value.properties.length)fail(value??root,'客户端静态配置不是确定的对象');
    if(name==='instances'&&value.properties.length)fail(value,'客户端单例缓存非空');
    if(name==='classNames'&&value.properties.some(p=>!['Surge','Loon','QuanX'].includes(key(p))||p.value.type!=='ArrowFunctionExpression'))fail(value,'客户端工厂含未知行为');
    if(name==='clientAdapter'){
     const actual=Object.fromEntries(value.properties.map(p=>[key(p),p.value.type==='Literal'?p.value.value:null]));
     if(!(Object.keys(actual).length===1&&actual.bodyBytes==='body'||Object.keys(actual).length===2&&actual.id==='sessionIndex'&&actual.status==='statusCode'))fail(value,'客户端字段映射超出已确认的平台字段');
+    adapters.set(resolve(owner),new Map(value.properties.map(p=>[key(p),p.value.value])));
    }
   }
   let factory;
   for(const n of nodes){
    if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&members.has(resolve(n.left.object))&&['instances','classNames','clientAdapter'].includes(property(n.left))){
-    metadata(property(n.left),n.right);
+    metadata(n.left.object,property(n.left),n.right);
     removed.add(n);if(resolve(n.left.object)===root&&property(n.left)==='classNames')factory=n.right;
    }
    if(n.type==='CallExpression'&&n.arguments.length===3&&members.has(resolve(n.arguments[0]))&&['instances','classNames','clientAdapter'].includes(n.arguments[1]?.value)){
     const helper=resolve(n.callee);
     checkInitializer(helper);
-    metadata(n.arguments[1].value,n.arguments[2]);
+    metadata(n.arguments[0],n.arguments[1].value,n.arguments[2]);
     removed.add(n);if(resolve(n.arguments[0])===root&&n.arguments[1].value==='classNames')factory=n.arguments[2];
    }
   }
-  const selected=factory?.type==='ObjectExpression'?factory.properties.find(p=>key(p)===(format==='loon'?'Loon':'Surge')):null;
+  const selected=factory?.type==='ObjectExpression'?factory.properties.find(p=>key(p)===factoryKey):null;
   const make=selected?.value,ctor=make?.body?.type==='NewExpression'?resolve(make.body.callee):null;
   if(!members.has(ctor)||make.type!=='ArrowFunctionExpression'||make.params.length!==3||make.params.some(p=>p.type!=='Identifier')||make.body.arguments.length!==3||make.body.arguments.some((a,i)=>a.type!=='Identifier'||bindings.get(a)!==bindings.get(make.params[i])))fail(root,'无法静态确定 '+format+' 客户端工厂及其参数');
   function method(name,c=ctor){const own=c.body.body.find(m=>m.type==='MethodDefinition'&&key(m)===name&&!m.static);return own??(c.superClass?method(name,resolve(c.superClass)):null);}
+  function adapter(c=ctor){for(let current=c;current;current=resolve(current.superClass))if(adapters.has(current))return adapters.get(current);return new Map();}
   const first=calls[0];
   if(first.arguments[0]?.type!=='Literal'||typeof first.arguments[0].value!=='string')fail(first,'客户端名称必须是静态字符串');
   const name=first.arguments[0].value;
@@ -214,7 +217,9 @@ export function lowerClients(source,format='surge'){
   const debug=opts?.properties.find(p=>key(p)==='debug')?.value;
   const enabled=debug?.type==='Literal'?debug.value:debug?.type==='UnaryExpression'&&debug.operator==='!'?!debug.argument.value:false;
   if(typeof enabled!=='boolean')fail(first,'客户端调试开关不是布尔值');
-  const info={name,enabled,method,family};
+  const fieldAdapter=adapter();
+  if(format==='qx'&&!fieldAdapter.size)fail(ctor,'QX 客户端缺少已确认的请求／响应字段适配器');
+  const info={name,enabled,method,family,adapter:fieldAdapter};
   for(const call of calls){
    if(JSON.stringify(call.arguments.map(n=>source.slice(n.start,n.end)))!==JSON.stringify(first.arguments.map(n=>source.slice(n.start,n.end))))fail(call,'同一单例的初始化参数不一致');
    let p=parents.get(call);while(p?.type==='AssignmentExpression'&&p.right===call)p=parents.get(p);
@@ -238,8 +243,10 @@ export function lowerClients(source,format='surge'){
   if(p?.type!=='MemberExpression'||p.object!==n||property(p)===undefined)fail(n,'客户端对象整体传递或动态访问');
   const field=property(p);
   if(['request','response'].includes(field)){
-   if(q?.type!=='MemberExpression'||q.object!==p||!['url','method','status','headers','body','bodyBytes'].includes(property(q)))fail(p,'请求或响应必须使用可确定的字段');
-   replacements.set(p,'$'+field);continue;
+   const member=property(q),allowed=format==='qx'?['url','method','headers','body','bodyBytes','status','statusCode','id','sessionIndex']:['url','method','status','headers','body','bodyBytes'];
+   if(q?.type!=='MemberExpression'||q.object!==p||!allowed.includes(member))fail(p,'请求或响应必须使用可确定的字段');
+   const mapped=format==='qx'?info.adapter.get(member)??member:member,raw=`$${field}.${mapped}`;
+   replacements.set(q,format==='qx'&&mapped==='bodyBytes'?`new Uint8Array(${raw})`:raw);continue;
   }
   if(field==='name'){replacements.set(p,JSON.stringify(info.name));continue;}
   if(q?.type!=='CallExpression'||q.callee!==p)fail(p,'客户端方法引用逃逸');
@@ -248,7 +255,13 @@ export function lowerClients(source,format='surge'){
   const m=info.method(field);if(!m)fail(p,'未知客户端方法 '+field);
   const behavior=contract(m,info.family),a=q.arguments.map(render),at=(i,fallback='undefined')=>a[i]??fallback;
   let text;
-  if(field==='done')text='$done('+at(0)+')';
+  if(field==='done'){
+   if(format==='qx'){
+    const value=q.arguments[0],keys=value?.type==='ObjectExpression'?value.properties.map(p=>p.type==='Property'&&!p.computed?key(p):null):[];
+    if(q.arguments.length!==1||value?.type!=='ObjectExpression'||keys.some(k=>!['body','bodyBytes','headers'].includes(k))||new Set(keys).size!==keys.length)fail(q,'QX done 仅支持互不重复的静态 body/bodyBytes/headers 完成字段');
+   }
+   text='$done('+at(0)+')';
+  }
   else if(['exit','reject'].includes(field))text='$done({})';
   else if(field==='getVal')text='$native.storage.get('+at(0)+')';
   else if(field==='setVal')text='$native.storage.set('+at(1)+', '+at(0)+')';
@@ -264,9 +277,10 @@ export function lowerClients(source,format='surge'){
    const enabled=behavior==='always'||info.enabled;
    text=enabled?`((value) => console.log(typeof value === 'object' ? JSON.stringify(value) : value))(${at(0)})`:`void (${at(0)})`;
   }else if(field==='msg'){
-   const action=behavior==='empty-url'?`, {url: ${at(3,'""')} ?? ''}`:a[3]?`, {url: ${at(3)}}`:'';
-   text=`$notification.post(${at(0,JSON.stringify(info.name))}, ${at(1,'""')}, ${at(2,'""')}${action})`;
+   const action=behavior==='empty-url'||behavior==='always-url'?`, {url: ${at(3,'""')} ?? ''}`:behavior==='conditional-url'&&a[3]?`, {url: ${at(3)}}`:'';
+   text=format==='qx'?`$notify(${at(0,JSON.stringify(info.name))}, ${at(1,'""')}, ${at(2,'""')}${action})`:`$notification.post(${at(0,JSON.stringify(info.name))}, ${at(1,'""')}, ${at(2,'""')}${action})`;
   }else if(field==='fetch'){
+   if(format==='qx')fail(q,'QX fetch 的 statusCode/bodyBytes/opts 返回契约尚未展开');
    const input=q.arguments[0];if(q.arguments.length!==1||input?.type!=='ObjectExpression'||input.properties.some(p=>p.type!=='Property'||p.computed))fail(q,'HTTP 请求必须是可确定字段的对象');
    const fields=new Map(input.properties.map(p=>[key(p),p.value]));
    if([...fields.keys()].some(k=>!['url','method','headers','body','bodyBytes','timeout','policy','insecure','auto-redirect','auto-cookie'].includes(k)))fail(q,'客户端 HTTP 请求包含未知选项');
