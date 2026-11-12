@@ -4011,7 +4011,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const callbackNode=dispatch?.callback??n.arguments[1];
   const fn=target(callbackNode);if(!fn||fn.params.some(p=>p.type!=='Identifier')||fn.params.length>3)fail(n,'HTTP 回调必须是可追溯的简单函数');
   const h=http(requestNode,dispatch?.method??clientMethod(n.callee),false),r=fresh('httpResponse'),e=fresh('httpError'),b=fresh('httpBody'),caught=fresh('networkError');
-  const response=fn.params[1]&&bindings.get(fn.params[1]),snapshot=httpReplies.get(response)?.snapshot;
+  const response=fn.params[1]&&bindings.get(fn.params[1]);
+  let snapshot=httpReplies.get(response)?.snapshot;
+  // 方法转发器入口不会在注册扫描中表现为直接的 $httpClient 调用；消费处
+  // 重新确认每条响应引用都属于闭合包装记录，才能安全地物化纯数据快照。
+  if(!snapshot&&response&&response.refs.length&&response.refs.every(ref=>closedWholeResponseUse(ref)))snapshot=true;
   const owner=owners.get(n);
   if(parents.get(n)?.type==='ReturnStatement'&&owner.async&&!complete.has(fn)){
    const p=parents.get(owner),binding=bindings.get(owner.id??(p?.type==='VariableDeclarator'?p.id:null));

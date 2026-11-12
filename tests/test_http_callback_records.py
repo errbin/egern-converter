@@ -9,6 +9,33 @@ URL = 'https://example.test/script.js'
 
 
 class HTTPCallbackRecordTests(unittest.TestCase):
+    @staticmethod
+    def forwarded_record_source(tail):
+        return ('''const method=$argument==='post'?$httpClient.post:$httpClient.get;
+function send(fn,options,callback){return fn(options,callback)}
+new Promise((resolve,reject)=>{send(method,{url:'https://api.test/'},(error,response,body)=>{
+if(error)return reject(error);const result={};result.response=response;result.body=body;'''
+                + tail + '''});}).then(result=>{result.response;$done({body:result.body});});''')
+
+    def test_forwarded_method_rechecks_closed_record_at_consumer(self):
+        source=self.forwarded_record_source('resolve(result);')
+        output=convert_script(source,'Fixture',URL,'',source_format='loon')
+        result=compare(source,output,'loon',URL,{
+            'name':'forwarded closed response wrapper','argument':'get',
+            'request':{'url':URL},
+            'http':[{'url':'https://api.test/','body':'payload','status':202}],
+            'expected':{'result':{'body':'payload'}}})
+        self.assertEqual(result['status'],'passed',result)
+
+    def test_forwarded_record_escape_projection_or_dynamic_read_is_rejected(self):
+        for tail in [
+            'unknown(result);resolve(result);',
+            'resolve(result);});}).then(result=>{$done({body:result.response.body});',
+            'resolve(result);});}).then(result=>{$done({body:result.response[$argument]});',
+        ]:
+            with self.subTest(tail=tail),self.assertRaises(ConversionError):
+                convert_script(self.forwarded_record_source(tail),'Fixture',URL,'',source_format='loon')
+
     def test_closed_promise_wrapper_may_observe_an_unused_response_key(self):
         direct="new Promise(resolve=>{$httpClient.get({url:'https://api.test/'},(error,response,body)=>{if(error)return;const result={};result.response=response;result.body=body;resolve(result);});}).then(result=>{result.response;$done({body:result.body});});"
         helper="function forward(resolve,value){return resolve(value)}"+direct.replace('resolve(result);','forward(resolve,result);')
