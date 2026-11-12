@@ -1,6 +1,6 @@
 import {children,patch,renderTree,property,key,functions,initializedAfter,closedAsyncCompletionRoot,standardGlobals as builtin,index,privateGlobalAssignment} from '../core/ast.mjs';
 import {parse} from '../core/syntax.mjs';
-import {valueFacts} from '../analysis/values.mjs';
+import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
 
 // 唯一静态方法定义 + 唯一调用点，且方法体只做原型/属性设置后原样返回参数：
 // 该调用对回调值而言是恒等包装。名字在整个封闭程序内必须唯一，避免同名方法
@@ -179,6 +179,130 @@ export function closedIdentityMethodCall(ix,call,arg){
  return statements.length===1&&statementReturns(statements[0]);
 }
 
+const REGENERATOR_LOOPS=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
+function regeneratorAbruptReturn(node,param,ix){
+ return node?.type==='CallExpression'&&node.callee.type==='MemberExpression'&&property(node.callee)==='abrupt'&&
+  node.arguments[0]?.type==='Literal'&&node.arguments[0].value==='return'&&
+  (param?.type!=='Identifier'||ix.bindings.get(node.callee.object)===ix.bindings.get(param));
+}
+function regeneratorCompletionTerminator(node,fn,param,ix){
+ let current=node;
+ while(current&&current!==fn){
+  const parent=ix.parents.get(current);
+  if(!parent)return null;
+  if(parent.type==='CallExpression'&&parent.arguments.includes(current)&&regeneratorAbruptReturn(parent,param,ix))return parent;
+  if(parent.type==='ReturnStatement'&&parent.argument===current)return parent;
+  if(parent.type==='SequenceExpression'&&parent.expressions.at(-1)===current){current=parent;continue;}
+  if(parent.type==='ConditionalExpression'&&(parent.consequent===current||parent.alternate===current)){current=parent;continue;}
+  if(parent.type==='LogicalExpression'&&(parent.left===current||parent.right===current)){current=parent;continue;}
+  if(parent.type==='ParenthesizedExpression'){current=parent;continue;}
+  return null;
+ }
+ return null;
+}
+function regeneratorStateControlExpression(node,param,ix){
+ if(node?.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='MemberExpression'&&
+    ix.bindings.get(node.left.object)===ix.bindings.get(param)&&['prev','next','sent'].includes(property(node.left)))return true;
+ if(node?.type==='CallExpression'&&node.callee.type==='MemberExpression'&&
+    ix.bindings.get(node.callee.object)===ix.bindings.get(param)&&['abrupt','finish','stop'].includes(property(node.callee)))return true;
+ return false;
+}
+function regeneratorTailSafe(completion,clause,param,ix){
+ let current=completion,statement=null;
+ while(current&&current!==clause){
+  const parent=ix.parents.get(current);
+  if(!parent)return false;
+  if(parent.type==='SwitchCase'){statement=current;break;}
+  if(parent.type==='SequenceExpression'){
+   for(const expression of parent.expressions)if(expression.start>current.end&&!regeneratorStateControlExpression(expression,param,ix))return false;
+  }else if(parent.type==='ConditionalExpression'||parent.type==='LogicalExpression'||parent.type==='ParenthesizedExpression'||parent.type==='ExpressionStatement'||parent.type==='BlockStatement'){
+   // 条件/逻辑分支与语句外壳在完成调用之后不再执行其它分支。
+  }else if(parent.type==='IfStatement'){
+   if(parent.test===current)return false;
+  }else return false;
+  current=parent;
+ }
+ if(!statement)return false;
+ const caseNode=ix.parents.get(statement),index=caseNode?.type==='SwitchCase'?caseNode.consequent.indexOf(statement):-1;
+ if(index<0)return false;
+ for(const later of caseNode.consequent.slice(index+1)){
+  if(later.type==='BreakStatement'||later.type==='EmptyStatement')continue;
+  if(later.type==='ExpressionStatement'&&regeneratorStateControlExpression(later.expression,param,ix))continue;
+  if(later.type==='ReturnStatement'&&regeneratorStateControlExpression(later.argument,param,ix))continue;
+  return false;
+ }
+ return true;
+}
+function regeneratorInsideLoop(node,fn,machine,ix){
+ for(let parent=ix.parents.get(node);parent&&parent!==fn;parent=ix.parents.get(parent)){
+  if(!REGENERATOR_LOOPS.has(parent.type))continue;
+  // 状态机的驱动 for(;;) 包住分派 switch，不属于正文循环。
+  if(parent.start<=machine.dispatchStart&&parent.end>=machine.dispatchEnd)continue;
+  return true;
+ }
+ return false;
+}
+function regeneratorReachesCompletion(state,completionStates,machine){
+ const from='state:'+String(state),seen=new Set([from]),queue=[from];
+ while(queue.length){
+  const current=queue.shift();
+  for(const edge of machine.edges){
+   if(edge.from!==current)continue;
+   // 完成调用后只允许状态控制；该状态自己的异常出口不可能在完成后触发。
+   if(current===from&&(edge.kind==='exception'||edge.kind==='exception-finally'))continue;
+   if(edge.to!==from&&completionStates.has(edge.to))return true;
+   if(seen.has(edge.to))continue;
+   seen.add(edge.to);queue.push(edge.to);
+  }
+ }
+ return false;
+}
+// 完成回调的 `.wrap` 消费方证明：状态图运行时完整、入口子图无环；唯一阻塞
+// 只能是死状态/死终止点。每个可达完成调用必须位于状态分派 case 内且不在
+// 循环中。多个完成点时，每个必须由独立的 return/abrupt return 终止，或
+// 完成之后只剩状态控制且沿显式边无法到达另一个完成状态；这保证同一路径
+// 至多执行一个完成调用。
+export function closedRegeneratorConsumer(ix,source,call,fn,isCompletion){
+ const reject=()=>null;
+ if(call?.type!=='CallExpression'||call.callee.type!=='MemberExpression'||property(call.callee)!=='wrap'||call.arguments[0]!==fn)return reject('shape');
+ let proof;
+ try{proof=regeneratorStateMachine(ix,source);}catch{return reject('proof');}
+ const machine=proof.machines.find(item=>item.wrapStart===call.start&&item.acyclic&&(item.proved||item.deadReachabilityProved));
+ if(!machine)return reject('machine '+proof.machines.map(item=>item.wrapStart+':'+item.proved+':'+item.deadReachabilityProved+':'+item.acyclic));
+ const completions=ix.nodes.filter(node=>node.start>=fn.start&&node.end<=fn.end&&isCompletion(node));
+ if(!completions.length)return reject('no-completions');
+ const param=fn.params[0],reachable=[];
+ // 机器只因异常处理副作用而无法极简降级时，完成消费方不能越过原有的
+ // 极简拒收边界；异步/上下文机器保留其它缺口，仍走通用完成路径。
+ if(machine.handlerEffects?.length&&!machine.nonHandlerMinimalGaps?.length)return reject('minimal-handler-only');
+ for(const completion of completions){
+  if(ix.owners.get(completion)!==fn)return reject('owner');
+  const clause=machine.cases.filter(item=>completion.start>=item.start&&completion.end<=item.end)
+   .sort((a,b)=>(a.end-a.start)-(b.end-b.start))[0];
+  if(!clause||clause.state===null)return reject('case '+completion.start);
+  if(machine.deadStates.some(state=>state===clause.state))continue;
+  reachable.push({node:completion,clause,state:clause.state});
+ }
+ if(!reachable.length)return reject('dead-completions');
+ for(const item of reachable)if(regeneratorInsideLoop(item.node,fn,machine,ix))return reject('loop');
+ if(reachable.length===1)return machine;
+ if(new Set(reachable.map(item=>String(item.state))).size!==reachable.length)return reject('multiple-in-case');
+ const completionStates=new Set(reachable.map(item=>'state:'+String(item.state)));
+ const nonterminal=[];
+ const terminators=new Set();
+ for(const item of reachable){
+  const terminator=regeneratorCompletionTerminator(item.node,fn,param,ix);
+  if(!terminator){nonterminal.push(item);continue;}
+  if(terminators.has(terminator))return reject('dup-terminator '+item.node.start);
+  terminators.add(terminator);
+ }
+ for(const item of nonterminal){
+  if(!regeneratorTailSafe(item.node,item.clause,param,ix))return reject('nonterminal-tail '+item.node.start);
+  if(regeneratorReachesCompletion(item.state,completionStates,machine))return reject('reaches-completion '+item.node.start);
+ }
+ return machine;
+}
+
 // Structured early-return propagation for statically resolved bundled clients.
 // Native payloads are stored only while unwinding ordinary JS helper calls;
 // there is no legacy API object, thrown sentinel or async polling runtime.
@@ -259,6 +383,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&n.arguments.some(a=>targets(a).some(fn=>done.has(fn)))&&!done.has(owners.get(n))){done.add(owners.get(n));changed=true;}
   if(candidates.some(fn=>done.has(fn))&&!done.has(owners.get(n))){done.add(owners.get(n));changed=true;}
   if(isHTTP?.(n)&&targets(n.arguments[1]).some(fn=>done.has(fn))&&!done.has(owners.get(n))){done.add(owners.get(n));changed=true;}
+  if(n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'&&closedRegeneratorWrap(n,n.arguments[0])&&!done.has(owners.get(n))){done.add(owners.get(n));changed=true;}
   if(done.has(timerCallback(n))&&!done.has(owners.get(n))){done.add(owners.get(n));changed=true;}
   if(candidates.some(fn=>asyncAdded.has(fn)||fn.async&&done.has(fn))&&!executorHelpers.has(owners.get(n))&&!owners.get(n).async&&!asyncAdded.has(owners.get(n))){asyncAdded.add(owners.get(n));changed=true;}
   if(isHTTP?.(n)&&targets(n.arguments[1]).some(fn=>done.has(fn))&&!executorHelpers.has(owners.get(n))&&!owners.get(n).async&&!asyncAdded.has(owners.get(n))){asyncAdded.add(owners.get(n));changed=true;}
@@ -277,6 +402,37 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    return b.refs.every(ref=>{const p=parents.get(ref);return p?.type==='CallExpression'&&(p.callee===ref||closedCallback(p,ref,next));});
   });
  }
+ // `.wrap` 的第一个实参由本文件证明过的状态机消费。
+ function closedRegeneratorMachine(call,fn){
+  return closedRegeneratorConsumer(ix,source,call,fn,node=>isDone(node)||targets(node.callee).some(target=>done.has(target)));
+ }
+ function closedRegeneratorWrap(call,fn){
+  return !!closedRegeneratorMachine(call,fn);
+ }
+ // 状态机回调内的完成调用由已证状态图负责终止，不能再用普通 `return` 截断
+ // 当前状态函数；否则 regenerator 驱动会停在半途而不再推进。完成传播仍
+ // 照常把结果送回脚本顶层。
+ const regeneratorMachines=new Map();
+ for(const n of nodes){
+  if(n.type!=='CallExpression'||n.callee.type!=='MemberExpression'||property(n.callee)!=='wrap')continue;
+  const machine=closedRegeneratorMachine(n,targets(n.arguments[0])[0]);
+  if(machine)regeneratorMachines.set(n,machine);
+ }
+ const regeneratorCallbackRanges=[...regeneratorMachines.values()].map(machine=>[machine.callbackStart,machine.callbackEnd]);
+ const synchronousRegeneratorCallbacks=new Set([...regeneratorMachines.values()]
+  .filter(machine=>!nodes.some(n=>n.type==='AwaitExpression'&&n.start>=machine.callbackStart&&n.end<=machine.callbackEnd))
+  .map(machine=>machine.callbackStart));
+ const inRegeneratorCallback=owner=>!!owner&&regeneratorCallbackRanges.some(([start,end])=>owner.start>=start&&owner.end<=end);
+ const containsRegeneratorCallback=owner=>!!owner&&regeneratorCallbackRanges.some(([start,end])=>start>=owner.start&&end<=owner.end);
+ const synchronousRegeneratorCallback=fn=>!!fn&&synchronousRegeneratorCallbacks.has(fn.start);
+ // regenerator 的 `wrap(inner, outerFn, self, tryEntries)` 会把生成器函数自身
+ // 作为 outerFn 传入；该位置只建立 this/构造语义，不调用回调。仅当调用点
+ // 已被本文件的完整状态机证明覆盖，且自引用正是该机器外层函数时放行。
+ const regeneratorOuterReference=ref=>{
+  const p=parents.get(ref);
+  if(p?.type!=='CallExpression'||p.arguments[1]!==ref||p.callee.type!=='MemberExpression'||property(p.callee)!=='wrap'||!regeneratorMachines.has(p))return false;
+  return targets(ref).some(fn=>owners.get(p)===fn);
+ };
  for(const n of nodes){
   if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&(targets(n.init).some(fn=>done.has(fn)||asyncAdded.has(fn))||n.init?.type==='ObjectExpression'&&n.init.properties.some(p=>targets(p.value).some(fn=>done.has(fn)||asyncAdded.has(fn))))){
    const binding=bindings.get(n.id);
@@ -288,7 +444,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   // “目标函数忽略返回值”不能成立，因此该族继续按未知回调拒绝。
   if(functions.has(n.type)&&(done.has(n)||asyncAdded.has(n))&&n.type!=='FunctionDeclaration'){
    const p=parents.get(n);
-   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='SequenceExpression'&&p.expressions.at(-1)===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
+   if(!(p?.type==='CallExpression'&&(p.callee===n||closedCallback(p,n)||closedRegeneratorWrap(p,n)||p.callee.type==='MemberExpression'&&['mark','wrap'].includes(property(p.callee))&&containsRegeneratorCallback(n))||p?.type==='NewExpression'&&closedCallback(p,n)||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n||p?.type==='MethodDefinition'&&p.value===n||p?.type==='SequenceExpression'&&p.expressions.at(-1)===n||p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee))))fail(n,'内联完成函数传给未知回调');
   }
   if(free(n,'globalThis')){
    const p=parents.get(n);
@@ -307,6 +463,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    if(p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee)))continue;
    if(p?.type==='CallExpression'&&closedCallback(p,n))continue;
    if(p?.type==='NewExpression'&&closedCallback(p,n))continue;
+   if(regeneratorOuterReference(n))continue;
    fail(n,'完成函数传给未知回调，无法短路调用者');
   }
  }
@@ -343,7 +500,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   }
   if(valid&&setup)deferred={call,statement:parents.get(call),promise:fresh('pendingCompletion')};
  }
- function guard(owner){return `if (${completion}) ${owner===tree?'return '+completion+'.value;':'return;'}`;}
+ function guard(owner){return inRegeneratorCallback(owner)?'':`if (${completion}) ${owner===tree?'return '+completion+'.value;':'return;'}`;}
  function tail(n,asynchronous=false){
   if(deferred?.call===n)return true;
   let p=parents.get(n);
@@ -389,7 +546,8 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    // Payload shapes and API fields still go through the same native mapper.
    const v=n.arguments[0],prefix=[];
    if(v){const e=expression(v,owner);prefix.push(...e.before);substitutions.set(v,e.code);}
-   return result('undefined',[...prefix,`${completion} = {value: ${payload(v)}};`,...(concurrent?[`${finish}(${completion}.value);`]:[]),owner===tree?`return ${completion}.value;`:'return;']);
+   const termination=owner===tree?`return ${completion}.value;`:inRegeneratorCallback(owner)?'':'return;';
+   return result('undefined',[...prefix,`${completion} = {value: ${payload(v)}};`,...(concurrent?[`${finish}(${completion}.value);`]:[]),termination]);
   }
   if(n.type==='SequenceExpression'){
    const before=[];for(const part of n.expressions.slice(0,-1)){const e=expression(part,owner);before.push(...e.before,'('+e.code+');');}
@@ -456,7 +614,9 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.body.type!=='BlockStatement')head=head.slice(0,head.lastIndexOf('=>')+2)+' ';
   if(executorHelpers.has(n)&&(asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await ')))fail(n,'Promise 执行器需要异步提升，不能改变同步执行器契约');
   const method=parents.get(n)?.type==='MethodDefinition'||parents.get(n)?.type==='Property'&&parents.get(n).method;
-  if((asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await '))&&!n.async&&!method)head='async '+head;
+  // 已证 wrap 状态函数由同步状态机驱动，不能因为内部完成通道被提升而改成
+  // async：wrap 需要立即返回状态对象，Promise 返回值会破坏推进协议。
+  if((asyncAdded.has(n)||hasPromiseCompletion(n)||prelude.includes('await '))&&!n.async&&!method&&!synchronousRegeneratorCallback(n))head='async '+head;
   return head+(prelude?'{'+prelude+'\n'+body.slice(1,-1)+'}':body);
  }
  function hasPromiseCompletion(fn){return nodes.some(n=>owners.get(n)===fn&&n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&done.has(fn));}
@@ -600,7 +760,11 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   return functions.has(b.init.type)||b.init.type==='Identifier'&&callbackReference(b.init,new Set([...seen,b]));
  }
  const rendered=statement(tree);
- return {body:rendered+(deferred?`\nif (${deferred.promise} !== undefined) {await ${deferred.promise};${guard(tree)}}`:'')+(concurrent?`\nreturn await ${finished};`:''),prefix:`let ${completion};${concurrent?`let ${finish}, ${reject};const ${finished} = new Promise((resolve,reject) => {${finish}=resolve;${reject}=reject;});`:''}${deferred?`let ${deferred.promise};`:''}`,render,raw:substitutions,done};
+ // regenerator 驱动可能在 IIFE 内完成并把结果写进 completion，但驱动返回值
+ // 已被原脚本丢弃；异步状态链可能还要经过少量微任务才写入完成值。这里只做
+ // 有界排空，既覆盖已证的同步/异步完成回调，又不会在缺完成路径上永久等待。
+ const regeneratorResult=regeneratorMachines.size?`for (let completionTurn = 0; completionTurn < 20 && !${completion}; completionTurn++) await Promise.resolve();\nif (${completion}) return ${completion}.value;`:'';
+ return {body:rendered+(regeneratorResult?`\n${regeneratorResult}`:'')+(deferred?`\nif (${deferred.promise} !== undefined) {await ${deferred.promise};${guard(tree)}}`:'')+(concurrent?`\nreturn await ${finished};`:''),prefix:`let ${completion};${concurrent?`let ${finish}, ${reject};const ${finished} = new Promise((resolve,reject) => {${finish}=resolve;${reject}=reject;});`:''}${deferred?`let ${deferred.promise};`:''}`,render,raw:substitutions,done};
 }
 
 // Expand discarded statement expressions before native return propagation.

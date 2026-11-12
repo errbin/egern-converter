@@ -3,7 +3,7 @@ import {parse,withSyntaxCache} from '../core/syntax.mjs';
 import {analyze} from '../analysis/analyze.mjs';
 import {rewriteUsageComments,copyrightDocumentation,formatNative,compactNative,singleLineSource} from '../output/source.mjs';
 import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/clients.mjs';
-import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall} from './flow.mjs';
+import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall,closedRegeneratorConsumer} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
@@ -1070,7 +1070,16 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n.type==='AwaitExpression'||n.async||n.type==='CallExpression'&&clientMethod(n.callee)&&complete.has(target(n.arguments[1])))asyncFns.add(owners.get(n));
   if(n.type==='CallExpression'&&compressionMethod(n.callee)){asyncFns.add(owners.get(n));lifted.add(owners.get(n));}
  }
+ // 已完成状态机回调的 `.wrap` 是完成路径的闭合消费者：证明要求状态图
+ // 完整、入口子图无环且回调内恰有一个完成调用。传播后，同脚本中的非完成
+ // HTTP 辅助请求可沿用既有的“存在另一条完成路径”证明。
+ const closedRegeneratorCompletion=call=>{
+  if(call.type!=='CallExpression'||call.callee.type!=='MemberExpression'||property(call.callee)!=='wrap')return false;
+  const callback=target(call.arguments[0]);if(!callback||!complete.has(callback))return false;
+  return !!closedRegeneratorConsumer(ix,source,call,callback,node=>isDone(node)||complete.has(target(node.callee)));
+ };
  let changed=true;while(changed){changed=false;for(const n of nodes)if(n.type==='CallExpression'){
+  if(closedRegeneratorCompletion(n)){if(!complete.has(owners.get(n))){complete.add(owners.get(n));changed=true;}if(!complete.has(tree)){complete.add(tree);changed=true;}}
   if(clientMethod(n.callee)&&complete.has(target(n.arguments[1]))&&!asyncFns.has(owners.get(n))){asyncFns.add(owners.get(n));changed=true;}
   const fn=target(n.callee);if(terminal(n)&&!complete.has(owners.get(n))){complete.add(owners.get(n));changed=true;}
   if(fn&&asyncFns.has(fn)&&(!fn.async||complete.has(fn)||lifted.has(fn))&&!asyncFns.has(owners.get(n))){asyncFns.add(owners.get(n));changed=true;}

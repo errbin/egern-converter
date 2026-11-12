@@ -1389,14 +1389,21 @@ export function lowerDiscardedSelfCheckCallbacks(source){
   }
   return false;
  };
- for(const declarator of ix.nodes){
-  if(declarator.type!=='VariableDeclarator'||declarator.id.type!=='Identifier'||declarator.init?.type!=='CallExpression')continue;
-  const init=declarator.init;
+ for(const node of ix.nodes){
+  // 同一自检壳既可能由 var 声明写入，也可能在逗号序列中赋给已声明槽位；
+  // 两种形状都要求该槽位只有这一个写入点。
+  let wrapperId=null,init=null,write=null;
+  if(node.type==='VariableDeclarator'&&node.id.type==='Identifier'&&node.init?.type==='CallExpression'){
+   wrapperId=node.id;init=node.init;write=node;
+  }else if(node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'&&node.right.type==='CallExpression'){
+   wrapperId=node.left;init=node.right;write=node;
+  }
+  if(!wrapperId)continue;
   if(init.arguments.length!==2||init.arguments[1].type!=='FunctionExpression')continue;
   const callback=init.arguments[1];
   if(callback.async||callback.generator||callback.params.length||callback.body.type!=='BlockStatement')continue;
-  const wrapper=ix.bindings.get(declarator.id);
-  if(!wrapper||wrapper.writes.length||init.callee.type!=='Identifier')continue;
+  const wrapper=ix.bindings.get(wrapperId);
+  if(!wrapper||(write.type==='VariableDeclarator'?wrapper.writes.length:wrapper.writes.length!==1||wrapper.writes[0]!==write)||init.callee.type!=='Identifier')continue;
   const factory=ix.bindings.get(init.callee);
   if(!factory||factory.writes.length||factory.refs.some(ref=>ref!==init.callee))continue;
   const factoryInit=factory.init;
@@ -1415,7 +1422,21 @@ export function lowerDiscardedSelfCheckCallbacks(source){
   const returnedFunction=returned.argument;
   if(returnedFunction.async||returnedFunction.generator||returnedFunction.params.length!==2||returnedFunction.params.some(param=>param.type!=='Identifier'))continue;
   const callbackBinding=ix.bindings.get(returnedFunction.params[1]);
-  if(!callbackBinding||callbackBinding.writes.length!==1||callbackBinding.refs.length!==3)continue;
+  if(!callbackBinding||callbackBinding.writes.length!==1)continue;
+  // 自检壳在调用回调的分支外还有一条“已被篡改”的失败分支；该分支只读写
+  // 回调/结果槽位本身，包装调用的返回值又整体丢弃。只要回调调用位于会返回
+  // 的分支，另一条分支的额外引用不影响短路证明。
+  const containsNode=(range,node)=>!!range&&node.start>=range.start&&node.end<=range.end;
+  const oppositeBranch=(node,call)=>{
+   for(let current=call;current;current=ix.parents.get(current)){
+    const parent=ix.parents.get(current);
+    if(parent?.type!=='IfStatement'||!containsNode(parent.consequent,call)&&!containsNode(parent.alternate,call))continue;
+    const branch=containsNode(parent.consequent,call)?parent.alternate:parent.consequent;
+    if(containsNode(branch,node))return true;
+   }
+   return false;
+  };
+  const callbackExtras=[];
   let applyCall=null,nullAssignment=null,tested=false;
   for(const ref of callbackBinding.refs){
    const parent=ix.parents.get(ref);
@@ -1424,9 +1445,10 @@ export function lowerDiscardedSelfCheckCallbacks(source){
     const call=ix.parents.get(parent);
     if(call?.type==='CallExpression'&&call.callee===parent)applyCall=call;
    }else if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&parent.right?.type==='Literal'&&parent.right.value===null)nullAssignment=parent;
-   else{applyCall=null;break;}
+   else callbackExtras.push(ref);
   }
   if(!tested||!applyCall||!nullAssignment||applyCall.arguments.length!==2)continue;
+  if(callbackExtras.some(ref=>!oppositeBranch(ref,applyCall)))continue;
   if(applyCall.arguments[0].type!=='Identifier'||ix.bindings.get(applyCall.arguments[0])!==ix.bindings.get(returnedFunction.params[0]))continue;
   if(!ix.free(applyCall.arguments[1],'arguments'))continue;
   const applyDeclarator=ix.parents.get(applyCall);
@@ -1438,8 +1460,11 @@ export function lowerDiscardedSelfCheckCallbacks(source){
   const [resetExpression,resultExpression]=afterApply.argument.expressions;
   if(resetExpression!==nullAssignment||resultExpression.type!=='Identifier'||ix.bindings.get(resultExpression)!==ix.bindings.get(applyDeclarator.id))continue;
   const resultBinding=ix.bindings.get(applyDeclarator.id);
-  if(!resultBinding||resultBinding.writes.length||resultBinding.refs.length!==1||resultBinding.refs[0]!==resultExpression)continue;
-  const outside=wrapper.refs.filter(ref=>!inside(ref,callback));
+  if(!resultBinding||resultBinding.writes.length||resultBinding.refs[0]!==resultExpression||
+    resultBinding.refs.some(ref=>ref!==resultExpression&&!oppositeBranch(ref,applyCall)))continue;
+  // 赋值形态的左值本身就是一次写入引用；它由上面的唯一写入点证明覆盖，
+  // 不能算作包装器在回调之外的读取。
+  const outside=wrapper.refs.filter(ref=>!inside(ref,callback)&&ref!==wrapperId);
   if(outside.length!==1)continue;
   const discarded=ix.parents.get(outside[0]);
   if(discarded?.type!=='CallExpression'||discarded.callee!==outside[0]||discarded.arguments.length||!discardedValue(discarded,ix))continue;

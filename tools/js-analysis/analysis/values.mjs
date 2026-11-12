@@ -1156,8 +1156,11 @@ export function regeneratorStateMachine(ix,source){
   while(queue.length){const from=queue.shift();for(const to of adjacency.get(from)??[]){if(!seen.has(to)){seen.add(to);queue.push(to);}}}
   const deadStates=[...states].filter(state=>!seen.has(stateId(state)));
   const deadTerminals=terminals.filter(terminal=>!seen.has(terminal.id)).map(terminal=>terminal.id);
-  if(deadStates.length)gaps.push('状态从单一入口不可达：'+deadStates.join('、'));
-  if(deadTerminals.length)gaps.push('终止节点从单一入口不可达：'+deadTerminals.length+' 个');
+  // 不可达状态/终止节点只影响“整图都必须可达”的严格放行；完成消费方另用
+  // deadReachabilityProved 证明它们确实是死代码，不把消息文本当放行依据。
+  const reachabilityGaps=[];
+  if(deadStates.length){const gap='状态从单一入口不可达：'+deadStates.join('、');gaps.push(gap);reachabilityGaps.push(gap);}
+  if(deadTerminals.length){const gap='终止节点从单一入口不可达：'+deadTerminals.length+' 个';gaps.push(gap);reachabilityGaps.push(gap);}
   for(const state of states)if(!(adjacency.get(stateId(state))?.length))gaps.push('状态 '+state+' 没有可证明的出边');
   if(!terminals.length)gaps.push('状态图没有返回点或异常终止点');
   const stateByNodeId=new Map([...states].map(state=>[stateId(state),state]));
@@ -1175,16 +1178,41 @@ export function regeneratorStateMachine(ix,source){
    }
    for(const state of region)handlerStates.add(state);
   }
+  const handlerEffects=[],handlerMinimalGaps=[];
   for(const state of handlerStates){
    const clause=caseByState.get(state);if(!clause)continue;
    for(const n of nodes)if(n.start>=clause.start&&n.end<=clause.end&&own(n,fn)&&handlerEffect(n,param)){
-    minimalGaps.push('极简模式异常处理区域含业务副作用：状态 '+state+'，第 '+lineOf(n)+' 行');
+    const gap='极简模式异常处理区域含业务副作用：状态 '+state+'，第 '+lineOf(n)+' 行';
+    minimalGaps.push(gap);handlerMinimalGaps.push(gap);
+    handlerEffects.push({state,line:lineOf(n)});
     break;
    }
   }
   const uniqueMinimalGaps=[...new Set(minimalGaps)];
+  const uniqueHandlerMinimalGaps=new Set(handlerMinimalGaps);
+  // 除异常处理副作用之外仍存在的极简缺口；为空表示该机器只因 handler
+  // 副作用而无法走极简降级，完成消费方不能越过这条既有拒收边界。
+  const nonHandlerMinimalGaps=uniqueMinimalGaps.filter(gap=>!uniqueHandlerMinimalGaps.has(gap));
   const uniqueGaps=[...new Set([...gaps,...runtimeInfo.gaps])];
-  machines.push({line:lineOf(call),entryState:0,proved:uniqueGaps.length===0,gaps:uniqueGaps,nodes:graphNodes,edges,
+  const uniqueReachabilityGaps=[...new Set(reachabilityGaps)];
+  // 完成回调只有在状态图无环时才能保证单个静态完成点至多执行一次。
+  // 终止节点不参与环检测；未可达状态已由 gaps 拒绝。
+  const terminalIds=new Set(terminals.map(terminal=>terminal.id));
+  let cyclic=false;const active=new Set(),finished=new Set();
+  const visitState=id=>{
+   if(finished.has(id))return;
+   if(active.has(id)){cyclic=true;return;}
+   active.add(id);
+   for(const target of adjacency.get(id)??[])if(!terminalIds.has(target))visitState(target);
+   active.delete(id);finished.add(id);
+  };
+  visitState('invoke');
+  // 仅当运行时契约完整、唯一阻塞是死状态/死终止点且入口子图无环时，
+  // 完成消费方才能把不可达节点视为真正死代码。
+  const deadReachabilityProved=runtimeInfo.proved&&!cyclic&&terminals.length>0&&
+   uniqueGaps.length===uniqueReachabilityGaps.length;
+  machines.push({line:lineOf(call),entryState:0,wrapStart:call.start,wrapEnd:call.end,callbackStart:fn.start,callbackEnd:fn.end,dispatchStart:dispatch?.start,dispatchEnd:dispatch?.end,acyclic:!cyclic,proved:uniqueGaps.length===0,deadReachabilityProved,handlerEffects,nonHandlerMinimalGaps,gaps:uniqueGaps,nodes:graphNodes,edges,
+   cases:cases.map(clause=>({state:stateValue(clause.test),start:clause.start,end:clause.end,line:lineOf(clause)})),
    states:states.size,reachableStates:stateNodes.filter(node=>seen.has(node.id)).length,deadStates,deadTerminals,edges_count:edges.length,saveSlots:[...slots.values()],exceptions:exceptionEntries.map(({tryLoc,catchLoc,line})=>({tryLoc,catchLoc,line})),handlerStates:[...handlerStates],runtime:{driveCount:runtimeInfo.driveCount,internalDrives:runtimeInfo.internalDrives,externalDrives:runtimeInfo.externalDrives},
    minimal:uniqueGaps.length===0&&uniqueMinimalGaps.length===0,minimalGaps:uniqueMinimalGaps,release:false});
  }

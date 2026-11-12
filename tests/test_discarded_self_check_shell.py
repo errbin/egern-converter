@@ -13,6 +13,9 @@ SHELL = '''var factory = (function () {
       if (callback) {
         var result = callback.apply(host, arguments);
         return callback = null, result;
+      } else {
+        var seen = callback ? result : null;
+        return seen;
       }
     } : function () {};
     return state = false, fn;
@@ -29,6 +32,13 @@ wrapper();
 '''
 
 
+def assigned(body):
+    return body.replace(
+        'var wrapper = factory(this, function () {',
+        'var wrapper;\n(0, wrapper = factory(this, function () {').replace(
+        '});\nwrapper();', '}));\nwrapper();')
+
+
 class DiscardedSelfCheckShellTests(unittest.TestCase):
     def test_pure_discarded_self_check_is_short_circuited(self):
         source = SHELL.replace('{tail}', '$done({body:"ok"});')
@@ -38,6 +48,38 @@ class DiscardedSelfCheckShellTests(unittest.TestCase):
                    'expected': {'result': {'body': 'ok'}}}
         result = compare(source, output, 'surge', URL, fixture)
         self.assertEqual(result['status'], 'passed', result)
+
+    def test_assigned_wrapper_with_opposite_branch_reads_is_short_circuited(self):
+        source = assigned(SHELL).replace('{tail}', '$done({body:"ok"});')
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertNotIn('search', output)
+        fixture = {'name': 'assigned discarded self check', 'request': {'url': URL},
+                   'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_extra_callback_or_result_reads_outside_opposite_branch_are_rejected(self):
+        cases = {
+            'callback read after branches': SHELL.replace(
+                '    } : function () {};\n    return state = false, fn;',
+                '    } : function () {};\n    var leaked = callback;\n    return state = false, fn;'),
+            'result read after branches': SHELL.replace(
+                '        return callback = null, result;\n      } else {\n        var seen = callback ? result : null;\n        return seen;\n      }',
+                '        return callback = null, result;\n      } else {\n        var seen = callback ? result : null;\n        return seen;\n      }\n      var tail = result;'),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                output = convert_script(body.replace('{tail}', '$done({body:"ok"});'),
+                                        'Fixture', URL, '', source_format='surge')
+                self.assertIn('search', output)
+
+    def test_wrapper_with_multiple_writes_is_rejected(self):
+        source = SHELL.replace(
+            'wrapper();',
+            'wrapper();\nwrapper = factory(this, function () {});\nwrapper();').replace(
+            '{tail}', '$done({body:"ok"});')
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertIn('search', output)
 
     def test_callback_with_observable_effect_is_not_short_circuited(self):
         source = SHELL.replace('{tail}', '$done({});').replace(
