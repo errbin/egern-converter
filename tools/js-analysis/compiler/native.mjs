@@ -2157,6 +2157,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return {fields,optional};
  }
  function http(input,method,qx){
+  // `{url: op, ...op}` 只把同一个闭合请求记录重新展开一次。展开值会覆盖
+  // 先写的 url，且先写的值只是无副作用的同一绑定读取；后续实时记录证明
+  // 还会要求所有调用点都确定包含 url。满足这些条件时按 op 本身处理。
+  const selfURLSpread=node=>{
+   if(node?.type!=='ObjectExpression'||node.properties.length>2)return null;
+   const spread=node.properties.at(-1),leading=node.properties.slice(0,-1);
+   if(spread?.type!=='SpreadElement'||spread.argument.type!=='Identifier')return null;
+   const binding=bindings.get(spread.argument);if(!binding)return null;
+   if(leading.some(entry=>entry.type!=='Property'||entry.kind!=='init'||entry.method||entry.computed||key(entry)!=='url'||entry.value.type!=='Identifier'||bindings.get(entry.value)!==binding))return null;
+   return spread.argument;
+  };
   function stringValue(n,seen=new Set()){
    const stringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr']);
    if(values.string(n))return true;
@@ -2190,8 +2201,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    // 且请求对象的身份没有被别名复制或交给其它函数。请求参数可以在入口重绑一次为
    // 新的展开快照；此后只允许读取或改写已知字段。走与 $argument 相同的实时字段
    // 路径，发送时读取更新后的字段，不把修改折叠成表达式。
-   const liveLocalRequest=()=>{
-    if(input?.type!=='Identifier')return false;
+   const liveLocalRequest=(request=input)=>{
+    if(request?.type!=='Identifier')return false;
     const consoleMethods=new Set(['log','warn','error','info','debug']);
     // 日志观察只有在 console 本身没有被重绑定、交给未知函数或动态读取时
     // 才等价于静态观察；否则请求对象可能逃逸到未知代码。
@@ -2200,7 +2211,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      return member?.type==='MemberExpression'&&member.object===ref&&consoleMethods.has(property(member))&&call?.type==='CallExpression'&&call.callee===member;
     });
     const consoleObservation=call=>closedConsole&&call?.type==='CallExpression'&&call.callee.type==='MemberExpression'&&free(call.callee.object,'console')&&consoleMethods.has(property(call.callee));
-    const binding=bindings.get(input);
+    const binding=bindings.get(request);
     if(!binding||!binding.refs.length)return false;
     const parameter=nodes.some(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
     const fields=['url','method','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode',...(qx?['opts']:[])];
@@ -2427,7 +2438,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(!binding.init||binding.writes.length)return false;
      // 局部别名可以在别名建立前由源记录逐项装配字段；以别名读取点为界，
      // 只吸收此前、同一语句列表内完成的静态写入。
-     finalFields=recordFields(binding.init,new Set(),null,input);
+     finalFields=recordFields(binding.init,new Set(),null,request);
      if(!finalFields)return false;
     }else{
      if(binding.writes.length>1)return false;
@@ -2439,6 +2450,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      }
     }
     const dispatchOf=ref=>{
+     const spread=parents.get(ref);
+     if(spread?.type==='SpreadElement'&&spread.argument===ref&&parents.get(spread)===input&&selfURLSpread(input)===ref){
+      const call=parents.get(input);
+      if(call?.type==='CallExpression'&&call.arguments.includes(input)&&isAPI(call,'$task','fetch'))return call;
+     }
      const call=parents.get(ref);
      if(call?.type!=='CallExpression'||!call.arguments.includes(ref))return null;
      if(call.callee.type==='MemberExpression'){
@@ -2544,6 +2560,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(!parameter||binding.writes.length!==1||binding.writes[0]!==p)return false;
       continue;
      }
+     if(p?.type==='Property'&&p.value===ref&&parents.get(p)===input&&key(p)==='url'&&bindings.get(selfURLSpread(input))===binding)continue;
+     if(p?.type==='SpreadElement'&&p.argument===ref&&q===input&&selfURLSpread(input)===ref)continue;
      if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return false;
      const field=String(property(p));
      // 参数记录的字段集合来自所有闭合调用点。读取一个在所有记录中都不存在的
@@ -2626,13 +2644,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(!urlDefinite)return false;
     return true;
    };
-   const live=liveLocalRequest();
+   const live=liveLocalRequest(selfURLSpread(input)??input);
    if(!f&&(free(input,'$argument')&&!qx||live)){
     // 静的可见记录不允许把传输标志留到运行期判断：只能静态证明未启用才放行。
     // $argument 派生记录本身是运行期输入，沿用既有运行期守卫，不在本单元改动范围内。
     if(!free(input,'$argument')){
      const visible=resolve(input);
      if(visible?.type==='ObjectExpression')for(const property of visible.properties){
+      if(property.type!=='Property')continue;
       const name=String(key(property));
       if(!['binary-mode','full-header-mode'].includes(name))continue;
       const value=resolve(property.value);
@@ -3644,13 +3663,50 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return `{${out.join(', ')}}`;
  }
+ // QX 的 $task.fetch 回调可能直接解构旧响应。只有函数仅作为本次 then
+ // 的参数、解构字段全部属于已知响应字段且结链返回值被丢弃时，才把原生
+ // 响应物化为一次性数据快照；失败分支仍把原始错误对象交给同一回调。
+ function replyPattern(fn,call){
+  if(fn.generator||fn.params.length!==1||fn.params[0]?.type!=='ObjectPattern')return null;
+  // 解构快照会在回调前插入 await。回调自身若是完成函数，改写会把原本
+  // 同步的 $done 边界变成异步链，现有完成顺序证明不覆盖这种混合。
+  if(complete.has(fn))return null;
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),binding=id?bindings.get(id):null;
+  if(binding){if(binding.writes.length||!binding.refs.length||binding.refs.some(ref=>parents.get(ref)!==call||!call.arguments.includes(ref)))return null;}
+  else if(parent!==call||!call.arguments.includes(fn))return null;
+  const pattern=fn.params[0],fields=[],seen=new Set();let rest=null;
+  for(const entry of pattern.properties){
+   if(entry.type==='RestElement'){
+    if(rest||entry!==pattern.properties.at(-1)||entry.argument.type!=='Identifier')return null;
+    rest=entry.argument.name;continue;
+   }
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method||entry.computed||entry.value.type!=='Identifier')return null;
+   const name=key(entry);if(name===undefined||!replyFieldNames.has(String(name))||seen.has(String(name)))return null;
+   seen.add(String(name));fields.push({name:String(name),local:entry.value.name});
+  }
+  if(!fields.length&&!rest)return null;
+  return {fields,rest};
+ }
+ function replyPatternPrelude(info,raw){
+  const {fields,rest}=info.pattern,names=fields.map(field=>field.local).concat(rest?[rest]:[]);
+  const destructure=source.slice(info.fn.params[0].start,info.fn.params[0].end),headers=forwardedHeaders(raw),bytes=fresh('responseBytes'),text=fresh('responseText');
+  const snapshot=`{ statusCode: ${raw}.status, headers: ${headers}, body: ${text}, bodyBytes: ${bytes} }`;
+  return `let ${names.join(', ')};\nif (${raw} && typeof ${raw}.arrayBuffer === 'function') {const ${bytes} = await ${raw}.arrayBuffer();const ${text} = new TextDecoder().decode(${bytes});(${destructure} = ${snapshot});} else {(${destructure} = ${raw} ?? {});}`;
+ }
  // Register awaited QX replies and Promise callback parameters before rendering.
  for(const n of nodes){
   if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&n.init?.type==='AwaitExpression'&&(isAPI(n.init.argument,'$task','fetch')||bundled&&n.init.argument.type==='CallExpression'&&n.init.argument.callee.type==='MemberExpression'&&n.init.argument.callee.object.type==='MemberExpression'&&free(n.init.argument.callee.object.object,'$native')&&property(n.init.argument.callee.object)==='http')){const b=bindings.get(n.id),info=reply(b,null,true);if(!info.snapshot)extraAfter.set(n,()=>replyPrelude(info,n.id.name));}
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='then'&&isAPI(n.callee.object,'$task','fetch')){
    const fn=target(n.arguments[0]);if(!fn)fail(n,'HTTP 响应处理函数必须可静态追溯');
-   if(fn.params[0]&&fn.params[0].type!=='Identifier')fail(fn.params[0],'HTTP 响应参数必须是简单局部变量，不能保留旧响应解构');
-   if(fn.params[0]){const binding=bindings.get(fn.params[0]),forwarded=binding&&forwardedReply(binding,fn);if(!forwarded)reply(binding,fn,false);}
+   const chain=parents.get(n),statement=chain?.type==='ChainExpression'?parents.get(chain):chain;
+   if(fn.params[0]?.type==='ObjectPattern'&&statement?.type!=='ExpressionStatement')fail(n,'HTTP 响应解构回调必须位于返回值被丢弃的 Promise 链');
+   if(fn.params[0]?.type==='ObjectPattern'){
+    const pattern=replyPattern(fn,n);if(!pattern)fail(fn.params[0],'HTTP 响应解构必须是封闭的静态字段和尾部 rest');
+    const info={uses:new Set(pattern.fields.map(field=>field.name)),body:null,bytes:null,snapshot:true,fn,pattern};
+    httpReplies.set(fn,info);asyncFns.add(fn);
+   }else if(fn.params[0]){
+    const binding=bindings.get(fn.params[0]),forwarded=binding&&forwardedReply(binding,fn);if(!forwarded)reply(binding,fn,false);
+   }
   }
   if(n.type==='CallExpression'&&clientMethod(n.callee)){
    const fn=target(n.arguments[1]),p=fn?.params[1];
@@ -3923,10 +3979,15 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    // expression form; only API/async/completion boundaries require lowering.
    if(!complete.has(n)&&!info&&(!asyncFns.has(n)||n.async))return patch(source,n,render);
    let head=patch(source,{...n,body:null,end:n.body.start},render);
+   let prologue=info&&!info.pattern?replyPrelude(info,n.params[0].name):'';
+   if(info?.pattern){
+    const raw=fresh('response');
+    head=source.slice(n.start,n.params[0].start)+raw+source.slice(n.params[0].end,n.body.start);
+    prologue=replyPatternPrelude(info,raw);
+   }
    if(n.body.type!=='BlockStatement')head=head.slice(0,head.lastIndexOf('=>')+2)+' ';
    const method=parents.get(n)?.type==='MethodDefinition'||parents.get(n)?.type==='Property'&&parents.get(n).method;
    if(asyncFns.has(n)&&!n.async&&!method)head='async '+head;
-   const prologue=info?replyPrelude(info,n.params[0].name):'';
    if(n.body.type==='BlockStatement'){
     const body=render(n.body),inner=body.slice(1,-1);
     if(prologue&&n.body.body.some(s=>s.directive))fail(n,'HTTP 回调含 directive，需要先明确正文读取位置');
