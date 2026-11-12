@@ -1,6 +1,6 @@
 import {parse} from '../core/syntax.mjs';
 import {ordinaryReceivers} from './values.mjs';
-import {standardGlobals} from '../core/ast.mjs';
+import {standardGlobals,privateGlobalAssignment} from '../core/ast.mjs';
 
 // Static parsing only. No upstream code or decoder is evaluated.
 export function analyze(source, sourceFormat='surge', options={}) {
@@ -80,6 +80,7 @@ for(const {node:n,parent:p,key} of nodes) {
     if(n.name==='Promise')asynchronous=true;
     if(n.name.startsWith('$')&&!allowed.has(n.name))reasons.add('未适配 API：'+n.name);
     const standardGlobal=options.nativeStandardGlobals&&n.name==='globalThis'&&p?.type==='MemberExpression'&&p.object===n&&standardGlobals.has(staticProperty(p));
+    const privateGlobalWrite=privateGlobalAssignment({parents,free:item=>!bound(item.name,scopes.get(item))},n);
     if(standardGlobal){const q=parents.get(p);if(q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.operator==='delete')reasons.add('不能覆写标准 JavaScript 全局字段');}
     const callback=p?.arguments?.[0];
     const boundCallback=callback?.type==='CallExpression'&&callback.callee.type==='MemberExpression'&&callback.callee.object.type==='Identifier'&&staticProperty(callback.callee)==='bind'&&callback.arguments[0]?.type==='Literal'&&callback.arguments[0].value===null;
@@ -89,7 +90,7 @@ for(const {node:n,parent:p,key} of nodes) {
     // observable ordering. String callbacks still imply dynamic code.
     const nativeTimer=options.nativeStandardGlobals&&n.name==='setTimeout'&&p?.type==='CallExpression'&&p.callee===n&&[1,2].includes(p.arguments.length)&&callback?.type!=='Literal'&&(['Identifier','ArrowFunctionExpression','FunctionExpression','CallExpression','MemberExpression','ConditionalExpression','LogicalExpression','SequenceExpression'].includes(callback?.type)||boundCallback);
     const nativeEvaluation=options.nativeStandardGlobals&&['eval','Function'].includes(n.name);
-    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!nativeTimer&&!nativeEvaluation)reasons.add('运行环境或动态/异步依赖：'+n.name);
+    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!privateGlobalWrite&&!nativeTimer&&!nativeEvaluation)reasons.add('运行环境或动态/异步依赖：'+n.name);
     if(n.name==='$done')done=true;
     if(n.name==='$task'||n.name==='$httpClient')asynchronous=true;
     if(members[n.name]) {

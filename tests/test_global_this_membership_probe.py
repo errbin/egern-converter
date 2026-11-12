@@ -34,3 +34,29 @@ class GlobalThisMembershipProbeTests(unittest.TestCase):
             source="const has=n=>n in globalThis;"+change+"$done({body:has('Egern')?'yes':'no'});"
             with self.subTest(change=change),self.assertRaises(ConversionError):
                 convert_script(source,'Fixture',URL,'')
+
+    def test_private_static_global_write_is_preserved(self):
+        source="globalThis._fixture_private=1;$done({body:'ok'});"
+        output=convert_script(source,'Fixture',URL,'')
+        self.assertIn('_fixture_private',output)
+        self.assertIn('globalThis._fixture_private',output)
+
+    def test_global_write_outside_private_whole_value_stays_rejected(self):
+        for change in [
+            "const value=globalThis._fixture_private;",
+            "globalThis['_fixture_private']=1;",
+            "const key='_fixture_private';globalThis[key]=1;",
+            "globalThis.fixturePrivate=1;",
+            "globalThis.alert=1;",
+            "globalThis.Object=1;",
+            "globalThis.Egern=1;",
+            "globalThis.process=1;",
+            "globalThis.setTimeout=1;",
+            "globalThis._fixture_private+=1;",
+            "delete globalThis._fixture_private;",
+            "globalThis.__proto__=1;",
+            "globalThis.constructor=1;",
+        ]:
+            source=change+"$done({body:'ok'});"
+            with self.subTest(change=change),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'')

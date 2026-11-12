@@ -127,6 +127,33 @@ const $=new Env();
             with self.subTest(expression=expression), self.assertRaises(ConversionError):
                 convert(source)
 
+    def test_host_request_header_fields_are_read_only(self):
+        positive = ('function handle(request){return String(request.headers["x-a"]||"")+":"'
+                    '+String(request.headers.xB||"")+":"+Object.keys(request.headers).join(",")}'
+                    '(async()=>{if($response){$done({body:handle($request)})}else{$done($request)}})();')
+        output = convert(positive)
+        self.assertIn('const hostRequest', output)
+        fixture = {'name': 'host request headers',
+                   'request': {'url': URL, 'headers': {'x-a': 'one', 'xB': 'two'}},
+                   'response': {'status': 200, 'body': 'x'},
+                   'expected': {'result': {'body': 'one:two:x-a,xB'}}}
+        result = compare(positive, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+        negatives = [
+            'request.headers["x-a"]="z"',
+            'delete request.headers["x-a"]',
+            'request.headers["x-a"]+=1',
+            'request.headers()',
+            'return request.headers.__proto__',
+        ]
+        for expression in negatives:
+            statement = expression if expression.startswith('return ') else expression+';'
+            source = ('function handle(request){'+statement+'return "ok"}'
+                      '(async()=>{if($response){$done({body:handle($request)})}else{$done($request)}})();')
+            with self.subTest(expression=expression), self.assertRaises(ConversionError):
+                convert(source)
+
     def test_qualified_client_counts_as_platform_evidence_and_task_fetch_is_present(self):
         source = ('const platform=globalThis.$httpClient?"legacy":"qx";'
                   'if("undefined"!=typeof $task&&$task.fetch){$done({body:platform+":qx"})}'

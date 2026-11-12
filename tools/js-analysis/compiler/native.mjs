@@ -3942,7 +3942,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const snapshotStringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr','split','includes','startsWith','endsWith','match','matchAll','search','indexOf','lastIndexOf','slice']);
  // 直接内联 helper 的宿主参数只在已证明的静态字段上使用；快照在调用边界
  // 建立，后续包装记录与返回值只携带本地数据，不再保留宿主对象身份。
- const inlineHostSnapshotProof=(binding,directFields,{allowedWrites=null,allowDone=false}={})=>{
+ const inlineHostSnapshotProof=(binding,directFields,{allowedWrites=null,allowDone=false,allowDynamicHeaders=false}={})=>{
   if(!binding)return false;
   for(const ref of binding.refs){
    const p=parents.get(ref),q=parents.get(p),other=p?.left===ref?p.right:p?.right===ref?p.left:null;
@@ -3954,7 +3954,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(q?.type==='MemberExpression'&&q.object===p){
      const nested=property(q);
      if(String(field)==='headers'){
-      if(nested===undefined||parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)return false;
+      const use=parents.get(q);
+      if(nested===undefined&&!allowDynamicHeaders||['__proto__','prototype','constructor'].includes(String(nested)))return false;
+      if(use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===q)return false;
       continue;
      }
      if(['url','method'].includes(String(field))&&nested!==undefined&&snapshotStringMethods.has(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q)continue;
@@ -4065,7 +4067,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(q?.type==='MemberExpression'&&q.object===p){
      const nested=property(q),stringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr','split','includes','startsWith','endsWith','match','matchAll','search','indexOf','lastIndexOf','slice']);
      if(field==='headers'){
-      if(nested===undefined||['__proto__','prototype','constructor'].includes(String(nested)))return stop('nested field:'+field);
+      if(nested!==undefined&&['__proto__','prototype','constructor'].includes(String(nested)))return stop('nested field:'+field);
      }else if(['url','method'].includes(field)&&nested!==undefined&&stringMethods.has(String(nested))&&parents.get(q)?.type==='CallExpression'&&parents.get(q).callee===q){
       // url / method 是宿主保证的字符串字段；只允许原地调用字符串方法。
      }else return stop('nested field:'+field);
@@ -4154,7 +4156,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const parameterBinding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
     const proof=parameterProof(parameterBinding);
     if(!proof){
-     if(functions.has(p.callee.type)&&inlineHostSnapshotProof(parameterBinding,directFields)){for(const field of directFields)reads.add(field);whole.push(ref);continue;}
+     if(functions.has(p.callee.type)&&inlineHostSnapshotProof(parameterBinding,directFields,{allowDynamicHeaders:true})){for(const field of directFields)reads.add(field);whole.push(ref);continue;}
      return stop('whole proof');
     }
     if(proof.returnsRequest&&!ignored(p)&&(proof.directReturn||!proof.returnedFields.size))return stop('whole proof');
@@ -4194,7 +4196,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const hostResponseReads=proveHostResponseSnapshot();
  if(hostRequestReads){
   hostRequestSnapshot=fresh('hostRequest');
-  const headers=`(() => {const value = ${context}.request.headers;if (value && typeof value.entries === 'function') {const result = {};for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return {...(value ?? {})};})()`;
+  const headers=`(() => {const value = ${context}.request.headers;if (value && typeof value.entries === 'function') {const result = Object.create(null);for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return Object.assign(Object.create(null), value ?? {});})()`;
   hostRequestInitializers=[`const ${hostRequestSnapshot} = {${[...hostRequestReads].map(field=>field==='body'?`body: ${readBody('$request','body')}`:field==='bodyBytes'?`bodyBytes: ${readBody('$request','bodyBytes')}`:field==='headers'?`headers: ${headers}`:`${JSON.stringify(field)}: ${context}.request[${JSON.stringify(field)}]`).join(', ')}};`];
  }
  if(hostResponseReads){

@@ -462,3 +462,16 @@ export const standardGlobals=new Set([
  'TextEncoder','TextDecoder','URL','URLSearchParams','Request','Response','Headers',
  'atob','btoa',
 ]);
+
+// 对私有静态全局成员的整值写入不读取宿主能力；保留原写入即可保持副作用。
+// 只接受 `globalThis._privateName = value`：前导下划线是项目私有全局的明确
+// 约定，动态键、标准全局、平台 API 和 `__proto__` 等危险成员仍按原规则拒绝。
+const privateGlobalDenied=new Set(['window','global','process','require','module','exports','document','self','navigator','location','fetch','crypto','console','setTimeout','setInterval','setImmediate','queueMicrotask','structuredClone','performance','WebSocket','XMLHttpRequest','localStorage','sessionStorage','Egern','Cloudflare','__proto__','prototype','constructor']);
+export function privateGlobalAssignment(ix,node){
+ if(node?.type!=='Identifier'||!ix.free(node,'globalThis'))return false;
+ const member=ix.parents.get(node),name=member?.type==='MemberExpression'?property(member):undefined;
+ if(member?.type!=='MemberExpression'||member.object!==node||member.computed||typeof name!=='string')return false;
+ if(!/^_[\w$]+$/.test(name)||standardGlobals.has(name)||privateGlobalDenied.has(name))return false;
+ const write=ix.parents.get(member);
+ return write?.type==='AssignmentExpression'&&write.operator==='='&&write.left===member;
+}

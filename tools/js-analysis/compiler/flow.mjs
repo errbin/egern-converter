@@ -1,4 +1,4 @@
-import {children,patch,renderTree,property,key,functions,initializedAfter,closedAsyncCompletionRoot,standardGlobals as builtin,index} from '../core/ast.mjs';
+import {children,patch,renderTree,property,key,functions,initializedAfter,closedAsyncCompletionRoot,standardGlobals as builtin,index,privateGlobalAssignment} from '../core/ast.mjs';
 import {parse} from '../core/syntax.mjs';
 import {valueFacts} from '../analysis/values.mjs';
 
@@ -292,6 +292,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   }
   if(free(n,'globalThis')){
    const p=parents.get(n);
+   if(privateGlobalAssignment(ix,n))continue;
    if(p?.type==='MemberExpression'&&p.object===n&&builtin.has(property(p)))continue;
    if(p?.type==='CallExpression'&&p.arguments.includes(n)){
     const fns=targets(p.callee),param=p.arguments.indexOf(n);
