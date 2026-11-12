@@ -167,4 +167,6 @@ JavaScript 原生编译支持封闭的回调转发函数、响应别名 getter�
 
 共享请求对象中的 `opts.filter` 按实际调用 API 区分：它是 Quantumult X 的独立响应过滤器（官方示例：<https://raw.githubusercontent.com/crossutility/Quantumult-X/master/sample-fetch-opts-filter.js>），不会在 Surge / Loon 等回调 HTTP 分支执行。该分支仅允许可追溯、无修改和逃逸的静态字符串过滤选项，不把字符串当作可执行源码，不将其传入 `ctx.http`；未知字段、访问器、动态初始化仍拒绝。QX 分支仍须证明其响应过滤语义，不可使用此规则静默忽略。
 
+已审查的 QX 单例客户端 `fetch` 只有在方法摘要匹配基于 `$task.fetch` 的实现时才展开：原实现的 `statusCode` 投影为原生响应状态，`body` 与 `bodyBytes` 在单次正文流快照中共存；请求同时提供两者时按原实现由 `bodyBytes` 覆盖正文，但被覆盖的正文必须是可证明无副作用的字面量。`opts` 必须是可枚举静态对象，仅允许 `redirection`、`skip-cert-verify`、`auto-cookie` 和 `policy`，三个布尔项须为静态值。依赖 `$httpClient` 的回调式 `fetch`、`id/sessionIndex` 会话映射、动态展开、未知 `opts` 及有副作用覆盖正文继续显式拒绝。
+
 封闭请求记录可保留 `console.log/info/warn/error/debug` 的普通打印，前提是全局 console 只通过这些成员直接调用、没有覆写或逃逸；未知观察函数仍不获得只读证明。条件表达式两侧的普通请求对象合并字段集合，URL 必须始终存在，缺省正文／请求头按实际存在性投影，传输标志仍要求各分支相同。空对象在 `if/else` 两侧赋 URL 时，按控制流证明调用前必定赋值，不执行条件、不重放初始化或覆盖表达式；循环或单侧赋值不能替代该证明。

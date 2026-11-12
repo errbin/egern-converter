@@ -280,7 +280,40 @@ export function lowerClients(source,format='surge'){
    const action=behavior==='empty-url'||behavior==='always-url'?`, {url: ${at(3,'""')} ?? ''}`:behavior==='conditional-url'&&a[3]?`, {url: ${at(3)}}`:'';
    text=format==='qx'?`$notify(${at(0,JSON.stringify(info.name))}, ${at(1,'""')}, ${at(2,'""')}${action})`:`$notification.post(${at(0,JSON.stringify(info.name))}, ${at(1,'""')}, ${at(2,'""')}${action})`;
   }else if(field==='fetch'){
-   if(format==='qx')fail(q,'QX fetch 的 statusCode/bodyBytes/opts 返回契约尚未展开');
+   if(format==='qx'){
+    // QX 客户端存在两类 fetch 实现。只有基于 $task.fetch 的版本同时具备
+    // statusCode、bodyBytes 和 opts 契约；回调版依赖 QX 不存在的 $httpClient。
+    if(digest(m,info.family)!=='2643c61826fd260e73331451265d4dfa5f4d7f70ba42eeffd93af74a9cb4803f')fail(q,'QX 客户端 fetch 缺少基于 $task.fetch 的已确认 statusCode/bodyBytes/opts 契约');
+    if(q.arguments.length!==1||q.arguments.some(a=>a.type==='SpreadElement'))fail(q,'QX 客户端 fetch 必须保留单个请求对象的求值语义');
+    const raw=q.arguments[0],input=resolve(raw),fields=new Map();
+    if(!input||input.type!=='ObjectExpression')fail(raw,'QX 客户端 fetch 的请求必须是可枚举的静态对象');
+    for(const p of input.properties){
+     const name=p.type==='Property'&&p.kind==='init'&&!p.method&&!p.computed?key(p):undefined;
+     if(name===undefined||name==='__proto__'||fields.has(name))fail(p,'QX 客户端 fetch 的请求字段必须唯一且可枚举');
+     fields.set(name,p.value);
+    }
+    for(const name of fields.keys())if(!['url','method','headers','body','bodyBytes','timeout','opts'].includes(name))fail(input,'QX 客户端 fetch 缺少 '+name+' 的原生映射判据');
+    if(!fields.has('url'))fail(input,'QX 客户端 fetch 缺少可确定 URL');
+    const options=fields.get('opts');
+    if(options!==undefined){
+     const value=resolve(options);
+     if(!value||value.type!=='ObjectExpression')fail(options,'QX 客户端 fetch 的 opts 必须是可枚举的静态对象');
+     const seen=new Set();
+     for(const p of value.properties){
+      const name=p.type==='Property'&&p.kind==='init'&&!p.method&&!p.computed?key(p):undefined;
+      if(name===undefined||seen.has(name))fail(p,'QX 客户端 fetch 的 opts 字段必须唯一且可枚举');
+      seen.add(name);
+      if(!['redirection','skip-cert-verify','auto-cookie','policy'].includes(name))fail(p,'QX 客户端 fetch 的 opts 缺少 '+name+' 的原生映射判据');
+      if(name!=='policy'){const flag=resolve(p.value);if(!flag||flag.type!=='Literal'||typeof flag.value!=='boolean')fail(p.value,'QX 客户端 fetch 的 opts.'+name+' 必须是静态布尔值');}
+     }
+    }
+    if(fields.has('body')&&fields.has('bodyBytes')){
+     const body=resolve(fields.get('body'));
+     const discardable=!body||body.type==='Literal'||free(body,'undefined')||body.type==='TemplateLiteral'&&!body.expressions.length||body.type==='UnaryExpression'&&body.operator==='void';
+     if(!discardable)fail(fields.get('body'),'QX 客户端 fetch 同时设置 body/bodyBytes 时，被 bodyBytes 覆盖的正文必须是无副作用字面量');
+    }
+    text='$task.fetch('+render(raw)+')';
+   }else{
    const input=q.arguments[0];if(q.arguments.length!==1||input?.type!=='ObjectExpression'||input.properties.some(p=>p.type!=='Property'||p.computed))fail(q,'HTTP 请求必须是可确定字段的对象');
    const fields=new Map(input.properties.map(p=>[key(p),p.value]));
    if([...fields.keys()].some(k=>!['url','method','headers','body','bodyBytes','timeout','policy','insecure','auto-redirect','auto-cookie'].includes(k)))fail(q,'客户端 HTTP 请求包含未知选项');
@@ -290,6 +323,7 @@ export function lowerClients(source,format='surge'){
    for(const [name,key,yes,no]of [['auto-redirect','redirect','follow','manual'],['auto-cookie','credentials','include','omit']])if(fields.has(name))options.push(`${key}: ${render(fields.get(name))} ? '${yes}' : '${no}'`);
    if(fields.has('insecure'))options.push('insecureTls: '+render(fields.get('insecure')));
    text=`$native.http.${verb.toLowerCase()}(${render(fields.get('url'))}, {${options.join(', ')}})`;
+   }
   }else fail(q,'尚未展开客户端方法 '+field);
   replacements.set(q,text);
  }
