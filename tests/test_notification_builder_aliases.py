@@ -71,6 +71,39 @@ notify();$done({});''',
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_sequential_notification_url_fields_share_one_static_source(self):
+        # 通知调用前按顺序写入的字段可静态装配；多平台同时写 url/open-url
+        # 时，值必须来自同一字面量或同一未写入绑定，调用后的写入仍拒绝。
+        sources = [
+            ("var u='https://a.test',o={};o['open-url']=u,o.url=u,{call};$done({});", 'literal fields'),
+            ("var u='https://a.test',a=u,b=u,o={};o.url=a,o['open-url']=b,{call};$done({});", 'shared binding'),
+            ("var u='https://a.test',o={};$request.url&&(o.url=u),{call};$done({});", 'conditional field'),
+        ]
+        fixture = {'name':'sequential notification fields','request':{'url':URL},'expected':{'events':{'notifications':[
+            {'title':'t','subtitle':'s','body':'b','action':{'type':'openUrl','url':'https://a.test'}},
+        ]}}}
+        for source_format, call in [('surge','$notification.post("t","s","b",o)'),
+                                    ('loon','$notification.post("t","s","b",o)'),
+                                    ('qx','$notify("t","s","b",o)')]:
+            for template, name in sources:
+                with self.subTest(source_format=source_format, name=name):
+                    source=template.replace('{call}',call)
+                    output=convert_script(source,'Fixture',URL,'',source_format=source_format)
+                    result=compare(source,output,source_format,URL,fixture)
+                    self.assertEqual(result['status'],'passed',result)
+                    self.assertIn('.notify',output)
+
+    def test_out_of_order_or_conflicting_notification_url_writes_still_reject(self):
+        sources = [
+            "var u='https://a.test',v='https://b.test',o={};o.url=u,o['open-url']=v,"
+            "$notification.post('t','s','b',o);$done({});",
+            "var u='https://a.test',o={};$notification.post('t','s','b',o),o.url=u;$done({});",
+            "var u='https://a.test',o={};o[$argument]=u,$notification.post('t','s','b',o);$done({});",
+        ]
+        for source in sources:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='surge')
+
 
 if __name__ == '__main__':
     unittest.main()

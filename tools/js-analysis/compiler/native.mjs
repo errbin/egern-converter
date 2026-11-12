@@ -1034,6 +1034,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return {method:forwarded,request:n.arguments[1],callback:n.arguments[2],call:n};
  }
  function terminal(n){
+  // 逗号序列的完成结果由最后一个操作数决定；前面的操作数只保留求值顺序。
+  // 只有末项可证完成时才把整个序列视为完成，避免把中途 side effect 当成结果。
+  if(n?.type==='SequenceExpression')return terminal(n.expressions.at(-1));
   if(n?.type!=='CallExpression')return false;
   if(isDone(n))return true;
   if(clientMethod(n.callee)&&complete.has(target(n.arguments[1])))return true;
@@ -1180,6 +1183,16 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const e=n.expression,fn=target(e.callee);
    const asyncCompletion=e.type==='CallExpression'&&(fn&&asyncFns.has(fn)||clientMethod(e.callee)||e.callee.type==='MemberExpression'&&['then','catch'].includes(property(e.callee)));
    if(asyncCompletion&&!tail(n)&&!pending?.calls.has(e))fail(n,'未等待的完成任务后还有语句，可能并发执行，不能直接传播 return');
+  }
+  if(n.type==='SequenceExpression'){
+   // 非末项若经嵌套函数或完成函数引用触发完成，转换只能从嵌套函数返回，
+   // 外层仍会继续求值后续项；只有同一 owner 内的直接完成调用能立即 return。
+   for(const part of n.expressions.slice(0,-1)){
+    const within=node=>node.start>=part.start&&node.end<=part.end;
+    const nestedCompletion=nodes.some(node=>within(node)&&isDone(node)&&owners.get(node)!==owners.get(n));
+    const indirectTerminal=nodes.some(node=>within(node)&&node.type==='CallExpression'&&!isDone(node)&&terminal(node));
+    if(nestedCompletion||indirectTerminal)fail(part,'逗号序列前项含完成操作但后续操作数仍会执行，无法保持原始终止顺序');
+   }
   }
   if(functions.has(n.type)&&complete.has(n)){
    const p=parents.get(n);
@@ -1961,7 +1974,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const opt=resolve(a[3]);if(free(opt,'undefined')||opt?.type==='UnaryExpression'&&opt.operator==='void'&&opt.argument.type==='Literal'||opt?.type==='Literal'&&opt.value===null){}
    else if(opt?.type==='Literal'&&typeof opt.value==='string'||values.string(a[3]))out.push(`action: {type: 'openUrl', url: ${argument(3)}}`);
    else {
-    const mutable=returned??notificationFields(a[3])??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
+    const mutable=returned??notificationFields(a[3],n)??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
     if(mutable?.stringUrl)out.push(`...(typeof ${argument(3)} === 'string' ? {action: {type: 'openUrl', url: ${argument(3)}}} : {})`);
     const f=mutable?.fields??object(a[3],'通知参数'),allowed=['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'];
     const value=k=>captured?`${argument(3)}${mutable?.nullable?'?.':''}[${JSON.stringify(k)}]`:render(f.get(k));
@@ -1974,10 +1987,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     }else{
     const urls=['url','openUrl','open-url'].filter(k=>f.has(k));
     // 多平台脚本会同时写 QX 的 open-url 和通用 url。只有所有字段都是同一个
-    // 静态字面量时，选中任意一个才不影响通知目标；其它组合仍是冲突。
+    // 可静态追溯的值（同一字面量或同一未写入绑定）时，选中任意一个才不影响
+    // 通知目标；其它组合仍是冲突。
     if(urls.length>1){
      const first=resolve(f.get(urls[0]));
-     if(!(first?.type==='Literal'&&typeof first.value==='string'&&urls.every(k=>{const v=resolve(f.get(k));return v?.type==='Literal'&&v.value===first.value;})))fail(a[3],'通知 URL 字段冲突');
+     if(!urls.every(k=>{
+      const value=resolve(f.get(k));
+      if(value===first)return true;
+      if(first?.type==='Literal'&&value?.type==='Literal')return typeof first.value===typeof value.value&&first.value===value.value;
+      const a=first?.type==='Identifier'?bindings.get(first):null,b=value?.type==='Identifier'?bindings.get(value):null;
+      return !!a&&a===b&&!a.writes.length;
+     }))fail(a[3],'通知 URL 字段冲突');
     }
     const url=urls.length?f.get(urls[0]):null,clip=f.get('update-pasteboard')??(resolve(f.get('action'))?.value==='clipboard'?f.get('text'):null);
     if(url&&clip)fail(a[3],'通知操作冲突');
@@ -2110,7 +2130,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if([...fields.keys()].some(k=>!['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'].includes(k)))return null;
   return {fields,optional:new Set([...fields.keys()].filter(k=>required.some(s=>!s.has(k)))),nullable:true,stringUrl,returnedRecord:true};
  }
- function notificationFields(ref){
+ function notificationFields(ref,call){
   if(ref.type!=='Identifier')return null;
   const b=bindings.get(ref),initial=resolve(ref);
   if(!b||b.writes.length||initial?.type!=='ObjectExpression')return null;
@@ -2121,7 +2141,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='CallExpression'&&p.arguments[3]===r&&(isAPI(p,'$notify')||isAPI(p,'$notification','post')))continue;
    if(p?.type==='CallExpression'&&p.arguments[0]===r&&p.arguments.length===1&&p.callee.type==='MemberExpression'&&free(p.callee.object,'JSON')&&property(p.callee)==='stringify')continue;
    if(p?.type!=='MemberExpression'||p.object!==r||property(p)===undefined)return null;
-   if(q?.type==='AssignmentExpression'&&q.left===p&&q.operator==='='){writes.push(p);continue;}
+   if(q?.type==='AssignmentExpression'&&q.left===p&&q.operator==='='){
+    if(!call)return null;
+    if(q.start>=call.start)fail(ref,'通知参数在通知调用后仍被修改，无法确定发送时的字段值');
+    writes.push(p);continue;
+   }
    return null; // No aliases, deletes, accessors, dynamic keys or unknown calls.
   }
   if(!writes.length)return null;

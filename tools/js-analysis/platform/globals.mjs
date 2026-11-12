@@ -97,11 +97,150 @@ export function probeResultSafeAt(ix,start){
 export function platformFold(source,format,options={}){
  let qx;
  for(let pass=0;pass<3;pass++){
-  const folded=fold(source,format,options,qx);qx=folded.qx;
+  const literalCalls=foldClosedLiteralMethodCalls(source);
+  const folded=fold(literalCalls,format,options,qx);qx=folded.qx;
   if(folded.source===source)return folded;
   source=folded.source;
  }
  return {source,qx};
+}
+
+// 折叠闭合对象字面量表上的纯谓词/转换方法。判据要求表绑定只被静态成员
+// 访问、被调用方法从未被写入，且方法体只读取参数、字面量和未被写入的表
+// 字段。这样可以安全移除与当前调用无关的其它字段写入，而不把表当成整体
+// 不可变对象；任何动态键、别名逃逸、方法重绑或未知调用都保持原样。
+export function foldClosedLiteralMethodCalls(source){
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
+ catch{return source;}
+ const {nodes,parents,bindings}=ix,UNKNOWN=Symbol('unknown'),infos=new Map(),edits=[];
+ const staticKey=member=>property(member);
+ function infoFor(binding){
+  if(infos.has(binding))return infos.get(binding);
+  const declarations=nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding);
+  const init=declarations.length===1&&declarations[0].init;
+  if(!binding||binding.writes.length||declarations.length!==1||init?.type!=='ObjectExpression'){
+   infos.set(binding,null);return null;
+  }
+  const fields=new Map();
+  for(const p of init.properties){
+   const name=p.type==='Property'?key(p):undefined;
+   if(p.type!=='Property'||p.kind!=='init'||name===undefined||name==='__proto__'||fields.has(name)){
+    infos.set(binding,null);return null;
+   }
+   fields.set(name,p.value);
+  }
+  const written=new Set();
+  for(const ref of binding.refs){
+   const member=parents.get(ref),use=parents.get(member);
+   if(member?.type==='MemberExpression'&&member.object===ref&&staticKey(member)!==undefined){
+    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')written.add(staticKey(member));
+    continue;
+   }
+   // 整体值只允许出现在不会修改对象的纯观察位置。字符串拼接、String/
+   // JSON 序列化和 truthiness/typeof 检查都不会写入表字段或替换方法。
+   const pureObservation=member?.type==='CallExpression'&&member.arguments.includes(ref)&&(
+    member.callee.type==='Identifier'&&ix.free(member.callee,'String')||
+    member.callee.type==='MemberExpression'&&property(member.callee)==='concat'&&
+     (member.callee.object.type==='Literal'&&typeof member.callee.object.value==='string'||ix.free(member.callee.object,'String'))||
+    member.callee.type==='MemberExpression'&&property(member.callee)==='stringify'&&ix.free(member.callee.object,'JSON'))||
+    member?.type==='UnaryExpression'&&['!','typeof','void'].includes(member.operator)||
+    member?.type==='BinaryExpression'||member?.type==='LogicalExpression'||
+    ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(member?.type)&&member.test===ref;
+   if(!pureObservation){infos.set(binding,null);return null;}
+   if(member.type==='CallExpression'&&member.callee.type==='Identifier')continue;
+   if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')written.add(staticKey(member));
+  }
+  // 调用点必须位于唯一初始化声明之后；否则折叠会吞掉 TDZ 或 undefined
+  // 读取异常。嵌套函数仍按源码顺序保守处理，不做跨调用图推断。
+  const info={fields,written,end:declarations[0].end};
+  infos.set(binding,info);return info;
+ }
+ function fieldValue(binding,name,seen=new Set()){
+  const info=infoFor(binding);if(!info||!info.fields.has(name)||info.written.has(name))return UNKNOWN;
+  return constantValue(info.fields.get(name),binding,new Map(),seen);
+ }
+ function primitive(value){return value===undefined||value===null||['string','number','boolean'].includes(typeof value);}
+ function constantValue(n,binding,env,seen){
+  if(!n||seen.has(n))return UNKNOWN;seen=new Set(seen);seen.add(n);
+  if(n.type==='Literal')return n.regex?UNKNOWN:n.value;
+  if(n.type==='Identifier'){
+   if(ix.free(n,'undefined'))return undefined;
+   const b=bindings.get(n);return b&&env.has(b)?env.get(b):UNKNOWN;
+  }
+  if(n.type==='MemberExpression'&&n.object.type==='Identifier'&&bindings.get(n.object)===binding){
+   const name=staticKey(n);return name===undefined?UNKNOWN:fieldValue(binding,name,seen);
+  }
+  if(n.type==='UnaryExpression'){
+   if(n.operator==='typeof'&&n.argument.type==='Identifier'&&ix.free(n.argument,'undefined'))return 'undefined';
+   const value=constantValue(n.argument,binding,env,seen);if(value===UNKNOWN)return UNKNOWN;
+   if(n.operator==='!')return !value;
+   if(n.operator==='void')return undefined;
+   if(n.operator==='typeof')return typeof value;
+   if(n.operator==='+')return +value;
+   if(n.operator==='-')return -value;
+   return UNKNOWN;
+  }
+  if(n.type==='BinaryExpression'){
+   const a=constantValue(n.left,binding,env,seen),b=constantValue(n.right,binding,env,seen);
+   if(a===UNKNOWN||b===UNKNOWN)return UNKNOWN;
+   switch(n.operator){
+    case '===':return a===b;
+    case '!==':return a!==b;
+    case '==':return primitive(a)&&primitive(b)&&typeof a===typeof b?a===b:UNKNOWN;
+    case '!=':return primitive(a)&&primitive(b)&&typeof a===typeof b?a!==b:UNKNOWN;
+    case '<':return a<b;case '<=':return a<=b;case '>':return a>b;case '>=':return a>=b;
+    case '+':return primitive(a)&&primitive(b)&&(typeof a==='string'||typeof b==='string')?String(a)+String(b):a+b;
+    case '-':return a-b;case '*':return a*b;case '/':return a/b;case '%':return a%b;
+    default:return UNKNOWN;
+   }
+  }
+  if(n.type==='LogicalExpression'){
+   const a=constantValue(n.left,binding,env,seen);if(a===UNKNOWN)return UNKNOWN;
+   if(n.operator==='&&')return a?constantValue(n.right,binding,env,seen):a;
+   if(n.operator==='||')return a?a:constantValue(n.right,binding,env,seen);
+   if(n.operator==='??')return a==null?constantValue(n.right,binding,env,seen):a;
+   return UNKNOWN;
+  }
+  if(n.type==='ConditionalExpression'){
+   const test=constantValue(n.test,binding,env,seen);if(test===UNKNOWN)return UNKNOWN;
+   return constantValue(test?n.consequent:n.alternate,binding,env,seen);
+  }
+  return UNKNOWN;
+ }
+ function literal(value){
+  if(value===undefined)return 'undefined';
+  if(value===null)return 'null';
+  if(typeof value==='string')return JSON.stringify(value);
+  if(typeof value==='boolean')return String(value);
+  if(typeof value==='number'&&!Number.isNaN(value))return Object.is(value,-0)?'-0':String(value);
+  return null;
+ }
+ for(const call of nodes){
+  if(call.type!=='CallExpression'||call.optional||call.callee.type!=='MemberExpression'||call.arguments.some(a=>a.type==='SpreadElement'))continue;
+  const object=call.callee.object,name=staticKey(call.callee);
+  if(object.type!=='Identifier'||name===undefined)continue;
+  const binding=bindings.get(object),info=infoFor(binding),method=info?.fields.get(name);
+  if(!info||call.start<info.end||info.written.has(name)||!functions.has(method?.type)||method.async||method.generator||method.body.type==='BlockStatement'&&method.body.body.length!==1)continue;
+  if(method.params.some(p=>p.type!=='Identifier'||bindings.get(p)?.writes.length)||call.arguments.length!==method.params.length)continue;
+  if(index(method).nodes.some(n=>n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n)))continue;
+  const expression=method.body.type==='BlockStatement'?method.body.body[0]?.type==='ReturnStatement'?method.body.body[0].argument:null:method.body;
+  if(!expression)continue;
+  const env=new Map();
+  let valid=true;
+  for(let i=0;i<method.params.length;i++){
+   const value=constantValue(call.arguments[i],binding,new Map(),new Set());
+   if(value===UNKNOWN){valid=false;break;}
+   env.set(bindings.get(method.params[i]),value);
+  }
+  if(!valid)continue;
+  const value=constantValue(expression,binding,env,new Set()),replacement=literal(value);
+  if(replacement!==null)edits.push({start:call.start,end:call.end,replacement});
+ }
+ if(!edits.length)return source;
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
+ return output;
 }
 // 最终产物里若仍有缺失的 Node/浏览器全局探测，且探测结果流入未知函数，
 // 就不能用“目标宿主缺失”解释它的用途。保留拒绝，避免把探针结果交给

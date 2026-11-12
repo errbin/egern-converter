@@ -56,6 +56,33 @@ class NativeImplicitAndDiscardBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ConversionError, '完成操作嵌入表达式'):
             self.convert(source)
 
+    def test_sequence_completion_propagates_from_the_tail_or_direct_owner_call(self):
+        # 直接完成调用由同一 owner 立即 return，可安全位于序列前项；末项的
+        # 嵌套完成也会把结果作为整个序列的返回值传播。
+        self.check('function tail(){}tail(),$done({body:"ok"});',
+                   {'name':'direct completion before tail',
+                    'expected':{'result':{'body':'ok'}}})
+        source=('function tail(){}$argument?$done({body:"early"}):0,tail(),'
+                '$done({body:"fallback"});')
+        self.check(source,{'name':'conditional direct completion',
+                           'expected':{'result':{'body':'fallback'}}})
+        self.check(source,{'name':'conditional direct completion branch','argument':'go',
+                           'expected':{'result':{'body':'early'}}})
+        self.check('function tail(){}tail(),(()=>{$done({body:"ok"})})();',
+                   {'name':'nested completion at sequence tail',
+                    'expected':{'result':{'body':'ok'}}})
+
+    def test_sequence_completion_inside_nested_owner_before_tail_is_rejected(self):
+        # 嵌套 IIFE 或完成函数引用的 return 只退出自身，外层仍会求值后续项；
+        # 这种形态无法保持原脚本“完成即终止”的顺序。
+        for source in [
+            '(()=>{$done({body:"ok"})})(),(()=>{throw new Error("late")})();',
+            'function finish(){$done({body:"ok"})}finish(),unknownTail();',
+        ]:
+            with self.subTest(source=source), \
+                    self.assertRaisesRegex(ConversionError, '逗号序列前项含完成操作'):
+                self.convert(source)
+
     def test_conditional_implicit_global_direct_call_is_rejected(self):
         # 条件初始化的隐式全局直接作为调用目标时，函数身份和完成契约均未知。
         source = 'if($argument)conditionalCallable=()=>1;conditionalCallable();$done({});'
