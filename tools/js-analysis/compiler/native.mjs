@@ -557,19 +557,32 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  for(const n of nodes)if(n.type==='Identifier'&&free(n)){
   const p=parents.get(n);if(p?.type==='AssignmentExpression'&&p.left===n){if(!implicitGroups.has(n.name))implicitGroups.set(n.name,[]);implicitGroups.get(n.name).push(n);}
  }
- const strictImplicit=new Set();
+ const strictImplicit=new Set(),sloppyImplicit=new Set(),mixedImplicit=new Set();
  if(implicitGroups.size){
   const input=index(parse(libraries.source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
   for(const n of input.nodes)if(input.free(n)&&implicitGroups.has(n.name)&&input.parents.get(n)?.type==='AssignmentExpression'&&input.parents.get(n).left===n){
-   for(let p=n;p;p=input.parents.get(p))if(['ClassDeclaration','ClassExpression'].includes(p.type)||(p.type==='Program'?p.body:p.body?.body)?.some(s=>s.directive==='use strict')){strictImplicit.add(n.name);break;}
+   let strict=false;
+   for(let p=n;p;p=input.parents.get(p))if(['ClassDeclaration','ClassExpression'].includes(p.type)||(p.type==='Program'?p.body:p.body?.body)?.some(s=>s.directive==='use strict')){strict=true;break;}
+   if(strict)strictImplicit.add(n.name);else sloppyImplicit.add(n.name);
   }
+  for(const name of strictImplicit)if(sloppyImplicit.has(name))mixedImplicit.add(name);
  }
  for(const [name,writes]of implicitGroups){
-  if(strictImplicit.has(name))continue; // Preserve strict JavaScript ReferenceError/global-binding semantics verbatim.
-  for(const n of writes)for(let scope=owners.get(n);scope;scope=owners.get(parents.get(scope))){
-   if((scope.type==='Program'?scope.body:scope.body?.body)?.some(s=>s.directive==='use strict'))fail(n,'严格脚本中的隐式全局赋值不能局部化');
-   if(scope===tree)break;
+  // 严格作用域里的未声明赋值在原脚本中必定抛出 ReferenceError；目标模块
+  // 本身就是严格模式，原样保留即可得到同一异常时机，不能改写成局部变量。
+  const inStrictScope=n=>{
+   for(let scope=owners.get(n);scope;scope=owners.get(parents.get(scope))){
+    if((scope.type==='Program'?scope.body:scope.body?.body)?.some(s=>s.directive==='use strict'))return true;
+    if(scope===tree)break;
+   }
+   return false;
+  };
+  const strictWrites=writes.filter(inStrictScope);
+  if(mixedImplicit.has(name))fail(writes[0],'同一隐式全局同时出现在严格与非严格作用域');
+  if(strictImplicit.has(name)||strictWrites.length===writes.length){
+   continue; // Preserve strict JavaScript ReferenceError/global-binding semantics verbatim.
   }
+  if(strictWrites.length)fail(strictWrites[0],'同一隐式全局同时出现在严格与非严格作用域');
   const uses=nodes.filter(x=>free(x,name));
   if(name.startsWith('$')||['globalThis','global','window','module','exports','process','Object','Array','JSON','Date','Math','console','undefined','NaN','Infinity'].includes(name))fail(writes[0],'不能覆写宿主全局对象或平台 API');
   // Compound writes first read the existing sloppy binding. Keep an explicit
@@ -599,10 +612,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(!dominated&&!guardedImplicit.has(name))guardedImplicit.set(name,fresh(name+'Initialized'));
   }
   if(uses.some(n=>parents.get(n)?.type==='UnaryExpression'&&parents.get(n).operator==='delete'))fail(writes[0],'删除隐式全局变量尚未建立本地绑定契约');
-  if(guardedImplicit.has(name)&&uses.some(n=>{
-   let callee=n;while(parents.get(callee)?.type==='MemberExpression'&&parents.get(callee).object===callee)callee=parents.get(callee);
-   return parents.get(callee)?.type==='CallExpression'&&parents.get(callee).callee===callee;
-  }))fail(writes[0],'条件初始化的隐式全局调用尚未确定函数与完成结果契约');
+  // 直接调用条件初始化的隐式全局时，调用目标本身可能是完成函数，契约无法
+  // 静态确定。成员调用（例如 `value.replace(...)`）只消费该值的普通方法，
+  // 读取点的 ReferenceError 保护已经保持原语义，不需要把接收者当成目标。
+  if(guardedImplicit.has(name)&&uses.some(n=>parents.get(n)?.type==='CallExpression'&&parents.get(n).callee===n))fail(writes[0],'条件初始化的隐式全局调用尚未确定函数与完成结果契约');
   implicit.add(name);
  }
  if(implicit.size)prefix.push('let '+[...implicit].join(', ')+';');
@@ -1175,7 +1188,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(n.type==='CallExpression'&&terminal(n)){
    const p=parents.get(n);
-   if(!['ExpressionStatement','ReturnStatement','ArrowFunctionExpression'].includes(p?.type)&&!(p?.type==='AwaitExpression'&&['ExpressionStatement','ReturnStatement'].includes(parents.get(p)?.type))&&!(p?.type==='MemberExpression'&&['then','catch'].includes(property(p)))&&!(p?.type==='CallExpression'&&free(p.callee,'setTimeout')&&p.arguments[0]===n&&terminal(p))&&!terminalConditional(n))fail(n,'完成操作嵌入表达式，无法证明返回值传播');
+   // 逗号表达式作为独立语句时，各操作数的值都被丢弃；完成调用在其中
+   // 仍然只负责终止流程，不会把完成结果当成业务返回值继续传播。
+   let sequence=p;
+   while(sequence?.type==='SequenceExpression')sequence=parents.get(sequence);
+   const discardedSequence=p?.type==='SequenceExpression'&&sequence?.type==='ExpressionStatement';
+   if(!discardedSequence&&!['ExpressionStatement','ReturnStatement','ArrowFunctionExpression'].includes(p?.type)&&!(p?.type==='AwaitExpression'&&['ExpressionStatement','ReturnStatement'].includes(parents.get(p)?.type))&&!(p?.type==='MemberExpression'&&['then','catch'].includes(property(p)))&&!(p?.type==='CallExpression'&&free(p.callee,'setTimeout')&&p.arguments[0]===n&&terminal(p))&&!terminalConditional(n))fail(n,'完成操作嵌入表达式，无法证明返回值传播');
   }
   if(isAPI(n,'$task','fetch')){
    const p=parents.get(n),gp=parents.get(p);
@@ -3859,6 +3877,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      };
      if(callbackContext(owners.get(e))&&(!callee&&e.callee.type==='MemberExpression'&&['then','catch'].includes(property(e.callee))||callee?.async&&!complete.has(callee)&&!lifted.has(callee)))return patch(source,n,render);
     }
+    // then/catch 的所有回调都已解析为不完成、不同步提升的普通函数时，
+    // 该 Promise 链只是被忽略的普通异步工作；原样保留不会改变完成边界。
+    if(e.callee.type==='MemberExpression'&&['then','catch'].includes(property(e.callee))&&e.arguments.every(argument=>argument.type==='Identifier'&&free(argument,'undefined')||(()=>{
+     const fn=target(argument);return functions.has(fn?.type)&&!complete.has(fn)&&!asyncFns.has(fn)&&!lifted.has(fn);
+    })()))return patch(source,n,render);
     if(lifted.has(target(e.callee))&&!target(e.callee).async)return render(e)+';';
     fail(e,'独立异步任务未传播完成结果，无法证明终止顺序');
    }

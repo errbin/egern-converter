@@ -407,7 +407,7 @@ export function lowerReboundHostGlobals(source){
 // 所有完成调用都保持一参契约。默认值 `{}` 由无参调用和显式 undefined
 // 调用改写补回；其它可能为 undefined 的实参形状继续拒绝。
 export function lowerClosedCompletionWrappers(source,format){
- if(format!=='qx'||!source.includes('$done'))return {source,transformations:[]};
+ if(!source.includes('$done'))return {source,transformations:[]};
  let tree,ix;
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return {source,transformations:[]};}
  const {nodes,parents,bindings,free}=ix,replace=new WeakMap(),remove=new Set();
@@ -421,7 +421,7 @@ export function lowerClosedCompletionWrappers(source,format){
  const parameter=wrapper.params[0],id=parameter.type==='AssignmentPattern'?parameter.left:parameter;
  if(id.type!=='Identifier'||parameter.type==='AssignmentPattern'&&(parameter.right.type!=='ObjectExpression'||parameter.right.properties.length))return {source,transformations:[]};
  const parameterBinding=bindings.get(id);
- if(!parameterBinding||parameterBinding.writes.length||parameterBinding.refs.length!==1)return {source,transformations:[]};
+ if(!parameterBinding||parameterBinding.writes.length)return {source,transformations:[]};
  // 保存原始完成函数的声明必须位于顶层、恰好一个声明符，且只被包装器
  // 的委托调用读取。读取点同时决定包装器唯一返回路径的位置。
  const snapshots=doneRefs.filter(ref=>{
@@ -438,18 +438,70 @@ export function lowerClosedCompletionWrappers(source,format){
  }).map(ref=>parents.get(ref));
  if(doneRefs.some(ref=>ref!==write&&ref!==snapshot&&!calls.includes(parents.get(ref))))return {source,transformations:[]};
  const delegation=parents.get(snapshotBinding.refs[0]);
- if(delegation?.type!=='CallExpression'||delegation.callee!==snapshotBinding.refs[0]||delegation.arguments.length!==1||delegation.arguments[0]!==parameterBinding.refs[0])return {source,transformations:[]};
+ if(delegation?.type!=='CallExpression'||delegation.callee!==snapshotBinding.refs[0]||delegation.arguments.length!==1||delegation.arguments[0]?.type!=='Identifier'||bindings.get(delegation.arguments[0])!==parameterBinding)return {source,transformations:[]};
  if(wrapper.body.type!=='BlockStatement'||wrapper.body.body.length<1)return {source,transformations:[]};
  const last=wrapper.body.body.at(-1);
  if(last.type!=='ExpressionStatement'||last.expression!==delegation||parents.get(last)!==wrapper.body)return {source,transformations:[]};
- // 包装器只允许在委托前读取并丢弃 QX 平台对象。读取本身无副作用，删除
- // 不会改变完成结果；任何业务表达式、调用或字段访问仍需进一步证明。
- for(const statement of wrapper.body.body.slice(0,-1))if(statement.type!=='ExpressionStatement'||statement.expression.type!=='Identifier'||!free(statement.expression,'$prefs'))return {source,transformations:[]};
+ // 参数只允许出现在委托实参和已识别的前置状态归一中；保存、别名、二次
+ // 读取或传入其它调用都会改变删除包装器后的数据流。
+ const preStatements=wrapper.body.body.slice(0,-1),allowedParameterRefs=new Set();
+ for(const statement of preStatements)for(const ref of parameterBinding.refs)if(ref.start>=statement.start&&ref.end<=statement.end)allowedParameterRefs.add(ref);
+ if(parameterBinding.refs.some(ref=>ref!==delegation.arguments[0]&&!allowedParameterRefs.has(ref)))return {source,transformations:[]};
+ // 非 QX 平台折叠后，包装器会保留 `obj.status &&= ...` 这一条状态码
+ // 归一下来。只有该表达式恰好是“从字符串中提取三位状态码”且每个完成
+ // 载荷的 status 都能由原生完成映射得到同一数值时，才能删除包装器。
+ const statusMember=n=>n?.type==='MemberExpression'&&!n.computed&&n.object?.type==='Identifier'&&bindings.get(n.object)===parameterBinding&&property(n)==='status';
+ const statusNormalization=statement=>{
+  if(statement.type!=='ExpressionStatement')return false;
+  const assignment=statement.expression;
+  if(assignment.type!=='AssignmentExpression'||assignment.operator!=='&&='||!statusMember(assignment.left))return false;
+  const value=assignment.right;
+  if(value?.type!=='UnaryExpression'||value.operator!=='+')return false;
+  const index=value.argument;
+  if(index?.type!=='MemberExpression'||!index.computed||index.property.type!=='Literal'||index.property.value!==0)return false;
+  const call=index.object;
+  if(call?.type!=='CallExpression'||call.arguments.length!==1)return false;
+  const regex=call.arguments[0];
+  if(regex.type!=='Literal'||!regex.regex||regex.regex.pattern!=='\\b\\d{3}\\b'||regex.regex.flags)return false;
+  const match=call.callee;
+  if(match?.type!=='MemberExpression'||match.computed||property(match)!=='match')return false;
+  const string=match.object;
+  if(string?.type!=='CallExpression'||string.arguments.length!==1||string.callee.type!=='Identifier'||!free(string.callee,'String'))return false;
+  return statusMember(string.arguments[0]);
+ };
+ let normalizations=0;
+ // 包装器只允许在委托前读取并丢弃 QX 平台对象，或执行可证明等价的
+ // 状态码归一。读取本身无副作用；任何其它业务表达式、调用或字段访问
+ // 仍需进一步证明。
+ for(const statement of preStatements){
+  if(statement.type==='ExpressionStatement'&&statement.expression.type==='Identifier'&&free(statement.expression,'$prefs'))continue;
+  if(format!=='qx'&&statusNormalization(statement)){normalizations++;continue;}
+  return {source,transformations:[]};
+ }
+ if(normalizations>1)return {source,transformations:[]};
+ const statusPayload=call=>{
+  const argument=call.arguments[0];
+  if(!argument||free(argument,'undefined')||argument.type==='UnaryExpression'&&argument.operator==='void'&&argument.argument.type==='Literal')return true;
+  if(argument.type!=='ObjectExpression')return false;
+  let statuses=0;
+  for(const entry of argument.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method||entry.computed)return false;
+   const name=key(entry);if(name===undefined)return false;
+   if(name!=='status')continue;
+   if(++statuses>1)return false;
+   const value=entry.value;
+   if(value.type==='Literal'&&typeof value.value==='number'&&Number.isInteger(value.value)&&value.value>=100&&value.value<=599)continue;
+   if(value.type==='Literal'&&typeof value.value==='string'&&/^HTTP\/[\d.]+\s+\d{3}(?:\s|$)/.test(value.value))continue;
+   return false;
+  }
+  return true;
+ };
  const hasDefault=parameter.type==='AssignmentPattern';
  const definitelyNotUndefined=n=>n?.type==='Literal'&&!n.regex||['ObjectExpression','ArrayExpression','FunctionExpression','ArrowFunctionExpression','ClassExpression','NewExpression','TemplateLiteral'].includes(n?.type)||n?.type==='UnaryExpression'&&['!','typeof','+','-','~'].includes(n.operator)||n?.type==='BinaryExpression'||n?.type==='SequenceExpression'&&definitelyNotUndefined(n.expressions.at(-1));
  for(const call of calls){
   if(call.optional||call.arguments.length>1||call.arguments.some(argument=>argument.type==='SpreadElement'))return {source,transformations:[]};
   const argument=call.arguments[0];
+  if(normalizations&&!statusPayload(call))return {source,transformations:[]};
   if(!hasDefault)continue;
   if(!argument){replace.set(call,`$done({})`);continue;}
   const undefinedArgument=free(argument,'undefined')||argument.type==='UnaryExpression'&&argument.operator==='void'&&argument.argument.type==='Literal';
@@ -458,7 +510,7 @@ export function lowerClosedCompletionWrappers(source,format){
  }
  remove.add(declaration);remove.add(assignmentStatement);
  const output=renderTree(source,tree,n=>remove.has(n)?{direct:true,value:''}:replace.has(n)?{direct:true,value:replace.get(n)}:null);
- return {source:output,transformations:[{kind:'closed-completion-wrapper',line:source.slice(0,assignment.start).split('\n').length,reason:'QX 折叠后包装器只丢弃平台对象并原样委托唯一完成快照'}]};
+ return {source:output,transformations:[{kind:'closed-completion-wrapper',line:source.slice(0,assignment.start).split('\n').length,reason:normalizations?'包装器只丢弃平台对象并原样委托唯一完成快照，状态码归一由原生完成映射保持':'QX 折叠后包装器只丢弃平台对象并原样委托唯一完成快照'}]};
 }
 
 // QX 兼容层常把 `$prefs` / `$persistentStore` 的选择封装成局部 store 门面。
@@ -466,7 +518,7 @@ export function lowerClosedCompletionWrappers(source,format){
 // `set(value,key)` 直接调用时，才能把请求参数按原顺序投影到 QX 存储方法。
 // 这样不需要把平台对象本身作为值传出，也不会遗漏动态成员或方法别名。
 export function lowerClosedStorageFacades(source,format){
- if(format!=='qx'||!source.includes('$prefs'))return {source,transformations:[]};
+ if(!source.includes('$prefs')&&!source.includes('$persistentStore'))return {source,transformations:[]};
  let tree,ix;
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}catch{return {source,transformations:[]};}
  const {nodes,parents,bindings,free}=ix,replace=new WeakMap(),remove=new Set();
@@ -501,7 +553,7 @@ export function lowerClosedStorageFacades(source,format){
    const args=call.arguments.map(argument=>source.slice(argument.start,argument.end));
    // 门面 setter 已证明把调用参数 `(key,value)` 转成存储 API 的
    // `(value,key)`；改写时必须保持同一顺序，不能直接照搬实参列表。
-   replace.set(call,kind==='get'?`$prefs.valueForKey(${args[0]})`:`$prefs.setValueForKey(${args[1]}, ${args[0]})`);
+   replace.set(call,format==='qx'?(kind==='get'?`$prefs.valueForKey(${args[0]})`:`$prefs.setValueForKey(${args[1]}, ${args[0]})`):(kind==='get'?`$persistentStore.read(${args[0]})`:`$persistentStore.write(${args[1]}, ${args[0]})`));
   }
   remove.add(statement);
   const output=renderTree(source,tree,n=>remove.has(n)?{direct:true,value:''}:replace.has(n)?{direct:true,value:replace.get(n)}:null);
