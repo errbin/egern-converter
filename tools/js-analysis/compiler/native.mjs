@@ -2370,6 +2370,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const recordFields=(node,seen=new Set(),selfFields=null,boundary=null)=>{
      if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
      if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
+     if(node?.type==='ConditionalExpression'&&node.test.type==='BinaryExpression'&&['===','=='].includes(node.test.operator)&&node.test.left.type==='UnaryExpression'&&node.test.left.operator==='typeof'&&node.test.left.argument.type==='Identifier'&&node.test.right.type==='Literal'&&node.test.right.value==='string'&&node.alternate.type==='Identifier'&&bindings.get(node.test.left.argument)===bindings.get(node.alternate)&&node.consequent.type==='ObjectExpression'&&node.consequent.properties.length===1&&node.consequent.properties[0].type==='Property'&&key(node.consequent.properties[0])==='url'&&node.consequent.properties[0].value.type==='Identifier'&&bindings.get(node.consequent.properties[0].value)===bindings.get(node.alternate))return recordFields(node.alternate,seen,selfFields,boundary)??new Set(['url']);
      if(node?.type==='Identifier'){
       if(sameBinding(node))return selfFields?new Set(selfFields):null;
       const source=bindings.get(node);

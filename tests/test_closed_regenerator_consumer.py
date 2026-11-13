@@ -88,6 +88,15 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
         self.assertEqual(proof['completions'], 2, proof)
         self.convert_and_compare(body, 'b', 'distinct state completions')
 
+    def test_exclusive_conditional_completions_in_one_case_are_accepted(self):
+        body = ("case 0:ctx.sent==='a'?$done({body:'a'}):"
+                "ctx.sent==='b'?$done({body:'b'}):$done({body:'c'});"
+                "return ctx.stop();")
+        proof = consume(source_with(body))
+        self.assertTrue(proof['accepted'], proof)
+        self.assertTrue(proof['proved'], proof)
+        self.assertEqual(proof['completions'], 3, proof)
+
     def test_completion_only_in_dead_states_is_rejected(self):
         cases = {
             'single dead completion': (
@@ -122,6 +131,9 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
                 "return ctx.stop();"),
             'sequential calls': (
                 "case 0:$done({body:'a'});$done({body:'b'});return ctx.stop();"),
+            'completion in condition test': (
+                "case 0:($done({body:'test'}),ctx.sent)?$done({body:'a'}):$done({body:'b'});"
+                "return ctx.stop();"),
         }
         for name, body in cases.items():
             with self.subTest(name=name):
@@ -150,6 +162,37 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
         self.assertTrue(proof['proved'], proof)
         self.assertEqual(proof['completions'], 2, proof)
         self.convert_and_compare(positive, 'a', 'return wrapped terminal completion')
+
+    def test_closed_table_backed_abrupt_return_is_accepted(self):
+        body = (
+            "case 0:var H={ret:'return'};if(ctx.sent){ctx.next=2;break;}"
+            "return ctx.abrupt(H.ret,$done({body:'a'}));"
+            "case 2:return ctx.abrupt('return',$done({body:'b'}));")
+        proof = consume(source_with(body))
+        self.assertTrue(proof['accepted'], proof)
+        self.assertTrue(proof['proved'], proof)
+        self.convert_and_compare(body, 'a', 'closed table abrupt return')
+
+    def test_closed_table_backed_abrupt_return_rejects_unclosed_tables(self):
+        cases = {
+            'mutated member': (
+                "case 0:var H={ret:'return'};H.ret='throw';"
+                "if(ctx.sent){ctx.next=2;break;}"
+                "return ctx.abrupt(H.ret,$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+            'dynamic key': (
+                "case 0:var H={ret:'return'},key='ret';"
+                "if(ctx.sent){ctx.next=2;break;}"
+                "return ctx.abrupt(H[key],$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+            'mismatched value': (
+                "case 0:var H={ret:'throw'};if(ctx.sent){ctx.next=2;break;}"
+                "return ctx.abrupt(H.ret,$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                self.assert_rejected(body)
 
     def test_return_wrapped_completion_tail_rejects_nonterminal_paths(self):
         cases = {

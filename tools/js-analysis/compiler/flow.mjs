@@ -179,10 +179,52 @@ export function closedIdentityMethodCall(ix,call,arg){
  return statements.length===1&&statementReturns(statements[0]);
 }
 
+const CLOSED_UNKNOWN=Symbol('closed-unknown');
+// 闭表常量只用于状态控制参数的身份证明。表本身必须由单一对象字面量初始化，
+// 没有改绑、成员写入、删除、整体别名或未知逃逸；属性键必须静态且唯一。
+// 被读取的属性值只接受无插值字符串，其它表项可以保留为函数等运行期值。
+function closedStaticStringMember(node,ix){
+ if(node?.type!=='MemberExpression')return CLOSED_UNKNOWN;
+ const name=property(node);
+ if(typeof name!=='string'&&typeof name!=='number')return CLOSED_UNKNOWN;
+ let object=node.object;
+ if(object.type==='Identifier'){
+  const binding=ix.bindings.get(object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return CLOSED_UNKNOWN;
+  for(const ref of binding.refs){
+   const member=ix.parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref)return CLOSED_UNKNOWN;
+   let chain=member;
+   for(;;){
+    const use=ix.parents.get(chain);
+    if(use?.type==='MemberExpression'&&use.object===chain){chain=use;continue;}
+    if(use?.type==='AssignmentExpression'&&use.left===chain||use?.type==='UpdateExpression'||
+       use?.type==='UnaryExpression'&&use.operator==='delete')return CLOSED_UNKNOWN;
+    break;
+   }
+  }
+  object=binding.init;
+ }else if(object.type!=='ObjectExpression')return CLOSED_UNKNOWN;
+ const names=new Set();
+ let value=CLOSED_UNKNOWN;
+ for(const entry of object.properties){
+  if(entry.type!=='Property'||entry.kind!=='init'||entry.method)return CLOSED_UNKNOWN;
+  const entryName=key(entry);
+  if(entryName===undefined||entryName==='__proto__')return CLOSED_UNKNOWN;
+  const canonical=String(entryName);
+  if(names.has(canonical))return CLOSED_UNKNOWN;
+  names.add(canonical);
+  if(canonical===String(name))value=entry.value;
+ }
+ if(value===CLOSED_UNKNOWN)return CLOSED_UNKNOWN;
+ if(value.type==='Literal'&&typeof value.value==='string')return value.value;
+ if(value.type==='TemplateLiteral'&&value.expressions.length===0)return value.quasis[0].value.cooked??CLOSED_UNKNOWN;
+ return CLOSED_UNKNOWN;
+}
 const REGENERATOR_LOOPS=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);
 function regeneratorAbruptReturn(node,param,ix){
  return node?.type==='CallExpression'&&node.callee.type==='MemberExpression'&&property(node.callee)==='abrupt'&&
-  node.arguments[0]?.type==='Literal'&&node.arguments[0].value==='return'&&
+  (node.arguments[0]?.type==='Literal'?node.arguments[0].value:closedStaticStringMember(node.arguments[0],ix))==='return'&&
   (param?.type!=='Identifier'||ix.bindings.get(node.callee.object)===ix.bindings.get(param));
 }
 function regeneratorCompletionTerminator(node,fn,param,ix){
@@ -279,6 +321,19 @@ function regeneratorReachesCompletion(state,completionStates,machine){
  }
  return false;
 }
+// 同一状态内的多个完成点只有落在同一条件表达式的互斥分支里，才可能沿
+// 任意单条路径至多执行一个。测试表达式与分支之间不构成互斥，顺序表达式
+// 或同一分支内的多个调用也不能放行。
+function regeneratorConditionallyExclusive(a,b,ix){
+ const side=(node,part)=>part&&part.start<=node.start&&part.end>=node.end;
+ for(let ancestor=ix.parents.get(a);ancestor;ancestor=ix.parents.get(ancestor)){
+  if(ancestor.type!=='ConditionalExpression')continue;
+  const left=side(a,ancestor.consequent)?'consequent':side(a,ancestor.alternate)?'alternate':null;
+  const right=side(b,ancestor.consequent)?'consequent':side(b,ancestor.alternate)?'alternate':null;
+  if(left&&right&&left!==right)return true;
+ }
+ return false;
+}
 // 完成回调的 `.wrap` 消费方证明：状态图运行时完整、入口子图无环；唯一阻塞
 // 只能是死状态/死终止点。每个可达完成调用必须位于状态分派 case 内且不在
 // 循环中。多个完成点时，每个必须由独立的 return/abrupt return 终止，或
@@ -308,7 +363,10 @@ export function closedRegeneratorConsumer(ix,source,call,fn,isCompletion){
  if(!reachable.length)return reject('dead-completions');
  for(const item of reachable)if(regeneratorInsideLoop(item.node,fn,machine,ix))return reject('loop');
  if(reachable.length===1)return machine;
- if(new Set(reachable.map(item=>String(item.state))).size!==reachable.length)return reject('multiple-in-case');
+ const byState=new Map();
+ for(const item of reachable){const state=String(item.state);if(!byState.has(state))byState.set(state,[]);byState.get(state).push(item);}
+ for(const group of byState.values())for(let i=0;i<group.length;i++)for(let j=i+1;j<group.length;j++)
+  if(!regeneratorConditionallyExclusive(group[i].node,group[j].node,ix))return reject('multiple-in-case');
  const completionStates=new Set(reachable.map(item=>'state:'+String(item.state)));
  const nonterminal=[];
  const terminators=new Set();

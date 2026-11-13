@@ -61,6 +61,27 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         source = source_with("case 0:return ctx.stop();", 'const drive=outer();unknown(drive);drive.next();')
         self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
 
+    def test_symbol_iterator_helper_driver_is_closed(self):
+        helper = ('function iterate(items){'
+                  'var it="undefined"!=typeof Symbol&&items[Symbol.iterator]||items["@@iterator"];'
+                  'return {s(){it=it.call(items)},n(){return it.next()},f(){if(it.return)it.return()}};}')
+        proof = prove(source_with('case 0:return ctx.stop();', helper + '\nconst drive=outer();drive.next();'))
+        self.assertTrue(proof['proved'], proof)
+
+    def test_symbol_iterator_driver_reassigned_to_generator_is_rejected(self):
+        helper = ('function iterate(items){'
+                  'var it="undefined"!=typeof Symbol&&items[Symbol.iterator]||items["@@iterator"];'
+                  'return {s(){it=(function*(){})()},n(){return it.next()}};}')
+        source = source_with('case 0:return ctx.stop();', helper + '\nconst drive=outer();drive.next();')
+        self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
+
+    def test_symbol_iterator_driver_escape_is_rejected(self):
+        helper = ('function iterate(items){'
+                  'var it="undefined"!=typeof Symbol&&items[Symbol.iterator]||items["@@iterator"];'
+                  'unknown(it);return {n(){return it.next()}};}')
+        source = source_with('case 0:return ctx.stop();', helper + '\nconst drive=outer();drive.next();')
+        self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
+
     def test_reassigned_save_slot_is_rejected(self):
         body = ("case 0:var saved=function(){$done({body:'first'});};"
                 "saved=function(){$done({body:'second'});};return ctx.stop();")
@@ -90,6 +111,32 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         body = ('case 0:ctx.next=2;break;case 2:ctx.next=4;break;'
                 'case 4:mutate();ctx.next=6;break;case 6:return ctx.stop();')
         self.assert_rejected_shape(source_with(body, table='[[0,4,4,6]]'), 'finally 区域含可观察副作用：状态 4')
+
+    def test_unique_finally_completion_followed_by_state_control_is_accepted(self):
+        body = ('case 0:ctx.prev=0;ctx.next=4;break;'
+                'case 4:return $done({body:"ok"}),ctx.finish(4);'
+                'case 6:return ctx.stop();')
+        proof = prove(source_with(body, table='[[0,4,4,6]]'))
+        self.assertTrue(proof['proved'], proof)
+        machine = proof['machines'][0]
+        self.assertTrue(any(edge['kind'] == 'finally-finish' and edge['to'] == 'state:6'
+                            for edge in machine['edges']), machine)
+
+    def test_finally_completion_rejects_business_or_conditional_tails(self):
+        cases = {
+            'business call after completion': (
+                'case 0:ctx.prev=0;ctx.next=4;break;'
+                'case 4:return $done({body:"ok"}),unknown(),ctx.finish(4);'
+                'case 6:return ctx.stop();'),
+            'conditional completion': (
+                'case 0:ctx.prev=0;ctx.next=4;break;'
+                'case 4:ctx.sent?$done({body:"a"}):$done({body:"b"});'
+                'return ctx.finish(4);case 6:return ctx.stop();'),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                self.assert_rejected_shape(source_with(body, table='[[0,4,4,6]]'),
+                                           'finally 区域含可观察副作用：状态 4')
 
     def test_context_alias_is_rejected(self):
         body = ('case 0:var alias=ctx;alias.next=2;return ctx.stop();'

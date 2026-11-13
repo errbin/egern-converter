@@ -841,6 +841,42 @@ export function regeneratorStateMachine(ix,source){
   return ['UpdateExpression','AwaitExpression','YieldExpression','NewExpression','TaggedTemplateExpression'].includes(n.type)||
    n.type==='UnaryExpression'&&n.operator==='delete';
  }
+ // finally 里的唯一直接完成调用是脚本退出动作，不是业务副作用。只有完成
+ // 之后只剩状态控制（尤其 `finish(本 finally)`）时，它和普通 try/finally
+ // 的退出语义等价；完成条件化、重复完成或后接业务调用都继续拒绝。
+ const finallyStateControl=(n,param)=>n?.type==='AssignmentExpression'&&contextMember(n.left,param)&&['prev','next','sent'].includes(property(n.left))||
+  n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&contextMember(n.callee,param)&&['abrupt','finish','stop'].includes(property(n.callee));
+ const isCompletionCall=node=>{
+  if(node?.type!=='CallExpression')return false;
+  if(free(node.callee,'$done'))return true;
+  if(node.callee.type!=='MemberExpression'||property(node.callee)!=='done'||node.callee.object.type!=='Identifier')return false;
+  const receiver=bindings.get(node.callee.object);
+  if(!receiver||receiver.writes.length||receiver.init?.type!=='NewExpression'||receiver.init.callee.type!=='Identifier')return false;
+  const constructor=bindings.get(receiver.init.callee),fn=constructor?.fn??constructor?.init;
+  if(!functions.has(fn?.type)||fn.async||fn.generator)return false;
+  return nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&(n.type==='MethodDefinition'||n.type==='Property')&&key(n)==='done'&&
+   (n.value.type==='FunctionExpression'||n.value.type==='FunctionDeclaration'||n.value.type==='ArrowFunctionExpression')&&
+   nodes.some(call=>call.type==='CallExpression'&&free(call.callee,'$done')&&call.start>=n.value.start&&call.end<=n.value.end));
+ };
+ function safeFinallyCompletion(node,clause,param,ownerFn){
+  if(!isCompletionCall(node)||owners.get(node)!==ownerFn)return false;
+  if(node.arguments.length>1||node.arguments.some(argument=>argument.type!=='ObjectExpression'))return false;
+  const completions=nodes.filter(n=>n.start>=clause.start&&n.end<=clause.end&&owners.get(n)===ownerFn&&isCompletionCall(n));
+  if(completions.length!==1)return false;
+  let current=node;
+  for(;;){
+   const parent=parents.get(current);
+   if(!parent)return false;
+   if(parent.type==='SequenceExpression'){
+    const index=parent.expressions.indexOf(current);
+    if(index<0||!parent.expressions.slice(index+1).every(expression=>finallyStateControl(expression,param)))return false;
+    current=parent;continue;
+   }
+   if(parent.type==='ReturnStatement'&&parent.argument===current)return finallyStateControl(parent.argument.type==='SequenceExpression'?parent.argument.expressions.at(-1):parent.argument,param);
+   if(parent.type==='ParenthesizedExpression'||parent.type==='ExpressionStatement'){current=parent;continue;}
+   return false;
+  }
+ }
  function handlerEffect(n,param){
   // 异常处理区域只允许状态控制；业务调用、完成调用、对象写入、
   // 异常抛出和异步挂起都保持拒绝。
@@ -888,16 +924,78 @@ export function regeneratorStateMachine(ix,source){
   const driveCalls=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['next','throw','return'].includes(property(n.callee)));
   const internal=driveCalls.filter(ranged),external=driveCalls.filter(n=>!ranged(n));
   if(!driveCalls.length)gaps.push('状态机没有 next/step 驱动点');
+  // 标准 for-of 降级会先把可迭代对象取成 iterator 方法，再调用该方法得到
+  // 一个封闭的 iterator。该 iterator 的 next/return 仍属于局部循环驱动，
+  // 不是状态机生成器逃逸。只有初始化/赋值始终来自迭代器协议、全部引用都
+  // 留在同一闭包内，且没有把绑定改成 wrap 生成结果时才放行。
+  const iteratorLookup=node=>{
+   if(node?.type!=='MemberExpression')return null;
+   if(!node.computed&&node.property?.name==='@@iterator')return node.object;
+   if(node.computed&&node.property?.type==='Literal'&&node.property.value==='@@iterator')return node.object;
+   if(node.computed&&node.property?.type==='MemberExpression'&&free(node.property.object,'Symbol')&&property(node.property)==='iterator')return node.object;
+   return null;
+  };
+  const iteratorSources=node=>{
+   if(!node)return [];
+   if(iteratorLookup(node))return [iteratorLookup(node)];
+   if(node.type==='LogicalExpression')return [...iteratorSources(node.left),...iteratorSources(node.right)];
+   if(node.type==='ConditionalExpression')return [...iteratorSources(node.consequent),...iteratorSources(node.alternate)];
+   return [];
+  };
+  const sameValue=(a,b)=>{
+   a=unwrap(a);b=unwrap(b);
+   if(!a||!b)return false;
+   if(a.type==='Identifier'&&b.type==='Identifier')return bindings.get(a)===bindings.get(b);
+   return a.start===b.start&&a.end===b.end;
+  };
+  const iteratorProtocolBinding=binding=>{
+   if(!binding?.init)return false;
+   const sources=iteratorSources(binding.init);
+   if(!sources.length||!sources.every(source=>sameValue(source,sources[0])))return false;
+   const owner=owners.get(binding.init);
+   if(!functions.has(owner?.type))return false;
+   const insideOwner=node=>{const current=owners.get(node);return current===owner||functions.has(current?.type)&&current.start>=owner.start&&current.end<=owner.end;};
+   // wrap 调用或生成器函数的结果不是迭代器协议对象；重新赋成这类值会
+   // 把外部驱动重新变成状态机逃逸，必须继续拒绝。
+   const generatorValue=node=>nodes.some(n=>n.start>=node.start&&n.end<=node.end&&
+    (n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'||
+     functions.has(n.type)&&n.generator));
+   for(const write of binding.writes){
+    if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='Identifier'||bindings.get(write.left)!==binding)return false;
+    if(!insideOwner(write)||write.right.type!=='CallExpression'||generatorValue(write.right))return false;
+   }
+   for(const ref of binding.refs){
+    const parent=parents.get(ref),use=parents.get(parent);
+    if(parent?.type==='AssignmentExpression'&&parent.left===ref||!insideOwner(ref))continue;
+    if(parent?.type==='MemberExpression'&&parent.object===ref){
+     if(['call','next','throw','return'].includes(String(property(parent))))continue;
+     return false;
+    }
+    if(parent?.type==='UnaryExpression'&&['!','typeof'].includes(parent.operator))continue;
+    if(parent?.type==='BinaryExpression'||parent?.type==='LogicalExpression')continue;
+    if(['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(parent?.type)&&parent.test===ref)continue;
+    // for-of 降级在数组回退分支里执行 `source = iterator`。仅允许写入同一
+    // 闭包内的局部绑定；一旦写进外层、返回或作为参数传给未知函数仍拒绝。
+    if(parent?.type==='AssignmentExpression'&&parent.right===ref&&parent.left.type==='Identifier') {
+     const target=bindings.get(parent.left);
+     if(target&&insideOwner(parent.left)&&target.refs.every(insideOwner))continue;
+    }
+    if(use?.type==='ExpressionStatement'&&use.expression===ref)continue;
+    return false;
+   }
+   return true;
+  };
   for(const call of external){
    const object=unwrap(call.callee.object);
    if(object.type==='Identifier'){
     const binding=bindings.get(object);
-    const escaped=!binding||binding.writes.length||binding.refs.some(ref=>{
+    const protocol=!!binding&&iteratorProtocolBinding(binding);
+    const escaped=!binding||!protocol&&(binding.writes.length||binding.refs.some(ref=>{
      const parent=parents.get(ref);
      if(parent?.type==='MemberExpression'&&parent.object===ref)return !['next','throw','return'].includes(property(parent));
      if(parent?.type==='ConditionalExpression'||parent?.type==='LogicalExpression'||parent?.type==='IfStatement')return false;
      return true;
-    });
+    }));
     if(escaped){
      gaps.push('generator 对象逃逸或被外部驱动：第 '+lineOf(call)+' 行');continue;
     }
@@ -1071,7 +1169,7 @@ export function regeneratorStateMachine(ix,source){
     for(const [name,target] of [['catch',catchLoc],['finally',finallyLoc],['after',afterLoc]])if(target!==undefined&&target!==null&&!states.has(target))gaps.push('异常表 '+name+' 目标不在状态图中：'+target);
     if(tryOrigin!==null&&catchLoc!==undefined&&catchLoc!==null){
      addEdge(stateId(tryOrigin),stateId(catchLoc),'exception',entry,String(catchLoc));
-     exceptionEntries.push({tryLoc,catchLoc,line:lineOf(entry)});
+     exceptionEntries.push({tryLoc,catchLoc,finallyLoc,afterLoc,line:lineOf(entry)});
     }
     if(finallyLoc!==undefined&&finallyLoc!==null){
      exceptionFinally=true;
@@ -1080,10 +1178,18 @@ export function regeneratorStateMachine(ix,source){
       if(tryOrigin!==null)addEdge(stateId(tryOrigin),stateId(finallyLoc),'exception-finally',entry,String(finallyLoc));
       addEdge(stateId(finallyLoc),stateId(afterLoc),'finally-resume',entry,String(afterLoc));
       for(const [state,clause] of caseByState)if(state>=finallyLoc&&state<afterLoc){
-       for(const n of nodes)if(n.start>=clause.start&&n.end<=clause.end&&finallyEffect(n,param))gaps.push('finally 区域含可观察副作用：状态 '+state+'，第 '+lineOf(n)+' 行');
+       for(const n of nodes)if(n.start>=clause.start&&n.end<=clause.end&&finallyEffect(n,param)&&!safeFinallyCompletion(n,clause,param,fn))gaps.push('finally 区域含可观察副作用：状态 '+state+'，第 '+lineOf(n)+' 行');
       }
      }
     }
+   }
+   // 标准 regenerator 的 `finish(finallyLoc)` 会完成 finally 并恢复到
+   // afterLoc，而不是跳回 finally 状态本身。按异常表修正该控制边，避免把
+   // 每个 finally 都误判成自环。
+   const finallyAfter=new Map(exceptionEntries.filter(entry=>entry.finallyLoc!==undefined&&entry.finallyLoc!==null&&entry.afterLoc!==undefined&&entry.afterLoc!==null).map(entry=>[entry.finallyLoc,entry.afterLoc]));
+   for(const edge of edges)if(edge.kind==='finish'){
+    const after=finallyAfter.get(Number(edge.value));
+    if(after!==undefined){edge.to=stateId(after);edge.kind='finally-finish';edge.value=String(after);}
    }
   }
   function gapFinally(){gaps.push('finally 条目缺少 afterLoc');}
