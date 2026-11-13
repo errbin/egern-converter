@@ -238,3 +238,25 @@ copy.url+='?copy';$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
         source='''let options=null;if($argument){options={url:'https://example.test/a','binary-mode':true}}
 else{options={url:'https://example.test/a','binary-mode':false}}$httpClient.get(options,(e,r,b)=>$done({body:b}));'''
         with self.assertRaises(ConversionError):convert_script(source,'Fixture',URL,'',source_format='loon')
+
+    def test_delayed_single_record_initialization_before_dispatch(self):
+        # 去混淆代码常先声明局部记录、再在唯一派发前一次性赋值为对象字面量。
+        source='''let options;
+options={url:'https://example.test/delayed',headers:{X:'fixture'}};
+$httpClient.get(options,(e,r,b)=>$done({body:b}));'''
+        self.check(source,'', 'delayed')
+
+    def test_delayed_record_requires_definite_single_write_after_all_reads(self):
+        for source in [
+            '''let options;
+console.log(options&&options.url);options={url:'https://example.test/late-read'};
+$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
+            '''let options;
+function init(){options={url:'https://example.test/closure'}}init();
+$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
+            '''let options;
+options=(()=>({url:'https://example.test/indirect'}))();
+$httpClient.get(options,(e,r,b)=>$done({body:b}));''',
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='loon')

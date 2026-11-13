@@ -112,6 +112,39 @@ function send(request){
             with self.subTest(function_text=function_text, arguments_text=arguments_text), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_nested_identity_forwarders_preserve_request_and_method_order(self):
+        source = '''const call=(fn,request,callback)=>fn(request,callback);
+const pass=(fn,request,callback)=>call(fn,request,callback);
+pass($httpClient.get,{url:'https://api.test/',method:'GET'},(error,response,body)=>{});
+$done({body:'ok'});'''
+        for source_format in ['surge', 'loon']:
+            with self.subTest(source_format=source_format):
+                output = convert_script(source, 'Fixture', URL, '', source_format=source_format)
+                self.assertNotIn('$httpClient', output)
+                case = {'name': 'nested identity forwarder', 'request': {'url': URL},
+                        'http': [{'url': 'https://api.test/', 'body': 'ignored'}],
+                        'expected': {'result': {'body': 'ok'},
+                                     'events': {'requests': [{'method': 'GET',
+                                                              'url': 'https://api.test/'}]}}}
+                result = compare(source, output, source_format, URL, case)
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_nested_forwarders_reordering_or_extra_work_are_rejected(self):
+        template = '''const call=FIRST;
+const pass=SECOND;
+const method=$httpClient.get;
+function send(request){pass(method,request,(error,response,body)=>$done({body}));}
+send({url:'https://api.test/'});'''
+        for first, second in [
+            ('(fn,request,callback)=>fn(callback,request)', '(fn,request,callback)=>call(fn,request,callback)'),
+            ('(fn,request,callback)=>fn(request,callback)', '(fn,request,callback)=>call(request,fn,callback)'),
+            ('(fn,request,callback)=>{console.log(request.url);return fn(request,callback)}', '(fn,request,callback)=>call(fn,request,callback)'),
+            ('(fn,request,callback)=>fn(request,callback)', '(fn,request,callback)=>{call(fn,request,callback);return fn(request,callback)}'),
+        ]:
+            source = template.replace('FIRST', first).replace('SECOND', second)
+            with self.subTest(first=first, second=second), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -468,17 +468,30 @@ function lowerDirectPlatformForwarders(source){
   const parameter=fn.params[parent.arguments.indexOf(ref)];
   return !!parameter&&readOnlyParameter(parameter,nonCallable(ref),seen);
  };
- const equivalentParameter=(node,fn,position)=>{
-  if(node?.type!=='Identifier')return false;
-  const expected=fn.params[position];
-  if(expected?.type!=='Identifier')return false;
-  const binding=bindings.get(node);
-  return !!binding&&binding===bindings.get(expected)&&!binding.writes.length;
- };
  // 这些宿主值在直接调用位置都有确定语义。只有转发器被证明恰好执行一次
  // 直接调用时，才能把值参数还原成同一调用位置的直接调用。
  const platformValues=new Set(['$done','$notify','setTimeout']);
  const isPlatformValue=node=>node.type==='Identifier'&&platformValues.has(node.name)&&free(node,node.name);
+ // 去混淆器会把一次恒等转发拆成同序嵌套的多层 helper。每层都必须只返回
+ // 一次调用、逐位原序传递全部参数，并且最终直接调用首参；任何重排、分支、
+ // 副作用或写入都会让宿主值无法还原到直接调用位置。
+ const invocationForwarder=(fn,count,seen=new Set())=>{
+  if(!fn||seen.has(fn)||fn.async||fn.generator||fn.params.length!==count||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
+  const parameterBindings=fn.params.map(parameter=>bindings.get(parameter));
+  if(parameterBindings.some(binding=>!binding||binding.writes.length))return false;
+  const returned=fn.body.type==='BlockStatement'
+   ?fn.body.body.length===1&&fn.body.body[0].type==='ReturnStatement'?fn.body.body[0].argument:null
+   :fn.body;
+  if(returned?.type!=='CallExpression'||returned.optional||returned.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&(n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n))))return false;
+  const next=new Set(seen);next.add(fn);
+  if(returned.callee.type==='Identifier'&&bindings.get(returned.callee)===parameterBindings[0]){
+   return returned.arguments.length===count-1&&returned.arguments.every((argument,index)=>argument.type==='Identifier'&&bindings.get(argument)===parameterBindings[index+1]);
+  }
+  if(returned.arguments.length!==count||!returned.arguments.every((argument,index)=>argument.type==='Identifier'&&bindings.get(argument)===parameterBindings[index]))return false;
+  const nested=functionAt(returned.callee,returned);
+  return !!nested&&invocationForwarder(nested.fn,count,next);
+ };
  const edits=[];
  for(const call of nodes){
   if(call.type!=='CallExpression'||call.optional||call.callee.type==='Super')continue;
@@ -490,22 +503,8 @@ function lowerDirectPlatformForwarders(source){
   const api=apis[0].name;
   const target=functionAt(call.callee,call);if(!target)continue;
   const fn=target.fn;
-  if(fn.async||fn.generator||fn.params.length!==call.arguments.length)continue;
-  const apiParam=fn.params[0];if(apiParam.type!=='Identifier')continue;
-  const apiBinding=bindings.get(apiParam);
-  if(!apiBinding||apiBinding.writes.length)continue;
-  const returned=fn.body.type==='BlockStatement'
-   ?fn.body.body.length===1&&fn.body.body[0].type==='ReturnStatement'?fn.body.body[0].argument:null
-   :fn.body;
-  if(returned?.type!=='CallExpression'||returned.optional)continue;
-  if(returned.callee.type!=='Identifier'||bindings.get(returned.callee)!==apiBinding)continue;
-  const refs=apiBinding.refs;
-  if(refs.length!==1||refs[0]!==returned.callee)continue;
+  if(!invocationForwarder(fn,call.arguments.length))continue;
   const forwarded=call.arguments.slice(1);
-  if(returned.arguments.length!==forwarded.length)continue;
-  if(!returned.arguments.every((arg,index)=>equivalentParameter(arg,fn,index+1)))continue;
-  // 转发器只能做这一次直接调用；出现 this/arguments 或其他语句即拒绝。
-  if(nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&(n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n))))continue;
   const replacement=api+'('+forwarded.map(arg=>source.slice(arg.start,arg.end)).join(', ')+')';
   edits.push({start:call.start,end:call.end,replacement,api});
  }
@@ -953,19 +952,37 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return null;
  }
- function closedForwarder(call){
-  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==3||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+ function invocationForwarder(call,seen=new Set()){
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length<2||call.arguments.some(argument=>argument.type==='SpreadElement'))return null;
   const fn=forwarderFunction(call.callee);
-  if(!fn||fn.async||fn.generator||fn.params.length!==3||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
-  const [first,second,third]=fn.params,firstBinding=bindings.get(first),secondBinding=bindings.get(second),thirdBinding=bindings.get(third);
-  if(!firstBinding||!secondBinding||!thirdBinding||firstBinding.writes.length||secondBinding.writes.length||thirdBinding.writes.length)return false;
+  if(!fn||seen.has(fn)||fn.async||fn.generator||fn.params.length!==call.arguments.length||fn.params.some(parameter=>parameter.type!=='Identifier'))return null;
+  seen=new Set(seen).add(fn);
+  const parameterBindings=fn.params.map(parameter=>bindings.get(parameter));
+  if(parameterBindings.some(binding=>!binding||binding.writes.length))return null;
   const body=fn.body.type==='BlockStatement'
    ?fn.body.body.length===1&&fn.body.body[0].type==='ReturnStatement'?fn.body.body[0].argument:null
    :fn.body;
-  if(!body||body.type!=='CallExpression'||body.optional||body.arguments.length!==2||body.arguments.some(argument=>argument.type==='SpreadElement'))return false;
-  if(body.callee.type!=='Identifier'||bindings.get(body.callee)!==firstBinding)return false;
-  return body.arguments[0].type==='Identifier'&&bindings.get(body.arguments[0])===secondBinding&&
-   body.arguments[1].type==='Identifier'&&bindings.get(body.arguments[1])===thirdBinding;
+  if(!body||body.type!=='CallExpression'||body.optional||body.arguments.some(argument=>argument.type==='SpreadElement'))return null;
+  if(nodes.some(n=>n.start>=fn.start&&n.end<=fn.end&&(n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n))))return null;
+  if(body.callee.type==='Identifier'&&bindings.get(body.callee)===parameterBindings[0]){
+   if(body.arguments.length!==fn.params.length-1)return null;
+   for(let index=1;index<fn.params.length;index++){
+    const argument=body.arguments[index-1];
+    if(argument.type!=='Identifier'||bindings.get(argument)!==parameterBindings[index])return null;
+   }
+   return fn;
+  }
+  // 去混淆代码常把恒等转发拆成同序嵌套的多层 helper：外层将全部实参原序
+  // 交给另一个闭合转发器，内层再调用首参。只有每层都逐位原序透传才成立。
+  if(body.arguments.length!==fn.params.length)return null;
+  for(let index=0;index<fn.params.length;index++){
+   const argument=body.arguments[index];
+   if(argument.type!=='Identifier'||bindings.get(argument)!==parameterBindings[index])return null;
+  }
+  return invocationForwarder(body,seen)?fn:null;
+ }
+ function closedForwarder(call){
+  return call?.type==='CallExpression'&&call.arguments.length===3&&!!invocationForwarder(call);
  }
  // 条件方法别名只有在所有引用都是直接 HTTP 调用，或作为首参交给上述闭合
  // 转发器时才成立；写回、复制、比较或交给未知代码都拒绝。
@@ -1247,6 +1264,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(callee.type==='MemberExpression'&&free(callee.object,'console')&&closedConsole)continue;
      if(callee.type==='MemberExpression'&&free(callee.object,'Object')&&property(callee)==='assign'&&p.arguments[0]?.type==='ObjectExpression'&&!p.arguments[0].properties.length&&p.arguments[1]===ref)continue;
      if(callee.type==='MemberExpression'&&free(callee.object,'$httpClient')||callee.type==='MemberExpression'&&free(callee.object,'$task')&&property(callee)==='fetch')continue;
+     // 请求记录作为闭合三参转发器的第二个实参时，转发器只做
+     // 方法(请求, 回调)的原序转交；该调用点本身仍是可证明的 HTTP 派发。
+     if(p.arguments[1]===ref&&closedForwarder(p)&&httpDispatch(p))continue;
      fail(ref,label+' 被传给未知函数，无法证明对象身份不逃逸');
     }
    }
@@ -2220,6 +2240,34 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      return member?.type==='MemberExpression'&&member.object===ref&&consoleMethods.has(property(member))&&call?.type==='CallExpression'&&call.callee===member;
     });
     const consoleObservation=call=>closedConsole&&call?.type==='CallExpression'&&call.callee.type==='MemberExpression'&&free(call.callee.object,'console')&&consoleMethods.has(property(call.callee));
+    // 证明赋值在边界求值前一定执行：向上只允许普通容器，且两者在同一个
+    // 语句列表（块、switch case 或逗号序列）中按原文顺序出现。条件、循环、
+    // 函数边界跨越都会让记录可能仍是 undefined。
+    const definiteBefore=(write,boundary)=>{
+     if(!boundary||write.end>boundary.start||owners.get(write)!==owners.get(boundary))return false;
+     const ancestors=new Set();for(let item=boundary;item;item=parents.get(item))ancestors.add(item);
+     let child=write;
+     while(parents.get(child)&&!ancestors.has(parents.get(child))){
+      const parent=parents.get(child);
+      if(['IfStatement','ConditionalExpression','LogicalExpression','WhileStatement','DoWhileStatement','ForStatement','ForInStatement','ForOfStatement','SwitchStatement','TryStatement','CatchClause','FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(parent.type))return false;
+      child=parent;
+     }
+     const common=parents.get(child);if(!common)return false;
+     const list=common.type==='BlockStatement'||common.type==='Program'?common.body:common.type==='SwitchCase'?common.consequent:common.type==='SequenceExpression'?common.expressions:null;
+     if(!list)return false;
+     let boundaryChild=boundary;while(parents.get(boundaryChild)!==common)boundaryChild=parents.get(boundaryChild);
+     const writeIndex=list.indexOf(child),boundaryIndex=list.indexOf(boundaryChild);
+     return writeIndex>=0&&boundaryIndex>=0&&writeIndex<boundaryIndex;
+    };
+    // 延迟初始化的局部记录只允许一次直接对象赋值；所有读取都必须位于赋值
+    // 之后，避免把未初始化时的 undefined 当成同一个闭合记录。
+    const delayedRecordSource=(source,boundary)=>{
+     if(!source||source.init||source.writes.length!==1)return null;
+     const write=source.writes[0];
+     if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='Identifier'||bindings.get(write.left)!==source||write.right.type!=='ObjectExpression')return null;
+     if(!definiteBefore(write,boundary)||!source.refs.every(ref=>ref===write.left||ref.start>=write.end))return null;
+     return write.right;
+    };
     const binding=bindings.get(request);
     if(!binding||!binding.refs.length)return false;
     const parameter=nodes.some(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
@@ -2231,15 +2279,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const position=fn?.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===target);
      if(!fn||position<0)return null;
      let calls;
-     if(fnParent?.type==='MethodDefinition')calls=closedMethodCalls(fnParent);
-     else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[fnParent];
-     else if(fnParent?.type==='Property'&&fnParent.value===fn&&!fnParent.computed&&key(fnParent)!==undefined)calls=replyCallers(fn);
+     if(fnParent?.type==='MethodDefinition')calls=closedMethodCalls(fnParent).map(call=>({call,actual:call.arguments[position]}));
+     else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[{call:fnParent,actual:fnParent.arguments[position]}];
+     else if(fnParent?.type==='Property'&&fnParent.value===fn&&!fnParent.computed&&key(fnParent)!==undefined)calls=replyCallers(fn).map(call=>({call,actual:call.arguments[position]}));
      else{
       if(!fnBinding||fnBinding.writes.length||!fnBinding.refs.length)return null;
       calls=[];
       for(const ref of fnBinding.refs){
        const call=parents.get(ref);
-       if(call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')){calls.push(call);continue;}
+       if(call?.type==='CallExpression'&&call.callee===ref&&!call.optional&&!call.arguments.some(a=>a.type==='SpreadElement')){calls.push({call,actual:call.arguments[position]});continue;}
+       // 函数值作为闭合调用转发器的首个实参时，转发器只会以剩余实参直接
+       // 调用它；该转发点等价于一个真实调用点，实参取转发器第二项。
+       if(call?.type==='CallExpression'&&call.arguments[0]===ref&&invocationForwarder(call)){calls.push({call,actual:call.arguments[1]});continue;}
        // 函数存在性观察不构成调用点，也不会把函数值交给未知代码；其余非
        // 调用引用仍拒绝，避免参数实参来源无法闭合。
        const member=call?.type==='MemberExpression'&&call.object===ref&&property(call)!==undefined&&!['call','apply','bind','constructor','prototype'].includes(String(property(call)));
@@ -2262,22 +2313,24 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(node?.type==='Identifier'){
       if(sameBinding(node))return selfFields?new Set(selfFields):null;
       const source=bindings.get(node);
-      if(!source||source.writes.length||seen.has(source))return null;
-      if(!source.init){
+      if(!source||seen.has(source))return null;
+      const assigned=delayedRecordSource(source,boundary);
+      if(!source.init&&!assigned){
        // 局部函数的参数只有在所有调用点都能闭合到静态记录时，字段集合才
        // 能由实参共同证明。默认值仍按原规则只接受全部省略的调用点。
        const site=parameterCallSites(source);if(!site)return null;
        const all=new Set();
-       for(const call of site.calls){
-        let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+       for(const entry of site.calls){
+        let actual=entry.actual,formal=site.fn.params[site.position];
         if(!actual||free(actual,'undefined'))actual=formal?.type==='AssignmentPattern'?formal.right:null;
         if(!actual)return null;
-        const values=recordFields(actual,new Set(seen).add(source),null,call);
+        const values=recordFields(actual,new Set(seen).add(source),null,entry.call);
         if(!values)return null;for(const name of values)all.add(name);
        }
        return all;
       }
-      const result=recordFields(source.init,new Set(seen).add(source),null,boundary);
+      if(source.writes.length&&!assigned)return null;
+      const result=recordFields(source.init??assigned,new Set(seen).add(source),null,boundary);
       if(!result||!boundary)return result;
       // 实参记录可以在调用前用静态字段逐项装配。只有同一函数内、无分支包裹、
       // 且在调用之前完成的普通赋值才加入字段集合；动态键、删除、更新和
@@ -2354,6 +2407,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const ok=sourceBinding.refs.every(ref=>{
       if(ref===actual)return true;
       const member=parents.get(ref),use=parents.get(member);
+      if(member?.type==='AssignmentExpression'&&member.left===ref&&delayedRecordSource(sourceBinding,call)===member.right)return true;
       if(member?.type==='MemberExpression'&&member.object===ref&&property(member)!==undefined){
        if((use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')&&sourceBinding.init?.type!=='ObjectExpression')return false;
        return true;
@@ -2392,12 +2446,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       const source=bindings.get(node.object),site=source&&parameterCallSites(source);
       if(site&&!seen.has(source)){
        const next=new Set(seen);next.add(source);
-       const result=site.calls.every(call=>{
-        let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+       const result=site.calls.every(entry=>{
+        let actual=entry.actual,formal=site.fn.params[site.position];
         if(!actual||free(actual,'undefined'))actual=formal?.type==='AssignmentPattern'?formal.right:null;
         if(!actual)return true;
-        if(!safeRecordSource(actual,call))return false;
-        const record=recordFields(actual,new Set(),null,call);
+        if(!safeRecordSource(actual,entry.call))return false;
+        const record=recordFields(actual,new Set(),null,entry.call);
         return !!record&&!record.has(field);
        });
        return result;
@@ -2430,11 +2484,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(!parameter)return null;
      const site=parameterCallSites(binding);
      if(!site)return null;
-     return site.calls.map(call=>{
-      let actual=call.arguments[site.position],formal=site.fn.params[site.position];
+     return site.calls.map(entry=>{
+      let actual=entry.actual,formal=site.fn.params[site.position];
       if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void'&&actual.argument.type==='Literal')actual=formal?.type==='AssignmentPattern'?formal.right:null;
-      if(actual&&!safeRecordSource(actual,call))return null;
-      const record=actual?recordFields(actual,new Set(),null,call):null;
+      if(actual&&!safeRecordSource(actual,entry.call))return null;
+      const record=actual?recordFields(actual,new Set(),null,entry.call):null;
       return record;
      });
     };

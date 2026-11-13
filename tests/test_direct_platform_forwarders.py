@@ -76,6 +76,31 @@ class DirectPlatformForwarderTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '')
 
+    def test_nested_identity_forwarders_keep_platform_value_position(self):
+        self.check(
+            "const call=(f,v)=>f(v);const finish=(f,v)=>call(f,v);finish($done,{body:'ok'});"
+        )
+        timer = ("const h={call:function(f,cb,ms){return f(cb,ms)},"
+                 "delay:function(f,cb,ms){return h.call(f,cb,ms)}};"
+                 "new Promise(resolve=>h.delay(setTimeout,()=>resolve('ok'),10)).then(v=>$done({body:v}));")
+        for output_format in ['qx', 'surge', 'loon']:
+            with self.subTest(format=output_format):
+                native = convert_script(timer, 'Fixture', URL, '', source_format=output_format)
+                case = {'name': 'nested timer forwarder', 'request': {'url': URL}, 'event_loop': True,
+                        'expected': {'result': {'body': 'ok'}}}
+                result = compare(timer, native, output_format, URL, case)
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_nested_forwarders_reordering_side_effects_or_cycles_are_rejected(self):
+        for source in [
+            "const call=(f,v)=>f(v);const finish=(f,v)=>call(v,f);finish($done,{body:'ok'});",
+            "const call=(f,v)=>{console.log(v);return f(v)};const finish=(f,v)=>call(f,v);finish($done,{body:'ok'});",
+            "function first(f,v){return second(f,v)}function second(f,v){return first(f,v)}first($done,{body:'ok'});",
+            "const call=(f,v)=>f(v);const finish=(f,v)=>call(f,v,1);finish($done,{body:'ok'});",
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '')
+
     def test_mutating_or_aliasing_escape_is_rejected(self):
         for source in [
             "const h={done:function(f,v){return f(v)},mutate:function(o){o.done=function(){return 1}}};"
