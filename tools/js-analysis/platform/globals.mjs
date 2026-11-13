@@ -114,10 +114,14 @@ export function foldClosedLiteralMethodCalls(source){
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
  catch{return source;}
  const {nodes,parents,bindings}=ix,UNKNOWN=Symbol('unknown'),infos=new Map(),edits=[];
+ const declarators=new Map();
+ for(const n of nodes)if(n.type==='VariableDeclarator'){
+  const b=bindings.get(n.id);if(b){if(!declarators.has(b))declarators.set(b,[]);declarators.get(b).push(n);}
+ }
  const staticKey=member=>property(member);
  function infoFor(binding){
   if(infos.has(binding))return infos.get(binding);
-  const declarations=nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding);
+  const declarations=declarators.get(binding)??[];
   const init=declarations.length===1&&declarations[0].init;
   if(!binding||binding.writes.length||declarations.length!==1||init?.type!=='ObjectExpression'){
    infos.set(binding,null);return null;
@@ -275,6 +279,15 @@ function fold(source,format,options,qxHint){
  const used=name=>ix.nodes.some(n=>ix.free(n,name)&&!(ix.parents.get(n)?.operator==='typeof')||n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&property(n)===name);
  const qx=qxHint??(format==='qx'||(used('$task')&&!used('$httpClient')));
  const records=new WeakSet();
+ // 只由字面量和函数 AST 构成的表不依赖调用参数或当前递归路径。同一 AST
+ // 可能被大量成员访问反复求值；复用同一个记录可以避免反复构造数千字段，
+ // 记录本身只读，身份也不参与任何运行时语义。
+ const staticObjectRecords=new WeakMap(),staticObjectKeys=new WeakMap();
+ const staticObjectRecord=n=>{
+  if(staticObjectKeys.has(n))return staticObjectKeys.get(n);
+  const valid=n.properties.every(p=>p.type==='Property'&&p.kind==='init'&&key(p)!==undefined&&key(p)!=='__proto__'&&(functions.has(p.value?.type)||p.value?.type==='Literal'&&!p.value.regex));
+  staticObjectKeys.set(n,valid);return valid;
+ };
  const stableRegexTest=!ix.nodes.some(n=>ix.free(n,'RegExp')||n.type==='MemberExpression'&&(['constructor','prototype'].includes(property(n))||property(n)==='test'&&(ix.parents.get(n)?.type==='AssignmentExpression'||ix.parents.get(n)?.type==='UpdateExpression'||ix.parents.get(n)?.operator==='delete')));
  const readonlyRecords=new Map();
  function readonlyRecord(b){
@@ -483,13 +496,15 @@ function fold(source,format,options,qxHint){
   }
   if(n.type==='TemplateLiteral'&&!n.expressions.length)return n.quasis[0].value.cooked;
   if(n.type==='ObjectExpression'){
+   const cacheable=staticObjectRecord(n);
+   if(cacheable&&staticObjectRecords.has(n))return staticObjectRecords.get(n);
    const out=Object.create(null);for(const p of n.properties){if(p.type!=='Property'||p.kind!=='init'||key(p)===undefined||key(p)==='__proto__')return UNKNOWN;
     // Closed Env factories often expose platform predicates as object methods.
     // Retain the function AST as data so a direct call can be folded below;
     // no callback, alias or escaped method reference is admitted.
     if(functions.has(p.value?.type)){out[key(p)]=p.value;continue;}
     const v=value(p.value,new Set(seen));if(v===UNKNOWN&&!pureProbe(p.value)||v===PRESENT_VERSION||v!==null&&typeof v==='object')return UNKNOWN;out[key(p)]=v;
-   }records.add(out);return out;
+   }records.add(out);if(cacheable)staticObjectRecords.set(n,out);return out;
   }
   if(n.type==='MemberExpression'&&ix.free(n.object,'$environment')){
    const name=property(n);
@@ -612,16 +627,20 @@ function fold(source,format,options,qxHint){
  }
  // A captured program constant is safe only when the entire prefix before its
  // initializer cannot execute user code. No call can enter a closure early.
+ const inertCache=new WeakMap();
  function inert(n){
   if(!n)return true;
-  if(['Literal','Identifier','FunctionDeclaration','FunctionExpression','ArrowFunctionExpression','EmptyStatement'].includes(n.type))return n.type!=='Identifier';
-  if(n.type==='UnaryExpression')return n.operator==='typeof'&&n.argument.type==='Identifier'||['!','void','+','-'].includes(n.operator)&&inert(n.argument);
-  if(['BinaryExpression','LogicalExpression'].includes(n.type))return inert(n.left)&&inert(n.right);
-  if(n.type==='ConditionalExpression')return inert(n.test)&&inert(n.consequent)&&inert(n.alternate);
- if(n.type==='ObjectExpression')return n.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.computed&&(functions.has(p.value?.type)||inert(p.value)));
- if(n.type==='ArrayExpression')return n.elements.every(element=>element&&element.type!=='SpreadElement'&&inert(element));
-  if(n.type==='VariableDeclaration')return n.declarations.every(d=>d.id.type==='Identifier'&&inert(d.init));
-  return false;
+  if(inertCache.has(n))return inertCache.get(n);
+  let result;
+  if(['Literal','Identifier','FunctionDeclaration','FunctionExpression','ArrowFunctionExpression','EmptyStatement'].includes(n.type))result=n.type!=='Identifier';
+  else if(n.type==='UnaryExpression')result=n.operator==='typeof'&&n.argument.type==='Identifier'||['!','void','+','-'].includes(n.operator)&&inert(n.argument);
+  else if(['BinaryExpression','LogicalExpression'].includes(n.type))result=inert(n.left)&&inert(n.right);
+  else if(n.type==='ConditionalExpression')result=inert(n.test)&&inert(n.consequent)&&inert(n.alternate);
+  else if(n.type==='ObjectExpression')result=n.properties.every(p=>p.type==='Property'&&p.kind==='init'&&!p.computed&&(functions.has(p.value?.type)||inert(p.value)));
+  else if(n.type==='ArrayExpression')result=n.elements.every(element=>element&&element.type!=='SpreadElement'&&inert(element));
+  else if(n.type==='VariableDeclaration')result=n.declarations.every(d=>d.id.type==='Identifier'&&inert(d.init));
+  else result=false;
+  inertCache.set(n,result);return result;
  }
  // 仅用于折叠 `左值 && false` / `左值 || true`：左侧读取不得触发用户代码。
  // 裸 window 不进入 types，只有 typeof 探测可按目标宿主缺少该全局折叠。
