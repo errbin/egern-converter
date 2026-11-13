@@ -911,6 +911,44 @@ export function lowerSloppyThis(source){
  return {source:output,globalName,helperName,transformations:edits.map(({line})=>({kind:'sloppy-this',to:helperName+'(this)',line,reason:'sloppy 模式下 this 为 null/undefined 时取全局对象，ES 模块严格模式需要显式保留'}))};
 }
 
+// 旧平台脚本是 sloppy 模式：给原始值写属性会静默失败，ES 模块严格模式会抛错。
+// 只改写可证明为本地对象的静态成员赋值，保留对象 setter/Proxy 与求值顺序；
+// 宿主全局（globalThis/window/global）上的写入必须保持原样，后续平台注入依赖这些写法。
+export function lowerSloppyMemberWrites(source){
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
+ const strictContext=n=>{
+  for(let p=ix.parents.get(n);p;p=ix.parents.get(p)){
+   if(p.type==='Program')return false;
+   if(p.type==='ClassBody'||p.type==='ClassDeclaration'||p.type==='ClassExpression'||p.type==='PropertyDefinition'||p.type==='StaticBlock')return true;
+   if(/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(p.type)&&p.body?.body?.some(s=>s.directive==='use strict'))return true;
+  }
+  return false;
+ };
+ const localObject=n=>{
+  let root=n;
+  while(root?.type==='MemberExpression'){if(root.optional)return false;root=root.object;}
+  return root?.type==='Identifier'&&ix.bindings.has(root);
+ };
+ const names=new Set(ix.nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
+ const fresh=base=>{let name=base,i=2;while(names.has(name))name=base+i++;names.add(name);return name;};
+ const helperName=fresh('sloppySet');
+ const edits=[];
+ for(const n of ix.nodes){
+  if(n.type!=='AssignmentExpression'||n.operator!=='='||n.left.type!=='MemberExpression')continue;
+  const left=n.left;
+  if(left.computed||left.optional||left.object.type==='Super'||left.property.type==='PrivateIdentifier'||!localObject(left.object))continue;
+  if(strictContext(n))continue;
+  edits.push(n);
+ }
+ const render=n=>replace.has(n)?replace.get(n)():patch(source,n,render);
+ for(const n of edits){
+  const left=n.left;
+  replace.set(n,()=>`${helperName}(${render(left.object)}, ${JSON.stringify(property(left))}, ${render(n.right)})`);
+ }
+ if(!edits.length)return {source,transformations:[],helperName:null};
+ return {source:render(ix.nodes[0]),helperName,transformations:edits.map(n=>({kind:'sloppy-property-write',line:source.slice(0,n.start).split('\n').length,reason:'sloppy 模式对原始值写属性会静默失败，ES 模块严格模式需要显式保留'}))};
+}
+
 // Lower accessors on a single closed factory instance to ordinary local calls.
 // No property descriptor, receiver alias, reflection or prototype escapes qualify.
 export function lowerClosedAccessors(source){

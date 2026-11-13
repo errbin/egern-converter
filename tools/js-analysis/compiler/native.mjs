@@ -6,7 +6,7 @@ import {lowerClients,lowerMagic,lowerDevice,lowerPipeline} from '../platform/cli
 import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMethodCall,closedRegeneratorConsumer} from './flow.mjs';
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
-import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
+import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,lowerSloppyMemberWrites,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
@@ -27,7 +27,7 @@ function compileNative(source,format,options){
   // embedded libraries. No input body is evaluated during this reduction.
   const functionSource=lowerFunctionConstructorSource(source);
   libraries=protectLibraries(functionSource.source);
-  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
+  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),scopeWrite=lowerSloppyMemberWrites(scopeThis.source),nodeRequest=lowerNodeRequestClient(scopeWrite.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   if(options.state_machine_proof){
    try{
@@ -55,8 +55,8 @@ function compileNative(source,format,options){
   }
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
-  return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
-   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+  return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName},sloppyWrite:{helper:scopeWrite.helperName}},libraries),native_evaluation:evaluation,
+   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...scopeWrite.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[],...(stateMachineProof?{state_machine:stateMachineProof}:{})};}
 }
 function normalizeLegacyNumbers(source){
@@ -544,6 +544,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const closedHostResponseSnapshotBindings=new WeakSet();
  let hostRequestSnapshot=null,hostRequestInitializers=[],hostResponseSnapshot=null,hostResponseInitializers=[];
  if(options.sloppyThis?.helper)prefix.push(`const ${options.sloppyThis.global} = globalThis;function ${options.sloppyThis.helper}(value){return value == null ? ${options.sloppyThis.global} : value;}`);
+ if(options.sloppyWrite?.helper)prefix.push(`function ${options.sloppyWrite.helper}(target,key,value){if(target===null||target===undefined)throw new TypeError('Cannot set properties of '+target);if(typeof target==='object'||typeof target==='function')Reflect.set(target,key,value);return value;}`);
  if(device.deviceParameter)prefix.push(`if (!['iPhone', 'iPad', 'Mac'].includes(${context}.env.EGH_DEVICE_TYPE || 'iPhone')) throw new Error('EGH_DEVICE_TYPE must be iPhone, iPad or Mac');`);
  const argumentObject=options.argument_object&&nodes.some(n=>free(n,'$argument'))?fresh('scriptArgument'):null;
  if(argumentObject)prefix.push(`const ${argumentObject} = ${context}.env.argument ? JSON.parse(${context}.env.argument) : ${context}.env.argument;`);

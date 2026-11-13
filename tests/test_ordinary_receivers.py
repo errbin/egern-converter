@@ -52,6 +52,11 @@ class OrdinaryReceiverTests(unittest.TestCase):
         # 因此这类读取不再拒绝，改为验证行为等价。
         self.check('function f(){return this.body}$done({body:String(f())});','undefined')
 
+    def test_sloppy_primitive_property_write_keeps_silent_failure(self):
+        # 旧平台脚本给字符串写属性会静默失败；ES 模块严格模式必须保持同样结果，
+        # 不能额外抛出 TypeError 并改变完成消息。
+        self.check('function update(e){e.data.signed=1;return "ok"}$done({body:update({data:"fixture"})});','ok')
+
     def test_program_scope_this_keeps_the_script_global_object(self):
         # 旧平台脚本作用域的 this 就是全局对象；产物是 ES 模块、没有顶层 this，
         # 因此生成代码里注入一个指向标准 globalThis 的局部绑定，行为保持一致。
