@@ -777,6 +777,26 @@ export function regeneratorStateMachine(ix,source){
   return UNKNOWN;
  }
  function stateValue(n){const value=scalar(n);return Number.isSafeInteger(value)&&value>=0||typeof value==='string'?value:null;}
+ // 条件分支的测试值未知时，仍可枚举每个分支产生的状态常量。状态图只需要
+ // 可能目标集合，不需要断言运行时选择；并集只会增加保守边，不会漏掉目标。
+ // 只有所有可能返回值都是合法状态时才返回集合；未知对象、动态成员或含
+ // 非状态分支的表达式保持不可证明。
+ function stateTargets(n,seen=new Set()){
+  n=unwrap(n);
+  if(!n||seen.has(n))return null;
+  const next=new Set([...seen,n]);
+  if(n.type==='SequenceExpression')return stateTargets(n.expressions.at(-1),next);
+  if(n.type==='ConditionalExpression'){
+   const consequent=stateTargets(n.consequent,next),alternate=stateTargets(n.alternate,next);
+   return consequent&&alternate?new Set([...consequent,...alternate]):null;
+  }
+  if(n.type==='LogicalExpression'){
+   const left=stateTargets(n.left,next),right=stateTargets(n.right,next);
+   return left&&right?new Set([...left,...right]):null;
+  }
+  const value=stateValue(n);
+  return value===null?null:new Set([value]);
+ }
  const stateId=state=>'state:'+String(state);
  function isThisLike(n){
   if(n?.type==='ThisExpression')return true;
@@ -959,9 +979,9 @@ export function regeneratorStateMachine(ix,source){
     if(n.type==='ThrowStatement')throws.push(n);
    }
    for(const write of nextWrites){
-    const target=stateValue(write.right);
-    if(target===null||!states.has(target))gaps.push('状态 '+state+' 的 next 目标不可证明：第 '+lineOf(write)+' 行');
-    else addEdge(stateId(state),stateId(target),'next',write,source.slice(write.right.start,write.right.end));
+    const targets=stateTargets(write.right);
+    if(targets===null||[...targets].some(target=>!states.has(target)))gaps.push('状态 '+state+' 的 next 目标不可证明：第 '+lineOf(write)+' 行');
+    else for(const target of targets)addEdge(stateId(state),stateId(target),'next',write,source.slice(write.right.start,write.right.end));
    }
    for(const control of controlCalls){
     const name=property(control.callee);
@@ -989,6 +1009,13 @@ export function regeneratorStateMachine(ix,source){
    if(ownerFn===fn)for(const thrown of throws){const id='throw:'+thrown.start;addTerminal(id,'throw',thrown);addEdge(stateId(state),id,'throw',thrown);}
    for(const n of calls){
     const target=functionTarget(n.callee,n);
+    // 原生完成调用会终止入口；状态内直接调用 `$done` 后不需要再为同一
+    // 状态虚构 next 边。完成点仍由消费方单独校验，这里只补一个显式终止
+    // 边，避免把合法的完成后 break 误判为缺口。闭合包装函数可能只在部分
+    // 分支完成，不能仅凭函数体出现过 `$done` 就视为无条件终止。
+    if(free(n.callee,'$done')){
+     const id='completion:'+n.start;addTerminal(id,'completion',n);addEdge(stateId(state),id,'completion',n);continue;
+    }
     const contextArgs=n.arguments.map((arg,index)=>sameBinding(unwrap(arg),contextParam)?index:-1).filter(index=>index>=0);
     if(contextArgs.length>1)gaps.push('状态上下文通过多个实参传入调用：第 '+lineOf(n)+' 行');
     if(!target&&contextArgs.length)gaps.push('状态上下文传入未知调用：第 '+lineOf(n)+' 行');

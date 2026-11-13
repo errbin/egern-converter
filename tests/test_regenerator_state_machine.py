@@ -108,6 +108,82 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         machine = proof['machines'][0]
         self.assertTrue(any(edge['from'] == 'state:0' and edge['to'] == 'state:2' for edge in machine['edges']), machine)
 
+    def test_conditional_and_logical_next_targets_are_unioned(self):
+        cases = {
+            'conditional': (
+                'case 0:ctx.next=ctx.sent?2:4;break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+            'logical': (
+                'case 0:ctx.next=2||4;break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+            'nested sequence': (
+                'case 0:ctx.next=(ctx.sent,ctx.sent?2:4);break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                proof = prove(source_with(body))
+                self.assertTrue(proof['proved'], proof)
+                machine = proof['machines'][0]
+                targets = {
+                    int(edge['to'].split(':')[1])
+                    for edge in machine['edges']
+                    if edge['from'] == 'state:0' and edge['kind'] == 'next'
+                }
+                self.assertEqual(targets, {2, 4}, machine)
+
+    def test_unknown_or_missing_next_targets_remain_rejected(self):
+        cases = {
+            'unknown conditional branch': (
+                'case 0:ctx.next=ctx.sent?2:dynamicTarget;break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+            'conditional target is not a state': (
+                'case 0:ctx.next=ctx.sent?2:6;break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+            'unknown logical branch': (
+                'case 0:ctx.next=ctx.sent&&2;break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+            'dynamic sequence tail': (
+                'case 0:ctx.next=(ctx.sent,dynamicTarget);break;'
+                'case 2:return ctx.stop();case 4:return ctx.stop();'),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                proof = prove(source_with(body))
+                self.assertFalse(proof['proved'], proof)
+                self.assertTrue(any('状态 0 的 next 目标不可证明' in gap for gap in proof['gaps']), proof)
+
+    def test_direct_completion_is_a_terminal_without_a_missing_next(self):
+        proof = prove(source_with("case 0:$done({body:'ok'});"))
+        self.assertTrue(proof['proved'], proof)
+        machine = proof['machines'][0]
+        self.assertTrue(any(edge['from'] == 'state:0' and edge['kind'] == 'completion' for edge in machine['edges']), machine)
+        self.assertFalse(any('状态 0 没有可证明的出边' in gap for gap in proof['gaps']), proof)
+
+    def test_conditional_completion_wrapper_is_not_an_unconditional_terminal(self):
+        body = ('case 0:\n'
+                " function helper(){if(ctx.sent){$done({body:'x'});}}\n"
+                ' helper();\n'
+                ' return ctx.stop();\n')
+        source = source_with(body)
+        proof = prove(source)
+        self.assertTrue(proof['proved'], proof)
+        completion = [edge for edge in proof['machines'][0]['edges'] if edge['kind'] == 'completion']
+        lines = source.splitlines()
+        done_line = next(index for index, line in enumerate(lines, 1) if '$done' in line)
+        call_line = next(index for index, line in enumerate(lines, 1) if 'helper();' in line)
+        self.assertEqual([edge['line'] for edge in completion], [done_line], proof)
+        self.assertNotEqual(completion[0]['line'], call_line, proof)
+
+    def test_conditional_completion_wrapper_does_not_hide_unknown_next(self):
+        body = ('case 0:\n'
+                " function helper(){if(ctx.sent){$done({body:'x'});}else{ctx.next=dynamicTarget;}}\n"
+                ' helper();break;\n'
+                "case 2:$done({body:'a'});return ctx.stop();")
+        proof = prove(source_with(body))
+        self.assertFalse(proof['proved'], proof)
+        self.assertTrue(any('状态 0 的 next 目标不可证明' in gap for gap in proof['gaps']), proof)
+
     def test_minimal_state_machine_can_enter_conversion(self):
         source = source_with("case 0:$done({body:'ok'});return ctx.stop();")
         self.assertTrue(prove(source)['machines'][0]['minimal'])
