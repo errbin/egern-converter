@@ -1858,7 +1858,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const fields=provenFields??shape(n);for(const k of fields.keys())if(!['url','method','headers','body','bodyBytes','status','response','abort'].includes(k))fail(n,'不支持的完成字段：'+k);
   if(fields.hostRequest&&!fields.variants?.length){
    const value=reference??render(n),body=readBody('$request','body');
-   return `((${value}) => ({url: ${value}.url, ...(${value}.method === undefined ? {} : {method: ${value}.method}), ...(${value}.headers === undefined ? {} : {headers: Object.fromEntries(${value}.headers)}), ...(${body} === undefined ? {} : {body: ${body}})}))(${value})`;
+   return `((${value}) => ({url: ${value}.url, ...(${value}.method === undefined ? {} : {method: ${value}.method}), ...(${value}.headers === undefined ? {} : {headers: ((${value}.headers && typeof ${value}.headers.entries === 'function') ? Object.fromEntries(${value}.headers.entries()) : {...${value}.headers})}), ...(${body} === undefined ? {} : {body: ${body}})}))(${value})`;
   }
   if(fields.variants?.length>1){
    const value=reference??fresh('completionValue');

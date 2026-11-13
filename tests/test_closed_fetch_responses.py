@@ -154,6 +154,20 @@ const $=new Env();
             with self.subTest(expression=expression), self.assertRaises(ConversionError):
                 convert(source)
 
+    def test_host_request_completion_accepts_iterable_and_plain_headers(self):
+        # 旧平台 $request.headers 是普通对象，原生 ctx.request.headers 是 Headers。
+        # 完成结果整体回传请求时两种头部形态都必须可读取。
+        source = ('function select(request,response){if(/closed-fetch/.test(request.url))return request;return response}'
+                  'function finish(value){$done(value)}'
+                  '(async()=>{const value=await select($request,$response);finish(value)})();')
+        output = convert(source, 'surge')
+        self.assertRegex(output, r"typeof \w+\.headers\.entries === 'function'")
+        self.assertRegex(output, r"\{\.\.\.\w+\.headers\}")
+        fixture = {'name': 'host request completion headers',
+                   'request': {'url': URL, 'method': 'POST', 'headers': {'X-Test': 'yes'}, 'body': 'payload'}}
+        result = compare(source, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
     def test_qualified_client_counts_as_platform_evidence_and_task_fetch_is_present(self):
         source = ('const platform=globalThis.$httpClient?"legacy":"qx";'
                   'if("undefined"!=typeof $task&&$task.fetch){$done({body:platform+":qx"})}'
