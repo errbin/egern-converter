@@ -1002,6 +1002,17 @@ function multiPlatformEnv(ix,source){
    instances.push(declarator);
   }
   if(!valid||!instances.length)continue;
+  // 旧 Env 常把 this 交给内部 HTTP helper；helper 可能再以 this.env 调用
+  // 同一批方法。这里把这类间接调用的方法名视为根，避免在改写委托前误删。
+  const helpers=new Map();
+  for(const n of nodes)if(n.type==='ClassDeclaration'&&n.start>=factory.start&&n.end<=factory.end){const b=bindings.get(n.id);if(b)helpers.set(b,n);}
+  for(const n of nodes)if(n.start>=cls.start&&n.end<=cls.end&&n.type==='NewExpression'&&n.callee.type==='Identifier'&&n.arguments.some(a=>a.type==='ThisExpression')){
+   const helper=helpers.get(bindings.get(n.callee));if(!helper)continue;
+   for(const m of helper.body.body)if(m.type==='MethodDefinition'&&m.kind==='method'){
+    if(methods.has(key(m)))roots.add(key(m));
+    for(const x of index(m.value).nodes)if(x.type==='MemberExpression'&&x.object.type==='ThisExpression'&&methods.has(property(x)))roots.add(property(x));
+   }
+  }
   candidates.push({factory,cls,methods,methodList,probeName,probeMethod,predicates,roots,instances});
  }
  return candidates;
