@@ -140,6 +140,36 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assert_rejected(body)
 
+    def test_return_wrapped_completion_tail_requires_terminal_control(self):
+        positive = (
+            "case 0:if(ctx.sent){ctx.next=2;break;}"
+            "return $done({body:'a'}),ctx.abrupt('return');"
+            "case 2:return $done({body:'b'}),ctx.stop();")
+        proof = consume(source_with(positive))
+        self.assertTrue(proof['accepted'], proof)
+        self.assertTrue(proof['proved'], proof)
+        self.assertEqual(proof['completions'], 2, proof)
+        self.convert_and_compare(positive, 'a', 'return wrapped terminal completion')
+
+    def test_return_wrapped_completion_tail_rejects_nonterminal_paths(self):
+        cases = {
+            'side effect after completion': (
+                "case 0:if(ctx.sent){ctx.next=2;break;}"
+                "return $done({body:'a'}),unknown();"
+                "case 2:return $done({body:'b'}),ctx.stop();"),
+            'resumable next in return': (
+                "case 0:if(ctx.sent){ctx.next=2;break;}"
+                "return $done({body:'a'}),ctx.next=2;"
+                "case 2:return $done({body:'b'}),ctx.stop();"),
+            'non-control before return': (
+                "case 0:if(ctx.sent){ctx.next=2;break;}"
+                "$done({body:'a'}),unknown();return ctx.stop();"
+                "case 2:return $done({body:'b'}),ctx.stop();"),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                self.assert_rejected(body)
+
 
 if __name__ == '__main__':
     unittest.main()

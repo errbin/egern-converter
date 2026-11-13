@@ -191,8 +191,19 @@ function regeneratorCompletionTerminator(node,fn,param,ix){
   const parent=ix.parents.get(current);
   if(!parent)return null;
   if(parent.type==='CallExpression'&&parent.arguments.includes(current)&&regeneratorAbruptReturn(parent,param,ix))return parent;
-  if(parent.type==='ReturnStatement'&&parent.argument===current)return parent;
-  if(parent.type==='SequenceExpression'&&parent.expressions.at(-1)===current){current=parent;continue;}
+  if(parent.type==='ReturnStatement'&&parent.argument===current)
+   return regeneratorTerminalReturn(parent.argument,param,ix)?parent:null;
+  if(parent.type==='SequenceExpression'){
+   const index=parent.expressions.indexOf(current);if(index<0)return null;
+   if(index===parent.expressions.length-1){current=parent;continue;}
+   // 完成调用之后的序列元素必须只是状态控制；其中 abrupt return 本身
+   // 就是终止点，其余情况继续沿外壳寻找 return/abrupt。
+   const later=parent.expressions.slice(index+1);
+   if(!later.every(expression=>regeneratorStateControlExpression(expression,param,ix)))return null;
+   const abrupt=later.find(expression=>regeneratorAbruptReturn(expression,param,ix));
+   if(abrupt)return abrupt;
+   current=parent;continue;
+  }
   if(parent.type==='ConditionalExpression'&&(parent.consequent===current||parent.alternate===current)){current=parent;continue;}
   if(parent.type==='LogicalExpression'&&(parent.left===current||parent.right===current)){current=parent;continue;}
   if(parent.type==='ParenthesizedExpression'){current=parent;continue;}
@@ -207,6 +218,14 @@ function regeneratorStateControlExpression(node,param,ix){
     ix.bindings.get(node.callee.object)===ix.bindings.get(param)&&['abrupt','finish','stop'].includes(property(node.callee)))return true;
  return false;
 }
+// return 外壳本身只是挂起点；只有返回表达式的最后一个求值项是
+// abrupt/finish/stop 时，状态机才真正终止，后续驱动不可能再进入另一个完成。
+function regeneratorTerminalReturn(node,param,ix){
+ const value=node?.type==='SequenceExpression'?node.expressions.at(-1):node;
+ return value?.type==='CallExpression'&&value.callee.type==='MemberExpression'&&
+  ['abrupt','finish','stop'].includes(property(value.callee))&&
+  (param?.type!=='Identifier'||ix.bindings.get(value.callee.object)===ix.bindings.get(param));
+}
 function regeneratorTailSafe(completion,clause,param,ix){
  let current=completion,statement=null;
  while(current&&current!==clause){
@@ -215,6 +234,9 @@ function regeneratorTailSafe(completion,clause,param,ix){
   if(parent.type==='SwitchCase'){statement=current;break;}
   if(parent.type==='SequenceExpression'){
    for(const expression of parent.expressions)if(expression.start>current.end&&!regeneratorStateControlExpression(expression,param,ix))return false;
+  }else if(parent.type==='ReturnStatement'&&parent.argument===current){
+   // 只有返回表达式最终以状态终止控制结束时，return 才是安全外壳。
+   if(!regeneratorTerminalReturn(parent.argument,param,ix))return false;
   }else if(parent.type==='ConditionalExpression'||parent.type==='LogicalExpression'||parent.type==='ParenthesizedExpression'||parent.type==='ExpressionStatement'||parent.type==='BlockStatement'){
    // 条件/逻辑分支与语句外壳在完成调用之后不再执行其它分支。
   }else if(parent.type==='IfStatement'){
@@ -315,6 +337,56 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b&&!b.writes.length&&!seen.has(b)&&(b.fn||b.init)){seen.add(b);return resolve(b.fn??b.init,seen);}}
   return n;
  }
+ // 赋值只有在文本上也必然位于读取之前时才可参与目标解析。写入若位于
+ // if/循环/try/条件表达式等容器内，可能被跳过；位置更靠前不等于支配读取。
+ function unconditionalWrite(write,common){
+  if(!common)return false;
+  for(let node=write;node!==common;){
+   const parent=parents.get(node);
+   if(!parent)return false;
+   if(parent===common)return true;
+   if(parent.type!=='SequenceExpression'&&parent.type!=='ExpressionStatement')return false;
+   node=parent;
+  }
+  return false;
+ }
+ // 闭合对象表只允许读取成员或枚举自身键。属性写入、删除、别名复制或把
+ // 整表传给未知调用都会让成员值身份不再确定；动态枚举只有在所有成员目标
+ // 一致时才能继续按同一完成函数处理。
+ function closedTableObject(member,allowDynamic){
+  if(member?.type!=='MemberExpression')return null;
+  if(member.object.type==='ObjectExpression')return member.object;
+  if(member.object.type!=='Identifier')return null;
+  const binding=bindings.get(member.object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  const writes=nodes.some(node=>{
+   const target=node.type==='AssignmentExpression'&&node.operator==='='?node.left:node.type==='UpdateExpression'?node.argument:node.type==='UnaryExpression'&&node.operator==='delete'?node.argument:null;
+   if(target?.type!=='MemberExpression')return false;
+   let root=target;while(root.type==='MemberExpression')root=root.object;
+   return root.type==='Identifier'&&bindings.get(root)===binding;
+  });
+  if(writes||!binding.refs.every(ref=>{const use=parents.get(ref);if(allowDynamic&&use?.type==='ForInStatement'&&use.right===ref)return true;if(use?.type!=='MemberExpression'||use.object!==ref||!allowDynamic&&property(use)===undefined)return false;let chain=use;while(parents.get(chain)?.type==='MemberExpression'&&parents.get(chain).object===chain)chain=parents.get(chain);const outerUse=parents.get(chain);return !(outerUse?.type==='AssignmentExpression'&&outerUse.left===chain||outerUse?.type==='UpdateExpression'||outerUse?.type==='UnaryExpression'&&outerUse.operator==='delete');}))return null;
+  return binding.init;
+ }
+ function closedTableValue(member){
+  const name=property(member);if(name===undefined)return null;
+  const object=closedTableObject(member,false);if(!object)return null;
+  return object.properties.find(entry=>entry.type==='Property'&&entry.kind==='init'&&key(entry)===name)?.value??null;
+ }
+ function closedTableValues(member){
+  if(property(member)!==undefined)return null;
+  const object=closedTableObject(member,true);
+  if(!object||!object.properties.length)return null;
+  // 展开、访问器、计算键和重复键都会让枚举到的成员集合不确定；动态派发
+  // 只接受完整静态表。
+  const names=new Set();
+  for(const entry of object.properties){
+   if(entry.type!=='Property'||entry.kind!=='init')return null;
+   const name=key(entry);if(name===undefined||names.has(name))return null;
+   names.add(name);
+  }
+  return object.properties.map(entry=>entry.value);
+ }
  function targets(n,seen=new Set()){
   n=resolve(n,seen);if(functions.has(n?.type))return [n];
   if(n?.type==='AssignmentExpression'&&n.operator==='=')return targets(n.right,seen);
@@ -334,41 +406,187 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
     if(common?.type==='SequenceExpression'){const a=common.expressions.indexOf(writeChild),b=common.expressions.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
     else if(common?.type==='BlockStatement'||common?.type==='Program'){const a=common.body.indexOf(writeChild),b=common.body.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
     else if(common?.type==='CallExpression'){const a=common.arguments.indexOf(writeChild),b=common.arguments.indexOf(referenceChild);ordered=a>=0&&b>=0&&a<b;}
-    if(ordered){const next=new Set(seen);next.add(binding);const result=targets(write.right,next);return result;}
+    if(ordered&&unconditionalWrite(write,common)){const next=new Set(seen);next.add(binding);const result=targets(write.right,next);return result;}
    }
   }
   if(n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.arguments.length===1&&closedIdentityMethodCall(ix,n,n.arguments[0]))return targets(n.arguments[0],seen);
   if(n?.type==='MemberExpression'){
-   const object=resolve(n.object,new Set(seen));
-   if(object?.type==='ObjectExpression'){
-    const values=object.properties.filter(p=>p.type==='Property'&&p.kind==='init'&&(property(n)===undefined||key(p)===property(n)));
-    return values.flatMap(p=>targets(p.value,new Set(seen)));
+   const value=closedTableValue(n);if(value)return targets(value,new Set(seen));
+   const values=closedTableValues(n);
+   if(values){
+    const resolved=values.map(value=>targets(value,new Set(seen)));
+    // 动态键可能命中任一成员；只有每个成员都有确定目标时才能合并候选。
+    // 后续完成传播对候选集合使用“任一目标会完成”的保守守卫，不会把
+    // 非完成成员误当成必然完成。
+    if(resolved.some(list=>!list.length))return [];
+    return [...new Set(resolved.flat())];
    }
   }
   const fn=callTarget?.(n);return fn?[fn]:[];
  }
- function promiseValue(n,seen=new Set()){
+ // 读取标识符在当前位置之前最后一次确定完成的直接赋值。只有同一序列、同一
+ // 语句块或同一实参列表中的写入才算支配当前读取；跨分支、循环和未知调用后
+ // 的写入保持未知。该证明用于 regenerator runner 的自赋值形态，不放宽普通
+ // 逃逸绑定。
+ function proofState(seen){
+  return seen??{promise:new Set(),callable:new Set(),bindings:new Set()};
+ }
+ function markProof(seen,mode,n){
+  const state=proofState(seen);if(state[mode].has(n))return null;
+  const next={promise:state.promise,callable:state.callable,bindings:state.bindings};
+  next[mode]=new Set(state[mode]);next[mode].add(n);return next;
+ }
+ function nonCallableValue(n,seen=new Set()){
   if(!n||seen.has(n))return false;seen=new Set(seen);seen.add(n);
+  if(['Literal','ArrayExpression','ObjectExpression','TemplateLiteral','BinaryExpression'].includes(n.type))return true;
+  if(n.type==='UnaryExpression')return true;
+  if(n.type==='LogicalExpression')return nonCallableValue(n.left,seen)&&nonCallableValue(n.right,seen);
+  if(n.type==='ConditionalExpression')return nonCallableValue(n.consequent,seen)&&nonCallableValue(n.alternate,seen);
+  if(n.type==='SequenceExpression')return nonCallableValue(n.expressions.at(-1),seen);
+  if(n.type==='AssignmentExpression'&&n.operator==='=')return nonCallableValue(n.right,seen);
+  if(n.type==='Identifier'){
+   const binding=bindings.get(n);
+   return !!binding&&!binding.writes.length&&!!binding.init&&nonCallableValue(binding.init,seen);
+  }
+  return false;
+ }
+ function priorValue(n,seen){
+  if(n?.type!=='Identifier')return null;
+  const state=proofState(seen),binding=bindings.get(n);
+  if(!binding||state.bindings.has(binding))return null;
+  const next={promise:state.promise,callable:state.callable,bindings:new Set(state.bindings)};next.bindings.add(binding);
+  const writes=binding.writes.filter(write=>write.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&bindings.get(write.left)===binding&&write.right!==n&&write.end<=n.start);
+  if(!writes.length){
+   if(!binding.writes.length&&(binding.fn||binding.init))return {node:binding.fn??binding.init,seen:next};
+   return null;
+  }
+  const write=writes.reduce((a,b)=>a.start>b.start?a:b),ancestors=new Set();
+  // 嵌套函数中的写入不会因为文本位置靠前就自动支配当前读取；只有同一
+  // 执行函数体内的直写才能按语句顺序解析。
+  if(owners.get(write)!==owners.get(n))return null;
+  for(let current=write;current;current=parents.get(current))ancestors.add(current);
+  let common=null;
+  for(let current=n;current;current=parents.get(current))if(ancestors.has(current)){common=current;break;}
+  if(!common)return null;
+  let writeChild=write,readChild=n;
+  while(parents.get(writeChild)!==common)writeChild=parents.get(writeChild);
+  while(parents.get(readChild)!==common)readChild=parents.get(readChild);
+  let ordered=false;
+  if(common.type==='SequenceExpression'){const a=common.expressions.indexOf(writeChild),b=common.expressions.indexOf(readChild);ordered=a>=0&&b>=0&&a<b;}
+  else if(common.type==='BlockStatement'||common.type==='Program'){const a=common.body.indexOf(writeChild),b=common.body.indexOf(readChild);ordered=a>=0&&b>=0&&a<b;}
+  else if(common.type==='CallExpression'){const a=common.arguments.indexOf(writeChild),b=common.arguments.indexOf(readChild);ordered=a>=0&&b>=0&&a<b;}
+  return ordered&&unconditionalWrite(write,common)?{node:write.right,seen:next}:null;
+ }
+ // 参数实参环境必须保留调用方的环境，才能在不展开调用的前提下继续证明
+ // 二层 runner。复杂参数、展开实参和缺少实际值都保持未知。
+ function callEnvironment(fn,call,outer){
+  const environment=new Map(outer??[]);
+  if(!call||!['CallExpression','NewExpression'].includes(call.type)||call.arguments.some(argument=>argument.type==='SpreadElement'))return environment;
+  fn.params.forEach((parameter,index)=>{
+   if(parameter.type!=='Identifier')return;
+   const argument=call.arguments[index];
+   if(!argument)return;
+   const binding=bindings.get(parameter);
+   if(binding)environment.set(binding,{node:argument,environment:outer??new Map()});
+  });
+  return environment;
+ }
+ function environmentValue(name,environment){
+  if(name?.type!=='Identifier')return null;
+  const binding=bindings.get(name);
+  return binding&&environment?.has(binding)?environment.get(binding):null;
+ }
+ function callTargets(callee,environment,seen){
+  const actual=environmentValue(callee,environment);
+  if(actual)return callTargets(actual.node,actual.environment,seen);
+  if(callee?.type==='MemberExpression'){
+   const value=closedTableValue(callee);
+   if(value)return targets(value,new Set());
+   // 对象表闭合证明失败时不能回退到按名称猜目标；别名到对象字面量也保持
+   // 未知，避免属性写入发生在别名一侧而绕过检查。
+   if(callee.object.type==='Identifier'){
+    const binding=bindings.get(callee.object);
+    if(binding?.init?.type==='ObjectExpression'||binding?.init?.type==='Identifier'&&bindings.get(binding.init)?.init?.type==='ObjectExpression')return [];
+   }
+   const fn=callTarget?.(callee);return fn?[fn]:[];
+  }
+  const answer=targets(callee);return answer;
+ }
+ // 函数体的末尾可能被语句块或双分支条件包裹；只有所有分支都必然以 return
+ // 结束时，才能把该函数视为返回值契约固定，避免漏掉其中的退出路径。
+ function endsWithReturn(node){
+  if(node?.type==='ReturnStatement')return true;
+  if(node?.type==='BlockStatement')return node.body.length>0&&endsWithReturn(node.body.at(-1));
+  if(node?.type==='IfStatement'&&node.alternate)return endsWithReturn(node.consequent)&&endsWithReturn(node.alternate);
+  return false;
+ }
+ function promiseReturns(fn,call,outer,seen){
+  if(fn.async)return true;
+  if(fn.generator)return false;
+  const environment=callEnvironment(fn,call,outer);
+  if(fn.body.type!=='BlockStatement')return promiseValue(fn.body,seen,environment);
+  if(!endsWithReturn(fn.body))return false;
+  const returns=nodes.filter(statement=>statement.type==='ReturnStatement'&&owners.get(statement)===fn);
+  return returns.length>0&&returns.every(statement=>promiseValue(statement.argument,seen,environment));
+ }
+ function callableReturns(fn,call,outer,seen){
+  if(fn.async||fn.generator)return false;
+  const environment=callEnvironment(fn,call,outer);
+  if(fn.body.type!=='BlockStatement')return callableValue(fn.body,seen,environment);
+  if(!endsWithReturn(fn.body))return false;
+  const returns=nodes.filter(statement=>statement.type==='ReturnStatement'&&owners.get(statement)===fn);
+  return returns.length>0&&returns.every(statement=>callableValue(statement.argument,seen,environment));
+ }
+ function callableValue(n,seen,environment=new Map()){
+  if(!n)return false;const state=markProof(seen,'callable',n);if(!state)return false;
+  if(functions.has(n.type))return promiseReturns(n,null,environment,state);
+  if(n.type==='Identifier'){
+   const actual=environmentValue(n,environment);
+   if(actual)return callableValue(actual.node,state,actual.environment);
+   const resolved=resolve(n);if(resolved!==n)return callableValue(resolved,state,environment);
+   const previous=priorValue(n,state);if(previous)return callableValue(previous.node,previous.seen,environment);
+   // 自赋值 runner（`m = k(...mark(...)), m.apply(...)`）在首次读取前仍是
+   // 提升的函数声明；只接受所有写入都位于该函数自身的形状，避免把外部
+   // 条件重绑定误当成初始函数。
+   const binding=bindings.get(n);
+   const writes=!!binding?.writes.length&&binding.writes.every(write=>write.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&bindings.get(write.left)===binding&&nonCallableValue(write.right));
+   const selfRewrites=!!binding?.fn&&binding.writes.every(write=>write.start>=binding.fn.start&&write.end<=binding.fn.end);
+   return !!binding?.fn&&(writes||selfRewrites)&&callableValue(binding.fn,state,environment);
+  }
+  if(n.type==='AssignmentExpression'&&n.operator==='=')return callableValue(n.right,state,environment);
+  if(n.type==='SequenceExpression')return callableValue(n.expressions.at(-1),state,environment);
+  if(n.type==='ConditionalExpression')return callableValue(n.consequent,state,environment)&&callableValue(n.alternate,state,environment);
+  if(n.type!=='CallExpression')return false;
+  const fns=callTargets(n.callee,environment,state);
+  return fns.length>0&&fns.every(fn=>callableReturns(fn,n,environment,state));
+ }
+ function promiseValue(n,seen,environment=new Map()){
+  if(!n)return false;const state=markProof(seen,'promise',n);if(!state)return false;
   if(isPromiseCall?.(n))return true;
-  const resolved=resolve(n);if(resolved!==n)return promiseValue(resolved,seen);
-  if(n.type==='AssignmentExpression'&&n.operator==='=')return promiseValue(n.right,seen);
-  if(n.type==='SequenceExpression')return promiseValue(n.expressions.at(-1),seen);
-  if(n.type==='ConditionalExpression')return promiseValue(n.consequent,seen)&&promiseValue(n.alternate,seen);
+  const resolved=resolve(n);if(resolved!==n)return promiseValue(resolved,state,environment);
+  if(n.type==='Identifier'){
+   const actual=environmentValue(n,environment);
+   if(actual)return promiseValue(actual.node,state,actual.environment);
+   const previous=priorValue(n,state);return !!previous&&promiseValue(previous.node,previous.seen,environment);
+  }
+  if(n.type==='AssignmentExpression'&&n.operator==='=')return promiseValue(n.right,state,environment);
+  if(n.type==='SequenceExpression')return promiseValue(n.expressions.at(-1),state,environment);
+  if(n.type==='ConditionalExpression')return promiseValue(n.consequent,state,environment)&&promiseValue(n.alternate,state,environment);
   if(n.type==='NewExpression'&&free(n.callee,'Promise'))return true;
   if(n.type!=='CallExpression')return false;
   if(n.callee.type==='MemberExpression'&&free(n.callee.object,'$task')&&property(n.callee)==='fetch')return true;
   if(n.callee.type==='MemberExpression'){
    if(free(n.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any','withResolvers'].includes(property(n.callee)))return true;
-   if(['then','catch','finally'].includes(property(n.callee)))return promiseValue(n.callee.object,seen);
+   if(['then','catch','finally'].includes(property(n.callee)))return promiseValue(n.callee.object,state,environment);
+   // `runner.apply(this, arguments)` 不展开实参；只有目标可调用值在不依赖
+   // 形参的情况下仍能证明返回 Promise 时才成立。返回函数若使用未知形参，
+   // callableValue 会保持拒绝。
+   if(['apply','call'].includes(property(n.callee))&&callableValue(n.callee.object,state,environment))return true;
   }
-  const fns=targets(n.callee);
-  return fns.length>0&&fns.every(fn=>{
-   if(fn.async)return true;
-   if(fn.body.type!=='BlockStatement')return promiseValue(fn.body,seen);
-   if(fn.body.body.at(-1)?.type!=='ReturnStatement')return false;
-   const returns=nodes.filter(r=>r.type==='ReturnStatement'&&owners.get(r)===fn);
-   return returns.length>0&&returns.every(r=>promiseValue(r.argument,seen));
-  });
+  const fns=callTargets(n.callee,environment,state);
+  if(fns.length)return fns.every(fn=>promiseReturns(fn,n,environment,state));
+  // `factory(argument)()`：工厂调用先返回一个闭合函数，再由外层调用消费。
+  return callableValue(n.callee,state,environment);
  }
  const executors=new Set(nodes.filter(n=>n.type==='NewExpression'&&free(n.callee,'Promise')&&n.arguments.length===1)
   .flatMap(n=>targets(n.arguments[0])).filter(fn=>!fn.async&&!fn.generator&&fn.params.every(p=>p.type==='Identifier')));
