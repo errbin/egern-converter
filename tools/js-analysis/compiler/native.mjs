@@ -539,6 +539,22 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const scheduledOnly=Array.isArray(options.entry_types)&&options.entry_types.length>0&&options.entry_types.every(type=>type==='schedule');
  const complete=new Set(),asyncFns=new Set([tree]),lifted=new Set(),httpReplies=new Map(),extraAfter=new WeakMap(),bodyReads=new Map(),bodyWrites=new Set(),prefix=[],dynamicMethods=new WeakMap(),httpMethodSelections=new WeakSet();
  const generated=new WeakMap(),fieldValues=new WeakMap(),optionalHTTPFields=new WeakSet();
+ // 闭包目标、类与成员调用证明只依赖当前 AST 索引和字段投影。大型 bundle
+ // 会从结构化完成分析反复查询同一批方法；缓存这些纯查询，避免每次重新
+ // 扫描全树。字段投影变化时统一失效，保持原有数据流精度。
+ let targetCache=new WeakMap(),classOfCache=new WeakMap(),immutableClassCache=new WeakMap(),closedMethodCallsCache=new WeakMap(),resolveCache=new WeakMap();
+ const invalidateResolutionCaches=()=>{targetCache=new WeakMap();classOfCache=new WeakMap();immutableClassCache=new WeakMap();closedMethodCallsCache=new WeakMap();resolveCache=new WeakMap();};
+ const setFieldValue=(node,value)=>{fieldValues.set(node,value);invalidateResolutionCaches();};
+ const parameterFunctions=new Map();
+ for(const fn of nodes)if(functions.has(fn.type)){
+  const seen=new Set();
+  fn.params.forEach((parameter,position)=>{
+   const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+   if(!binding||seen.has(binding))return;
+   seen.add(binding);if(!parameterFunctions.has(binding))parameterFunctions.set(binding,[]);
+   parameterFunctions.get(binding).push({fn,position});
+  });
+ }
  const shapeHostValues=new WeakSet();
  const hostResponseBindings=new WeakSet();
  const closedHostResponseSnapshotBindings=new WeakSet();
@@ -634,11 +650,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(c.start<n.finalizer.start||c.end>n.finalizer.end||!isDone(c)||c.arguments[0]?.type!=='Identifier')return false;
   const b=bindings.get(c.arguments[0]);return b?.init?.type==='ObjectExpression'&&b.writes.length&&b.writes.every(w=>w.type==='AssignmentExpression'&&w.operator==='='&&w.right.type==='ObjectExpression');
  }));
- function target(n,seen=new Set()){
+ function target(n,seen){
+  const root=seen===undefined,cacheable=root&&n&&typeof n==='object';
+  if(cacheable&&targetCache.has(n))return targetCache.get(n);
+  const result=targetNode(n,root?new Set():seen);
+  if(cacheable)targetCache.set(n,result);
+  return result;
+ }
+ function targetNode(n,seen){
   if(functions.has(n?.type))return n;
   if(n?.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.arguments.length===1&&!n.optional&&closedIdentityMethodCall(ix,n,n.arguments[0]))return target(n.arguments[0],seen);
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b&&!b.writes.length&&!seen.has(b)){seen.add(b);if(b.fn||b.init)return b.fn??target(b.init,seen);
-   for(const fn of nodes.filter(n=>functions.has(n.type))){const position=fn.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);if(position<0)continue;
+   for(const {fn,position} of parameterFunctions.get(b)??[]){
     const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),callee=id?bindings.get(id):null;
     const direct=parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&!parent.arguments.some(a=>a.type==='SpreadElement');
     let calls;
@@ -722,6 +745,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return b.refs.every(r=>{const p=parents.get(r),q=parents.get(p);return p?.type==='MemberExpression'&&p.object===r&&q?.type==='CallExpression'&&q.callee===p&&property(p)!==undefined;});
  }
  function classOf(n){
+  const cacheable=n&&typeof n==='object';
+  if(cacheable&&classOfCache.has(n))return classOfCache.get(n);
+  const result=classOfNode(n);
+  if(cacheable)classOfCache.set(n,result);
+  return result;
+ }
+ function classOfNode(n){
   if(['ClassExpression','ClassDeclaration'].includes(n?.type))return n;
   if(n?.type==='NewExpression'){
    const c=resolve(n.callee);
@@ -740,6 +770,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return null;
  }
  function immutableClass(cls){
+  if(immutableClassCache.has(cls))return immutableClassCache.get(cls);
+  const result=immutableClassProof(cls);
+  immutableClassCache.set(cls,result);
+  return result;
+ }
+ function immutableClassProof(cls){
   const members=cls.body.body,methods=members.filter(m=>m.type==='MethodDefinition');
   const inert=node=>!node||node.type==='Literal'||node.type==='UnaryExpression'&&['!','void','+','-','~'].includes(node.operator)&&inert(node.argument)||node.type==='BinaryExpression'&&inert(node.left)&&inert(node.right)||node.type==='ObjectExpression'&&node.properties.every(p=>p.type==='Property'&&!p.computed&&p.kind==='init'&&key(p)!=='__proto__'&&inert(p.value));
   if(members.some(m=>m.computed||m.type==='StaticBlock'||m.type==='MethodDefinition'&&['get','set'].includes(m.kind)||m.type!=='MethodDefinition'&&(m.type!=='PropertyDefinition'||m.static||!inert(m.value))))return false;
@@ -800,6 +836,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   });
  }
  function closedMethodCalls(method){
+  if(method&&typeof method==='object'&&closedMethodCallsCache.has(method))return closedMethodCallsCache.get(method);
+  const result=closedMethodCallsProof(method);
+  if(method&&typeof method==='object')closedMethodCallsCache.set(method,result);
+  return result;
+ }
+ function closedMethodCallsProof(method){
   if(method?.type!=='MethodDefinition')return null;
   const cls=parents.get(parents.get(method)),name=key(method);
   if(!cls)return null;
@@ -1246,7 +1288,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
  }
  }
- function resolve(n,seen=new Set()){
+ function resolve(n,seen){
+  const root=seen===undefined,cacheable=root&&n&&typeof n==='object';
+  if(cacheable&&resolveCache.has(n))return resolveCache.get(n);
+  const result=resolveNode(n,root?new Set():seen);
+  if(cacheable)resolveCache.set(n,result);
+  return result;
+ }
+ function resolveNode(n,seen){
   if(fieldValues.has(n))return resolve(fieldValues.get(n),seen);
   if(n?.type!=='Identifier')return n;
   const b=bindings.get(n);if(b?.init&&!b.writes.length&&!seen.has(b)){seen.add(b);return resolve(b.init,seen);}return n;
@@ -3328,7 +3377,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return n?.type==='ConditionalExpression'&&t?.type==='BinaryExpression'&&['===','=='].includes(t.operator)&&t.left.type==='UnaryExpression'&&t.left.operator==='typeof'&&t.left.argument.type==='Identifier'&&t.right.type==='Literal'&&t.right.value==='string'&&a.type==='Identifier'&&bindings.get(t.left.argument)===bindings.get(a)&&c.type==='ObjectExpression'&&c.properties.length===1&&c.properties[0].type==='Property'&&key(c.properties[0])==='url'&&c.properties[0].value.type==='Identifier'&&bindings.get(c.properties[0].value)===bindings.get(a);
   }
   const origin=closedLiveRequest(input)??fields(input);if(!origin)return null;
-  const projected=new Map([...origin].map(([k,value])=>{if(origin.runtimeRequest){if(origin.optional?.has(k))optionalHTTPFields.add(value);return [k,value];}const node={type:'Identifier',name:'httpField',start:input.start,end:input.end};fieldValues.set(node,value);if(origin.optional?.has(k))optionalHTTPFields.add(node);generated.set(node,`${render(input)}[${JSON.stringify(k)}]`);return [k,node];}));
+  const projected=new Map([...origin].map(([k,value])=>{if(origin.runtimeRequest){if(origin.optional?.has(k))optionalHTTPFields.add(value);return [k,value];}const node={type:'Identifier',name:'httpField',start:input.start,end:input.end};setFieldValue(node,value);if(origin.optional?.has(k))optionalHTTPFields.add(node);generated.set(node,`${render(input)}[${JSON.stringify(k)}]`);return [k,node];}));
   projected.runtimeRequest=origin.runtimeRequest?{...origin.runtimeRequest,expression:input}:undefined;return projected;
  }
  // 回调可能把完整响应放进局部包装记录的 response 键，再由封闭 Promise
