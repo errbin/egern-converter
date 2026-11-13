@@ -1303,7 +1303,112 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n?.type!=='Identifier')return n;
   const b=bindings.get(n);if(b?.init&&!b.writes.length&&!seen.has(b)){seen.add(b);return resolve(b.init,seen);}return n;
  }
+ // 发布到对象字面量的函数只有在宿主外壳闭合、且宿主绑定的每个读取都是
+ // 已知成员调用时，才能把对象上的调用点当成完整调用面。对象外传、别名、
+ // 读取方法值本身都会让外部代码有机会用任意实参调用它。
+ function propertyHostClosed(propertyNode){
+  const object=parents.get(propertyNode);
+  if(object?.type!=='ObjectExpression'||!closedObjectShell(object))return false;
+  const declaration=parents.get(object),id=declaration?.type==='VariableDeclarator'&&declaration.init===object?declaration.id:null;
+  // 工厂返回对象或嵌套属性表没有局部绑定；其闭合性由外壳和既有工厂实例
+  // 证明继续约束，这里不再虚构额外的对象身份。
+  if(id?.type!=='Identifier')return true;
+  const owner=bindings.get(id);
+  if(!owner||owner.writes.length)return false;
+  return owner.refs.every(ref=>{
+   const member=parents.get(ref),call=parents.get(member);
+   return member?.type==='MemberExpression'&&member.object===ref&&!member.optional&&property(member)!==undefined&&
+    call?.type==='CallExpression'&&call.callee===member;
+  });
+ }
+ // 属性发布出去的函数只有在对应属性键从未被读取时，才可能没有调用点。
+ // 键名相同不一定属于同一宿主：`$notification.post` 不能证明
+ // `$.http.post` 可达。这里沿对象字面量和工厂返回路径还原完整成员链，
+ // 例如 `$.http.get` 对应嵌套属性 `http.get`。
+ function memberChainRead(ref,path){
+  let node=ref;
+  for(const name of path){
+   const member=parents.get(node);
+   if(member?.type!=='MemberExpression'||member.object!==node||property(member)!==name)return false;
+   node=member;
+  }
+  return true;
+ }
+ function bindingMemberChainRead(binding,path,initialization=null){
+  const writesAreClosed=!binding?.writes.length||!!initialization&&binding.writes.length===1&&binding.writes[0]===initialization;
+  return !!binding&&writesAreClosed&&binding.refs.some(ref=>memberChainRead(ref,path));
+ }
+ function publishedPropertyRead(fn){
+  const publication=parents.get(fn);
+  if(publication?.type!=='Property'||publication.value!==fn)return false;
+  const leaf=key(publication);
+  if(leaf===undefined)return false;
+  const path=[leaf];
+  let object=parents.get(publication);
+  for(;;){
+   if(object?.type!=='ObjectExpression')return false;
+   const up=parents.get(object);
+   if(up?.type==='Property'&&up.value===object&&!up.computed&&key(up)!==undefined){
+    path.unshift(key(up));object=parents.get(up);continue;
+   }
+   if(up?.type==='VariableDeclarator'&&up.init===object&&up.id.type==='Identifier')
+    return bindingMemberChainRead(bindings.get(up.id),path);
+   if(up?.type==='AssignmentExpression'&&up.operator==='='&&up.right===object&&up.left.type==='Identifier')
+    return bindingMemberChainRead(bindings.get(up.left),path,up);
+   if(up?.type==='ReturnStatement'&&up.argument===object){
+    const factory=owners.get(up),factoryBinding=factory?.id&&bindings.get(factory.id);
+    if(!factoryBinding||factoryBinding.writes.length)return false;
+    return factoryBinding.refs.some(ref=>{
+     const construction=parents.get(ref);
+     if(construction?.type!=='NewExpression'||construction.callee!==ref)return false;
+     const declaration=parents.get(construction);
+     if(declaration?.type==='VariableDeclarator'&&declaration.init===construction&&declaration.id.type==='Identifier')
+      return bindingMemberChainRead(bindings.get(declaration.id),path);
+     return memberChainRead(construction,path);
+    });
+   }
+   return false;
+  }
+ }
+ // 函数值只允许直接调用和静态属性发布。属性发布还要经过宿主调用面证明；
+ // `typeof` 与条件测试不取得函数值，不会形成新的调用入口。
+ function functionUseSurfaceClosed(fn,allowCalls){
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'&&parent.init===fn?parent.id:null);
+  const binding=id?.type==='Identifier'?bindings.get(id):null,properties=[];
+  if(parent?.type==='Property'&&parent.value===fn&&!parent.computed&&key(parent)!==undefined)properties.push(parent);
+  if(binding){
+   if(binding.writes.length)return false;
+   for(const ref of binding.refs){
+    const use=parents.get(ref);
+    if(use?.type==='CallExpression'&&use.callee===ref){if(!allowCalls)return false;continue;}
+    if(use?.type==='Property'&&use.value===ref&&!use.computed&&key(use)!==undefined){properties.push(use);continue;}
+    if(use?.type==='UnaryExpression'&&use.operator==='typeof')continue;
+    if(['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(use?.type)&&use.test===ref)continue;
+    return false;
+   }
+  }else if(!properties.length)return false;
+  return properties.every(propertyHostClosed);
+ }
+ // 闭合函数的对象默认参数只在所有调用点都省略该实参时才折叠为默认字面量。
+ // 任一调用点提供实参（包括显式 undefined 以外的值）都保持原表达式，交给
+ // 常规对象记录证明，不能把默认值误当成实际入参。
+ function defaultedObjectParameter(n){
+  if(n?.type!=='Identifier')return null;
+  const binding=bindings.get(n);
+  if(!binding||binding.writes.length)return null;
+  const entries=parameterFunctions.get(binding);
+  if(!entries||entries.length!==1)return null;
+  const {fn,position}=entries[0],parameter=fn.params[position];
+  if(parameter?.type!=='AssignmentPattern'||parameter.right.type!=='ObjectExpression')return null;
+  if(!functionUseSurfaceClosed(fn,true))return null;
+  const calls=replyCallers(fn);
+  if(!calls?.length)return null;
+  if(calls.some(call=>call.optional||call.arguments.some(argument=>argument.type==='SpreadElement')))return null;
+  if(!calls.every(call=>!call.arguments[position]||free(call.arguments[position],'undefined')))return null;
+  return parameter.right;
+ }
  function object(n,label){
+  const defaulted=defaultedObjectParameter(n);if(defaulted)n=defaulted;
   const b=n?.type==='Identifier'?bindings.get(n):null;
   if(b){
    if(b.writes.length)fail(n,label+' 在声明后被整体重绑，需要先确定字段的数据流');
@@ -2558,13 +2663,30 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(!parameter)return null;
      const site=parameterCallSites(binding);
      if(!site)return null;
-     return site.calls.map(entry=>{
+     // 共享 helper 的参数可能由多个包装调用点提供。若某个包装函数本身在
+     // 闭合对象外壳上没有任何调用点，对应的实参路径不可达，不应把该路径
+     // 的未知记录当成当前 helper 的字段来源；真实可达但未知的调用点仍返回
+     // null 并保持失败关闭。
+     const deadActual=actual=>{
+      if(actual?.type!=='Identifier')return false;
+      const actualBinding=bindings.get(actual),owners=actualBinding&&parameterFunctions.get(actualBinding);
+      if(!owners||owners.length!==1)return false;
+      const fn=owners[0].fn;
+      if(publishedPropertyRead(fn))return false;
+      // 没有调用点还不够：函数值可能经别名或对象外传交给未知代码。只有
+      // 完整使用面仍是闭合静态调用面时，才能把该实参路径视为不可达。
+      return replyCallers(fn).length===0&&functionUseSurfaceClosed(fn,false);
+     };
+     const records=site.calls.map(entry=>{
       let actual=entry.actual,formal=site.fn.params[site.position];
       if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void'&&actual.argument.type==='Literal')actual=formal?.type==='AssignmentPattern'?formal.right:null;
+      if(actual&&deadActual(actual))return undefined;
       if(actual&&!safeRecordSource(actual,entry.call))return null;
       const record=actual?recordFields(actual,new Set(),null,entry.call):null;
       return record;
      });
+     const live=records.filter(record=>record!==undefined);
+     return live.length?live:null;
     };
     const sourceRecords=parameter?parameterRecords():null;
     if(parameter&&!sourceRecords)return false;
@@ -3611,6 +3733,64 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return false;
   });
  }
+ // 整体响应只允许交给本地闭合 helper。helper 的对应参数必须只读取
+ // 原生响应上语义稳定的固定字段，且不能写回、调用响应本身或继续逃逸。
+ // 正文是流对象，不能通过整体响应参数读取；调用方若需要正文必须单独读取
+ // `response.body`，由既有的正文投影证明处理。
+ const responsePassFields=new Set(['status','statusCode','headers','ok','statusText']);
+ const responseHeaderReads=new Set(['entries','keys','values','get','getAll','has','forEach','toString','valueOf']);
+ const responseHeaderObservers=new Set(['keys','values','entries']);
+ // headers 会成为普通数据对象，因此可以作为对象字段复制，或交给只观察键值
+ // 的静态函数；直接返回、别名到未知代码、调用未知函数以及任何写操作都会
+ // 扩大宿主响应的可观察面，保持拒绝。
+ function responseHeaderUseReadOnly(headerMember){
+  const use=parents.get(headerMember);
+  if(use?.type==='Property'&&use.value===headerMember&&parents.get(use)?.type==='ObjectExpression')return true;
+  if(use?.type==='SpreadElement'&&use.argument===headerMember&&parents.get(use)?.type==='ObjectExpression')return true;
+  if(use?.type==='MemberExpression'&&use.object===headerMember){
+   if(use.computed&&use.property?.type!=='Literal')return false;
+   const method=property(use),call=parents.get(use);
+   return method!==undefined&&responseHeaderReads.has(String(method))&&call?.type==='CallExpression'&&call.callee===use&&!call.optional;
+  }
+  if(use?.type==='CallExpression'&&use.arguments.includes(headerMember)){
+   const callee=use.callee;
+   if(callee.type==='MemberExpression'&&free(callee.object,'Object')&&responseHeaderObservers.has(String(property(callee)))&&use.arguments.length===1)return true;
+   if(callee.type==='MemberExpression'&&free(callee.object,'JSON')&&property(callee)==='stringify'&&use.arguments[0]===headerMember)return true;
+  }
+  return false;
+ }
+ function responsePassParameter(fn,parameter,seen=new Set()){
+  if(!functions.has(fn?.type)||fn.generator)return false;
+  const binding=bindings.get(parameter);
+  if(!binding||binding.writes.length||seen.has(binding))return false;
+  seen=new Set(seen);seen.add(binding);
+  for(const ref of binding.refs){
+   const [current,parent]=replyValueContext(ref);
+   if(parent?.type==='MemberExpression'&&parent.object===current){
+    const name=property(parent);
+    if(name===undefined||!responsePassFields.has(String(name)))return false;
+    const use=parents.get(parent);
+    if(use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||
+       use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===parent)return false;
+    if(String(name)==='headers'){if(!responseHeaderUseReadOnly(parent))return false;continue;}
+    // 标量字段按值读取；嵌套成员仍不能写回，避免修改宿主消息记录。
+    if(use?.type==='MemberExpression'&&use.object===parent){
+     const nested=parents.get(use);
+     if(nested?.type==='AssignmentExpression'&&nested.left===use||nested?.type==='UpdateExpression'||
+        nested?.type==='UnaryExpression'&&nested.operator==='delete')return false;
+    }
+    continue;
+   }
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(current)){
+    const next=replyTarget(parent.callee),nextParameter=next?.params[parent.arguments.indexOf(current)];
+    const id=nextParameter?.type==='AssignmentPattern'?nextParameter.left:nextParameter;
+    if(!next||id?.type!=='Identifier'||!responsePassParameter(next,id,seen))return false;
+    continue;
+   }
+   return false;
+  }
+  return true;
+ }
  function reply(binding,fn=null,allowSnapshot=false){
   if(binding&&allowSnapshot){
    const fields=new Set(),state={write:false,whole:false};
@@ -3624,6 +3804,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     for(const entry of p.id.properties){const name=entry.type==='Property'?key(entry):null;if(!['body','bodyBytes','status','statusCode','headers'].includes(name))fail(entry,'未知 HTTP 响应解构字段');uses.add(name);}continue;
    }
    if(closedWholeResponseUse(ref))continue;
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+    const targetFn=replyTarget(p.callee),parameter=targetFn?.params[p.arguments.indexOf(ref)];
+    const id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
+    if(targetFn&&id?.type==='Identifier'&&responsePassParameter(targetFn,id,new Set([binding])))continue;
+   }
    if(p?.type!=='MemberExpression'||p.object!==ref)fail(ref,'HTTP 响应整体传递无法静态转换');const k=property(p);if(!['body','bodyBytes','status','statusCode','headers'].includes(k))fail(p,'未知 HTTP 响应字段');uses.add(k);}
   const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
  }

@@ -173,6 +173,54 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
         self.assertTrue(proof['proved'], proof)
         self.convert_and_compare(body, 'a', 'closed table abrupt return')
 
+    def test_multilevel_closed_table_chain_is_accepted(self):
+        body = (
+            "case 0:var H={ret:'return'},D={ret:H.ret};if(ctx.sent){ctx.next=2;break;}"
+            "return ctx.abrupt(D.ret,$done({body:'a'}));"
+            "case 2:return ctx.abrupt('return',$done({body:'b'}));")
+        proof = consume(source_with(body))
+        self.assertTrue(proof['accepted'], proof)
+        self.assertTrue(proof['proved'], proof)
+        self.convert_and_compare(body, 'a', 'multilevel closed table abrupt return')
+
+    def test_closed_table_string_coercion_observation_is_accepted(self):
+        body = (
+            "case 0:var H={ret:'return'};"
+            "if(({}.toString()).constructor(H)){if(ctx.sent){ctx.next=2;break;}}"
+            "return ctx.abrupt(H.ret,$done({body:'a'}));"
+            "case 2:return ctx.abrupt('return',$done({body:'b'}));")
+        proof = consume(source_with(body))
+        self.assertTrue(proof['accepted'], proof)
+        self.assertTrue(proof['proved'], proof)
+        self.convert_and_compare(body, 'a', 'closed table string coercion')
+
+    def test_table_chain_and_coercion_reject_unproved_observations(self):
+        cases = {
+            'mutated chain member': (
+                "case 0:var H={ret:'return'},D={ret:H.ret};D.ret='throw';"
+                "if(ctx.sent){ctx.next=2;break;}"
+                "return ctx.abrupt(D.ret,$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+            'dynamic chain key': (
+                "case 0:var H={ret:'return'},D={ret:H.ret},key='ret';"
+                "if(ctx.sent){ctx.next=2;break;}"
+                "return ctx.abrupt(D[key],$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+            'unknown toString receiver': (
+                "case 0:var H={ret:'return'};"
+                "if((unknown().toString()).constructor(H)){if(ctx.sent){ctx.next=2;break;}}"
+                "return ctx.abrupt(H.ret,$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+            'array concat is not a string': (
+                "case 0:var H={ret:'return'};"
+                "if(([].concat()).constructor(H)){if(ctx.sent){ctx.next=2;break;}}"
+                "return ctx.abrupt(H.ret,$done({body:'a'}));"
+                "case 2:return ctx.abrupt('return',$done({body:'b'}));"),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                self.assert_rejected(body)
+
     def test_closed_table_backed_abrupt_return_rejects_unclosed_tables(self):
         cases = {
             'mutated member': (

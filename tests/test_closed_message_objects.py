@@ -30,6 +30,38 @@ const result=snapshot($response);$done({body:JSON.stringify(result.headers)});''
         self.assertIn('ctx.response["headers"].entries()', native)
         self.assertIn('ctx.response["status"]', native)
 
+    def test_whole_response_may_reach_closed_field_helper(self):
+        source = ("function request(){return new Promise((resolve,reject)=>{"
+                  "const cb=(err,resp)=>err?reject(err):resolve({status:resp.status||resp.statusCode,headers:resp.headers});"
+                  "$task.fetch('https://api.test/').then(r=>cb(null,r),e=>cb(e));});}"
+                  "(async()=>{const out=await request();$done({body:String(out.status)})})();")
+        native = self.convert(source)
+        self.assertNotIn('$task', native)
+        case = {'name': 'closed response helper', 'request': {'url': URL},
+                'http': [{'url': 'https://api.test/', 'status': 201,
+                          'headers': {'X-Test': 'yes'}, 'body': 'network'}],
+                'expected': {'result': {'body': '201'}}}
+        result = compare(source, native, 'qx', URL, case)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_whole_response_helper_rejects_body_escape_and_header_writes(self):
+        template = ("function request(){return new Promise((resolve,reject)=>{"
+                    "const cb=(err,resp)=>err?reject(err):resolve(__VALUE__);"
+                    "$task.fetch('https://api.test/').then(r=>cb(null,r),e=>cb(e));});}"
+                    "(async()=>{const out=await request();$done({body:String(out.status)})})();")
+        values = [
+            'resp.body',
+            'resp',
+            'unknown(resp)',
+            'resp.status=201',
+            'resp.headers.set("x-test","rewritten")',
+            '(()=>{const headers=resp.headers;unknown(headers);return {status:resp.status}})()',
+            'resp.headers',
+        ]
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(ConversionError):
+                self.convert(template.replace('__VALUE__', value))
+
     def test_whole_snapshot_may_reach_closed_identity_helpers(self):
         source = ("function eq(a,b){return a===b}const snapshot=$response;"
                   "$done({body:eq(snapshot,null)?'same':'different'});")

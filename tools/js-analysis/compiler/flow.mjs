@@ -180,20 +180,93 @@ export function closedIdentityMethodCall(ix,call,arg){
 }
 
 const CLOSED_UNKNOWN=Symbol('closed-unknown');
+const STRING_RETURNING_METHODS=new Set(['toLocaleString','concat','slice','substring','substr','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','replace','replaceAll','repeat','padStart','padEnd','charAt','normalize']);
+const STRING_NUMBER_METHODS=new Set(['search','indexOf','lastIndexOf','localeCompare','charCodeAt','codePointAt']);
+// 只证明“表达式结果一定是字符串”，用于识别 `(stringExpr).constructor(value)`
+// 这种 String(value) coercion。成员方法必须同时证明接收者是字符串，不能只
+// 凭方法名把数组上的同名 `slice/concat` 或作者自定义方法当成字符串。
+function provablyStringValue(node,ix,seen=new Set()){
+ if(!node||seen.has(node))return false;
+ seen=new Set(seen);seen.add(node);
+ if(node.type==='Literal')return typeof node.value==='string';
+ if(node.type==='TemplateLiteral')return node.expressions.length===0;
+ if(node.type==='ParenthesizedExpression'||node.type==='ChainExpression')return provablyStringValue(node.expression,ix,seen);
+ if(node.type==='SequenceExpression')return provablyStringValue(node.expressions.at(-1),ix,seen);
+ if(node.type==='ConditionalExpression')return provablyStringValue(node.consequent,ix,seen)&&provablyStringValue(node.alternate,ix,seen);
+ if(node.type==='LogicalExpression')return provablyStringValue(node.left,ix,seen)&&provablyStringValue(node.right,ix,seen);
+ if(node.type==='BinaryExpression'&&node.operator==='+')return provablyStringValue(node.left,ix,seen)||provablyStringValue(node.right,ix,seen);
+ if(node.type==='CallExpression'){
+  if(node.callee.type==='Identifier')return ix.free(node.callee,'String');
+   if(node.callee.type!=='MemberExpression'||node.optional||node.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+   const method=property(node.callee);
+   if(method==='toString'&&node.arguments.length===0)return provablyStringCoercibleReceiver(node.callee.object,ix,seen);
+   return STRING_RETURNING_METHODS.has(String(method))&&provablyStringValue(node.callee.object,ix,seen);
+ }
+ return false;
+}
+// 数字经 `.toString()` 后必为字符串。这里的数字来源只接受字面量和在字符串
+// 接收者上调用返回数字的标准方法，避免把任意同名方法当作 Number.prototype。
+function provablyNumberValue(node,ix,seen=new Set()){
+ if(!node||seen.has(node))return false;
+ seen=new Set(seen);seen.add(node);
+ if(node.type==='Literal')return typeof node.value==='number';
+ if(node.type==='ParenthesizedExpression'||node.type==='ChainExpression')return provablyNumberValue(node.expression,ix,seen);
+ if(node.type==='SequenceExpression')return provablyNumberValue(node.expressions.at(-1),ix,seen);
+ if(node.type==='Identifier'){
+  const binding=ix.bindings.get(node);
+  return !!binding&&!binding.writes.length&&!!binding.init&&provablyNumberValue(binding.init,ix,seen);
+ }
+ if(node.type==='CallExpression'){
+  if(node.callee.type!=='MemberExpression'||node.optional||node.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  return STRING_NUMBER_METHODS.has(String(property(node.callee)))&&provablyStringValue(node.callee.object,ix,seen);
+ }
+ return false;
+}
+// `.toString()` 的接收者必须是字符串／数字、布尔／BigInt 字面量，或无自定义
+// 原始值转换钩子的闭合普通对象。未知调用、数组和带替换方法的对象仍拒绝。
+function provablyStringCoercibleReceiver(node,ix,seen=new Set()){
+ if(!node||seen.has(node))return false;
+ if(provablyStringValue(node,ix,seen)||provablyNumberValue(node,ix,seen))return true;
+ seen=new Set(seen);seen.add(node);
+ if(node.type==='Literal')return ['boolean','bigint'].includes(typeof node.value);
+ if(node.type==='Identifier'){
+  const binding=ix.bindings.get(node);
+  return !!binding&&!binding.writes.length&&!!binding.init&&provablyStringCoercibleReceiver(binding.init,ix,seen);
+ }
+ if(node.type!=='ObjectExpression')return false;
+ return node.properties.every(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&!entry.computed&&
+  key(entry)!==undefined&&!['__proto__','toString','valueOf'].includes(String(key(entry))));
+}
+// 表对象整体传给 `(stringExpr).constructor(value)` 等价于 String(value)：
+// 只读取对象到原始值的转换，不写入任何字段。表自身不能覆盖 valueOf /
+// toString / Symbol.toPrimitive，否则该观察可能执行作者代码。
+function stringCoercionObservation(ref,ix,object){
+ const call=ix.parents.get(ref);
+ if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==1||call.arguments[0]!==ref)return false;
+ const callee=call.callee;
+ if(callee.type!=='MemberExpression'||callee.optional||property(callee)!=='constructor')return false;
+ if(!provablyStringValue(callee.object,ix))return false;
+ return !object.properties.some(entry=>entry.type==='Property'&&['toString','valueOf','Symbol.toPrimitive'].includes(String(key(entry))));
+}
 // 闭表常量只用于状态控制参数的身份证明。表本身必须由单一对象字面量初始化，
 // 没有改绑、成员写入、删除、整体别名或未知逃逸；属性键必须静态且唯一。
 // 被读取的属性值只接受无插值字符串，其它表项可以保留为函数等运行期值。
-function closedStaticStringMember(node,ix){
- if(node?.type!=='MemberExpression')return CLOSED_UNKNOWN;
+function closedStaticStringMember(node,ix,seen=new Set()){
+ if(node?.type!=='MemberExpression'||seen.has(node))return CLOSED_UNKNOWN;
+ seen=new Set(seen);seen.add(node);
  const name=property(node);
  if(typeof name!=='string'&&typeof name!=='number')return CLOSED_UNKNOWN;
  let object=node.object;
  if(object.type==='Identifier'){
   const binding=ix.bindings.get(object);
   if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return CLOSED_UNKNOWN;
+  object=binding.init;
   for(const ref of binding.refs){
    const member=ix.parents.get(ref);
-   if(member?.type!=='MemberExpression'||member.object!==ref)return CLOSED_UNKNOWN;
+   if(member?.type!=='MemberExpression'||member.object!==ref){
+    if(stringCoercionObservation(ref,ix,object))continue;
+    return CLOSED_UNKNOWN;
+   }
    let chain=member;
    for(;;){
     const use=ix.parents.get(chain);
@@ -203,7 +276,6 @@ function closedStaticStringMember(node,ix){
     break;
    }
   }
-  object=binding.init;
  }else if(object.type!=='ObjectExpression')return CLOSED_UNKNOWN;
  const names=new Set();
  let value=CLOSED_UNKNOWN;
@@ -219,6 +291,10 @@ function closedStaticStringMember(node,ix){
  if(value===CLOSED_UNKNOWN)return CLOSED_UNKNOWN;
  if(value.type==='Literal'&&typeof value.value==='string')return value.value;
  if(value.type==='TemplateLiteral'&&value.expressions.length===0)return value.quasis[0].value.cooked??CLOSED_UNKNOWN;
+ // 去混淆代码常把同一组状态串拆成多层闭合表：`m["key"]` 的值又是
+ // `d["key"]`。只要每一层都通过同样的无改绑、只读成员证明，就沿链
+ // 继续取值；环、动态键和任何一层不可证值都保持 unknown。
+ if(value.type==='MemberExpression')return closedStaticStringMember(value,ix,seen);
  return CLOSED_UNKNOWN;
 }
 const REGENERATOR_LOOPS=new Set(['ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement']);

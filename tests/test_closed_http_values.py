@@ -58,3 +58,65 @@ else $notification.post("title","","body",options)}notify($request.url);$done({}
         self.assertIn('ctx.notify(',output)
         with self.assertRaises(ConversionError):
             convert_script(source.replace('if(url)options.openUrl=url;','unknown(options);if(url)options.openUrl=url;'),'Author',URL,'',source_format='loon')
+
+    def test_closed_default_object_parameter_requires_all_call_sites_omitted(self):
+        source="function notify(opts={}){$notify('title','subtitle','body',opts)}notify();$done({body:'ok'});"
+        output=convert_script(source,'Author',URL,'',source_format='qx')
+        self.assertIn('ctx.notify(',output)
+        fixture={'name':'closed default object','request':{'url':URL},
+                 'expected':{'result':{'body':'ok'}}}
+        self.assertEqual(compare(source,output,'qx',URL,fixture)['status'],'passed')
+        rejected=[
+            "function notify(opts={}){$notify('title','subtitle','body',opts)}notify($argument);$done({body:'ok'});",
+            "function notify(opts={}){$notify('title','subtitle','body',opts)}notify();notify($argument);$done({body:'ok'});",
+            "function notify(opts={}){$notify('title','subtitle','body',opts)}unknown(notify);notify();$done({body:'ok'});",
+            "function notify(opts={}){$notify('title','subtitle','body',opts)}const alias=notify;notify();$done({body:'ok'});",
+        ]
+        for rejected_source in rejected:
+            with self.subTest(source=rejected_source),self.assertRaises(ConversionError):
+                convert_script(rejected_source,'Author',URL,'',source_format='qx')
+
+    def test_unreachable_shared_wrapper_actual_is_ignored_only_with_closed_use_surface(self):
+        source=("function send(opts){$task.fetch(opts).then(()=>{})}"
+                "const api={get:opts=>send(opts),post:opts=>send(opts)};"
+                "api.get({url:'https://example.test/'});$done({body:'ok'});")
+        output=convert_script(source,'Author',URL,'',source_format='qx')
+        self.assertIn('ctx.http',output)
+        fixture={'name':'dead wrapper actual','request':{'url':URL},
+                 'http':[{'url':'https://example.test/','status':200,'headers':{},'body':'network'}],
+                 'expected':{'result':{'body':'ok'}}}
+        self.assertEqual(compare(source,output,'qx',URL,fixture)['status'],'passed')
+        rejected=[
+            source.replace("api.get({url:'https://example.test/'});","api.get({url:'https://example.test/'});api.post($argument);"),
+            source.replace("api.get({url:'https://example.test/'});","api.get({url:'https://example.test/'});unknown(api.post);"),
+            source.replace("api.get({url:'https://example.test/'});","api.get({url:'https://example.test/'});unknown(api);"),
+            source.replace("api.get({url:'https://example.test/'});","api.get({url:'https://example.test/'});unknown(api.get);"),
+        ]
+        for rejected_source in rejected:
+            with self.subTest(source=rejected_source),self.assertRaises(ConversionError):
+                convert_script(rejected_source,'Author',URL,'',source_format='qx')
+
+    def test_published_http_member_read_keeps_shared_wrapper_actual(self):
+        source=("function Env(name){return new class{"
+                "constructor(name){this.http={get:req=>this.send(req,'GET'),post:req=>this.send(req,'POST')};}"
+                "send(req,method){return new Promise((resolve,reject)=>{"
+                "req=typeof req==='string'?{url:req}:req;req.method=method;"
+                "$task.fetch(req).then(resp=>resolve(resp.body),reject);});}"
+                "}(name)}"
+                "const $=new Env('x');"
+                "$.http.get({url:'https://example.test/'}).then(body=>$done({body}));")
+        output=convert_script(source,'Author',URL,'',source_format='qx')
+        fixture={'name':'published http member read','request':{'url':URL},
+                 'http':[{'url':'https://example.test/','status':200,
+                          'headers':{},'body':'network'}],
+                 'expected':{'result':{'body':'network'}}}
+        self.assertEqual(compare(source,output,'qx',URL,fixture)['status'],'passed')
+        rejected=[
+            source.replace("const $=new Env('x');","const $=new Env('x');$.http={get:req=>$,post:req=>{}};"),
+            source.replace("const $=new Env('x');","const $=new Env('x');$.http=null;"),
+            source.replace("const $=new Env('x');",
+                           "const $=new Env('x');function make(){return {get:req=>$,post:req=>{}}}$.http=make();"),
+        ]
+        for rejected_source in rejected:
+            with self.subTest(source=rejected_source),self.assertRaises(ConversionError):
+                convert_script(rejected_source,'Author',URL,'',source_format='qx')
