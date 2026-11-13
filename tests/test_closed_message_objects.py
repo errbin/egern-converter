@@ -30,6 +30,47 @@ const result=snapshot($response);$done({body:JSON.stringify(result.headers)});''
         self.assertIn('ctx.response["headers"].entries()', native)
         self.assertIn('ctx.response["status"]', native)
 
+    def test_whole_snapshot_may_reach_closed_identity_helpers(self):
+        source = ("function eq(a,b){return a===b}const snapshot=$response;"
+                  "$done({body:eq(snapshot,null)?'same':'different'});")
+        native = self.convert(source)
+        self.assertNotIn('$response', native)
+        case = {'name': 'closed identity helper', 'request': {'url': URL},
+                'response': {'status': 200, 'headers': {}, 'body': 'original'},
+                'expected': {'result': {'body': 'different'}}}
+        result = compare(source, native, 'qx', URL, case)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_identity_helper_table_chain_keeps_whole_snapshot_read_only(self):
+        source = ("const helpers={eq:function(a,b){return a===b}};"
+                  "function same(a,b){return helpers.eq(a,b)}const snapshot=$response;"
+                  "$done({body:same(snapshot,null)?'same':'different'});")
+        native = self.convert(source)
+        self.assertNotIn('$response', native)
+        case = {'name': 'closed identity helper chain', 'request': {'url': URL},
+                'response': {'status': 200, 'headers': {}, 'body': 'original'},
+                'expected': {'result': {'body': 'different'}}}
+        result = compare(source, native, 'qx', URL, case)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_coercing_or_escaping_identity_helpers_still_reject(self):
+        sources = [
+            "function eq(a,b){return a==b}const snapshot=$response;"
+            "$done({body:eq(snapshot,null)?'same':'different'});",
+            "function eq(a,b){return a.body===b}const snapshot=$response;"
+            "$done({body:eq(snapshot,null)?'same':'different'});",
+            "function eq(a,b){return unknown(a)}const snapshot=$response;"
+            "$done({body:eq(snapshot,null)?'same':'different'});",
+            "const helpers={eq:function(a,b){return a===b}};"
+            "helpers.eq=function(){return true};const snapshot=$response;"
+            "$done({body:helpers.eq(snapshot,null)?'same':'different'});",
+            "const helpers={eq:function(a,b){return a===b}};const snapshot=$response;"
+            "$done({body:helpers[$argument](snapshot,null)?'same':'different'});",
+        ]
+        for source in sources:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                self.convert(source)
+
     def test_response_alias_body_is_differentially_equivalent(self):
         source = 'const alias=$response; $done({body:alias.body});'
         native = self.convert(source)

@@ -236,13 +236,100 @@ export function lowerMessageParameters(source){
 // while preserving ordinary object mutation and return semantics for adapters.
 export function lowerClosedMessageObjects(source){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree),replace=new WeakMap();
- const {nodes,parents,bindings,free}=ix;
+ const {nodes,parents,bindings,owners,free}=ix;
  const fieldsByKind={$request:new Set(['url','method','headers','body','bodyBytes']),$response:new Set(['status','statusCode','headers','body','bodyBytes'])};
  const nullish=n=>free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void';
  function target(callee){
   if(functions.has(callee?.type))return callee;
   if(callee?.type!=='Identifier')return null;
   const binding=bindings.get(callee);return binding?.fn&&functions.has(binding.fn.type)?binding.fn:null;
+ }
+ // 整体消息别名可以交给本地闭合字面量表中的方法。这里只解析无改绑、
+ // 无成员写入的字面量表，避免把动态替换过的方法当成纯比较 helper。
+ const methodTargetCache=new WeakMap();
+ function methodTarget(callee,seen=new Set()){
+  if(functions.has(callee?.type))return callee;
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(!binding||binding.writes.length||seen.has(binding))return null;
+   const next=new Set(seen);next.add(binding);
+   return methodTarget(binding.fn??binding.init,next);
+  }
+  if(callee?.type!=='MemberExpression')return null;
+  if(methodTargetCache.has(callee))return methodTargetCache.get(callee);
+  const name=property(callee);
+  if(name===undefined)return null;
+  let object=callee.object;
+  if(object.type==='Identifier'){
+   const binding=bindings.get(object);
+   if(!binding||binding.writes.length||seen.has(binding)||binding.init?.type!=='ObjectExpression')return null;
+   const next=new Set(seen);next.add(binding);
+   for(const ref of binding.refs){
+    const use=parents.get(ref);
+    if(use?.type!=='MemberExpression'||use.object!==ref||property(use)===undefined)return null;
+    const parent=parents.get(use);
+    if(parent?.type==='AssignmentExpression'&&parent.left===use||parent?.type==='UpdateExpression'||
+       parent?.type==='UnaryExpression'&&parent.operator==='delete')return null;
+   }
+   object=binding.init;
+   const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)===name);
+   if(entries.length!==1)return null;
+   const result=methodTarget(entries[0].value,next);
+   if(result)methodTargetCache.set(callee,result);
+   return result;
+  }
+  if(object.type!=='ObjectExpression')return null;
+  const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)===name);
+  if(entries.length!==1)return null;
+  const result=methodTarget(entries[0].value,seen);
+  if(result)methodTargetCache.set(callee,result);
+  return result;
+ }
+ // 纯比较 helper 不会读取消息对象字段，也不会把对象本身返回或转交出去。
+ // 参数只允许出现在不会触发对象 coercion 的恒等比较/真值测试中，或继续
+ // 转交给同类的闭合 helper。`==`、关系比较和算术都会调用对象的转换钩子，
+ // 因而不属于可证明的纯读取。
+ const scalarFunctions=new WeakMap();
+ function scalarOnly(fn,seen=new Set()){
+  if(!functions.has(fn?.type))return false;
+  if(scalarFunctions.has(fn))return scalarFunctions.get(fn);
+  if(seen.has(fn))return false;
+  const next=new Set(seen);next.add(fn);
+  const params=new Set(),paramRefs=new Set();
+  for(const parameter of fn.params){
+   if(parameter.type!=='Identifier')return false;
+   const binding=bindings.get(parameter);
+   if(!binding)return false;
+   params.add(binding);for(const ref of binding.refs)paramRefs.add(ref);
+  }
+  const binaryOperators=new Set(['===','!==']),unaryOperators=new Set(['!','typeof','void']);
+  const scalarExpression=node=>{
+   if(!node)return true;
+   if(node.type==='Literal')return true;
+   if(node.type==='Identifier')return free(node,'undefined');
+   if(node.type==='BinaryExpression')return binaryOperators.has(node.operator);
+   if(node.type==='UnaryExpression')return unaryOperators.has(node.operator);
+   if(node.type==='LogicalExpression')return scalarExpression(node.left)&&scalarExpression(node.right);
+   if(node.type==='ConditionalExpression')return scalarExpression(node.consequent)&&scalarExpression(node.alternate);
+   if(node.type==='CallExpression'){
+    const nextTarget=methodTarget(node.callee);return !!nextTarget&&scalarOnly(nextTarget,next);
+   }
+   return false;
+  };
+  for(const node of nodes){
+   if(node.start<fn.start||node.end>fn.end)continue;
+   if(node.type==='ReturnStatement'&&owners.get(node)===fn){if(!scalarExpression(node.argument))return false;continue;}
+   if(node.type!=='Identifier'||!paramRefs.has(node)||!params.has(bindings.get(node)))continue;
+   const parent=parents.get(node);
+   if(parent?.type==='BinaryExpression'&&binaryOperators.has(parent.operator))continue;
+   if(parent?.type==='UnaryExpression'&&unaryOperators.has(parent.operator))continue;
+   if(['IfStatement','WhileStatement','DoWhileStatement'].includes(parent?.type)&&parent.test===node||parent?.type==='ConditionalExpression'&&parent.test===node)continue;
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(node)){
+    const nextTarget=methodTarget(parent.callee);if(nextTarget&&scalarOnly(nextTarget,next))continue;
+   }
+   return false;
+  }
+  scalarFunctions.set(fn,true);return true;
  }
  function directCalls(fn){
   const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
@@ -286,6 +373,10 @@ export function lowerClosedMessageObjects(source){
    if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
    const other=parent?.left===ref?parent.right:parent?.right===ref?parent.left:null;
    if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||nullish(other)))continue;
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+    const fn=methodTarget(parent.callee);
+    if(fn&&scalarOnly(fn))continue;
+   }
    if(fieldUse(kind,ref,fields,state))continue;
    return false;
   }
@@ -320,7 +411,9 @@ export function lowerClosedMessageObjects(source){
   if(parent.type==='ExpressionStatement'||parent.type==='SequenceExpression'&&parent.expressions.at(-1)!==current)return true;
   if(parent.type==='CallExpression'&&parent.arguments.includes(current)){
    const fn=target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(current)];
-   return !!parameter&&parameter.type==='Identifier'&&proveParameter(fn,parameter,kind,fields,state,seen);
+   if(!!parameter&&parameter.type==='Identifier'&&proveParameter(fn,parameter,kind,fields,state,seen))return true;
+   const method=methodTarget(parent.callee);
+   return !!method&&scalarOnly(method);
   }
   if(parent.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return proveBinding(bindings.get(parent.id),kind,fields,state,seen);
   if(parent.type==='AssignmentExpression'&&parent.right===current&&parent.left.type==='Identifier')return proveBinding(bindings.get(parent.left),kind,fields,state,seen);
@@ -1164,17 +1257,132 @@ function completionForwarderContext(ix){
   if(entries.length!==1||entries[0].value.type!=='Literal')return null;
   return {value:entries[0].value.value};
  };
- const testValue=node=>{
-  if(!node)return null;
-  if(node.type==='Literal')return typeof node.value==='boolean'?node.value:null;
-  if(node.type==='UnaryExpression'&&node.operator==='!'){const value=testValue(node.argument);return value===null?null:!value;}
-  if(node.type==='BinaryExpression'&&['===','==','!==','!='].includes(node.operator)){
-   const left=closedValue(node.left),right=closedValue(node.right);
-   if(!left||!right)return null;
-   const equal=left.value===right.value;
-   return ['===','=='].includes(node.operator)?equal:!equal;
+ // 有界常量求值只服务死分支判断：字面量、闭合表常量、纯比较 helper 的
+ // 单次 return。遇到未知值、动态键、改写过的表或递归都返回 NOT_CONSTANT。
+ const NOT_CONSTANT=Symbol('not-constant'),evaluatingTests=new Set();
+ // 守卫求值先按作者写下的字面量条目计算，再要求所有整体逃逸点都被这些
+ // 守卫证明死亡；这是“假设表未被改写 -> 证明没有路径能改写表”的不动点。
+ // 若任一逃逸点仍存活，functionAt 的整体闭合检查会失败，乐观求值不会被放行。
+ const literalTables=new WeakMap(),checkingLiteralTables=new Set();
+ const literalTable=binding=>{
+  if(literalTables.has(binding))return literalTables.get(binding);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  // 循环验证同一张表时先按字面量初值乐观求值；外层仍会检查全部引用，
+  // 任一存活逃生点或成员写入都会让最终闭包证明失败。
+  if(checkingLiteralTables.has(binding))return binding.init;
+  checkingLiteralTables.add(binding);
+  for(const ref of binding.refs){
+   const member=parents.get(ref);
+   if(member?.type==='MemberExpression'&&member.object===ref&&property(member)!==undefined){
+    const use=parents.get(member);
+    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||
+       use?.type==='UnaryExpression'&&use.operator==='delete'){checkingLiteralTables.delete(binding);return null;}
+    continue;
+   }
+   if(deadReference(ref))continue;
+   checkingLiteralTables.delete(binding);return null;
   }
-  return null;
+  checkingLiteralTables.delete(binding);literalTables.set(binding,binding.init);return binding.init;
+ };
+ const literalMemberValue=node=>{
+  if(node?.type!=='MemberExpression'||node.object.type!=='Identifier')return null;
+  const name=property(node),binding=bindings.get(node.object);
+  const object=literalTable(binding);
+  if(name===undefined||!object)return null;
+  const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)===name);
+  if(entries.length!==1)return null;
+  return entries[0].value;
+ };
+ const literalFunctionAt=(callee,seen=new Set())=>{
+  if(functions.has(callee?.type))return callee;
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(!binding||binding.writes.length||seen.has(binding))return null;
+   const next=new Set(seen);next.add(binding);
+   return literalFunctionAt(binding.fn??binding.init,next);
+  }
+  if(callee?.type!=='MemberExpression')return null;
+  const value=literalMemberValue(callee);
+  return value?literalFunctionAt(value,seen):null;
+ };
+ const constantValue=(node,env=new Map(),seen=new Set())=>{
+  if(!node)return NOT_CONSTANT;
+  if(node.type==='Literal'&&!node.regex)return node.value;
+  if(node.type==='Identifier'){
+   if(env.has(bindings.get(node)??node.name))return env.get(bindings.get(node)??node.name);
+   return free(node,'undefined')?undefined:NOT_CONSTANT;
+  }
+  if(node.type==='MemberExpression'){
+   const value=literalMemberValue(node);
+   return value?.type==='Literal'&&!value.regex?value.value:NOT_CONSTANT;
+  }
+  if(node.type==='UnaryExpression'){
+   const value=constantValue(node.argument,env,seen);
+   if(value===NOT_CONSTANT)return NOT_CONSTANT;
+   if(node.operator==='!')return !value;
+   if(node.operator==='typeof')return value===undefined?'undefined':value===null?'object':typeof value;
+   if(node.operator==='void')return undefined;
+   if(node.operator==='+')return +value;
+   if(node.operator==='-')return -value;
+   if(node.operator==='~')return ~value;
+   return NOT_CONSTANT;
+  }
+  if(node.type==='BinaryExpression'){
+   const left=constantValue(node.left,env,seen),right=constantValue(node.right,env,seen);
+   if(left===NOT_CONSTANT||right===NOT_CONSTANT)return NOT_CONSTANT;
+   switch(node.operator){
+    case '===':return left===right;case '!==':return left!==right;
+    case '==':return left==right;case '!=':return left!=right;
+    case '<':return left<right;case '<=':return left<=right;
+    case '>':return left>right;case '>=':return left>=right;
+    case '+':return left+right;case '-':return left-right;
+    case '*':return left*right;case '/':return left/right;
+    case '%':return left%right;case '&':return left&right;
+    case '|':return left|right;case '^':return left^right;
+    case '<<':return left<<right;case '>>':return left>>right;
+    case '>>>':return left>>>right;
+   }
+   return NOT_CONSTANT;
+  }
+  if(node.type==='LogicalExpression'){
+   const left=constantValue(node.left,env,seen);
+   if(left===NOT_CONSTANT)return NOT_CONSTANT;
+   if(node.operator==='&&')return left?constantValue(node.right,env,seen):left;
+   if(node.operator==='||')return left?left:constantValue(node.right,env,seen);
+   if(node.operator==='??')return left==null?constantValue(node.right,env,seen):left;
+   return NOT_CONSTANT;
+  }
+  if(node.type==='ConditionalExpression'){
+   const test=constantValue(node.test,env,seen);
+   if(test===NOT_CONSTANT)return NOT_CONSTANT;
+   return constantValue(test?node.consequent:node.alternate,env,seen);
+  }
+  if(node.type==='CallExpression'){
+   const fn=literalFunctionAt(node.callee,new Set());
+   if(!functions.has(fn?.type)||seen.has(fn))return NOT_CONSTANT;
+   const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+   if(statements.length!==1||statements[0].type!=='ReturnStatement')return NOT_CONSTANT;
+   const nextEnv=new Map();
+   for(let index=0;index<fn.params.length;index++){
+    const parameter=fn.params[index];
+    if(parameter.type!=='Identifier')return NOT_CONSTANT;
+    const argument=node.arguments[index];
+    const value=argument?constantValue(argument,env,seen):parameter.type==='AssignmentPattern'?constantValue(parameter.right,env,seen):undefined;
+    if(value===NOT_CONSTANT)return NOT_CONSTANT;
+    nextEnv.set(bindings.get(parameter),value);
+   }
+   const nextSeen=new Set(seen);nextSeen.add(fn);
+   return constantValue(statements[0].argument,nextEnv,nextSeen);
+  }
+  return NOT_CONSTANT;
+ };
+ const testValue=node=>{
+  if(!node||evaluatingTests.has(node))return null;
+  evaluatingTests.add(node);
+  try{
+  const value=constantValue(node);
+  return value===NOT_CONSTANT||typeof value!=='boolean'?null:value;
+  }finally{evaluatingTests.delete(node);}
  };
  const deadReference=ref=>{
   for(let child=ref,parent=parents.get(child);parent;child=parent,parent=parents.get(parent)){
@@ -1202,7 +1410,7 @@ function completionForwarderContext(ix){
    let object=callee.object;
    if(object.type==='Identifier'){
     const binding=bindings.get(object);
-    if(!binding||binding.writes.length||seen.has(binding))return null;
+     if(!binding||binding.writes.length||seen.has(binding))return null;
     // 查表对象必须是完全闭合的字面量：只允许通过静态属性读取，不能再写入
     // 任何成员，也不能作为整体传给其它代码。
     for(const ref of binding.refs){
@@ -1222,27 +1430,28 @@ function completionForwarderContext(ix){
   return null;
  };
  const sameParameter=(node,parameter,binding)=>node?.type==='Identifier'&&bindings.get(node)===bindings.get(parameter)&&!!binding;
- const forwarder=(fn,seen=new Set())=>{
+ const forwarder=(fn,count,seen=new Set())=>{
   if(!functions.has(fn?.type)||fn.async||fn.generator||seen.has(fn))return false;
   seen=new Set(seen);seen.add(fn);
-  if(fn.params.length!==2||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
-  const [first,second]=fn.params,firstBinding=bindings.get(first),secondBinding=bindings.get(second);
-  if(!firstBinding||!secondBinding||firstBinding.writes.length||secondBinding.writes.length)return false;
+  if(fn.params.length!==count||fn.params.some(parameter=>parameter.type!=='Identifier'))return false;
+  const params=fn.params,paramBindings=params.map(parameter=>bindings.get(parameter));
+  if(paramBindings.some(binding=>!binding||binding.writes.length))return false;
   const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
   if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return false;
   const call=statements[0].argument;
   if(call.type!=='CallExpression'||call.optional||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
-  if(call.arguments.length===1&&sameParameter(call.callee,first,firstBinding)&&sameParameter(call.arguments[0],second,secondBinding))return true;
-  if(call.arguments.length!==2)return false;
+  if(sameParameter(call.callee,params[0],paramBindings[0])&&call.arguments.length===count-1&&
+     call.arguments.every((argument,index)=>sameParameter(argument,params[index+1],paramBindings[index+1])))return true;
+  if(call.arguments.length!==count)return false;
   const target=functionAt(call.callee,seen);
-  if(!target||!forwarder(target,seen))return false;
-  return sameParameter(call.arguments[0],first,firstBinding)&&sameParameter(call.arguments[1],second,secondBinding);
+  if(!target||!forwarder(target,count,seen))return false;
+  return call.arguments.every((argument,index)=>sameParameter(argument,params[index],paramBindings[index]));
  };
  return call=>{
-  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==2||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  if(call?.type!=='CallExpression'||call.optional||![1,2].includes(call.arguments.length)||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
   if(!free(call.arguments[0],'$done'))return false;
   const fn=functionAt(call.callee);
-  return !!fn&&forwarder(fn);
+  return !!fn&&forwarder(fn,call.arguments.length);
  };
 }
 
@@ -1260,13 +1469,15 @@ export function lowerCompletionForwarders(source,ranges=null){
  const {nodes,parents}=ix,isForwarder=completionForwarderContext(ix),edits=[];
  for(const call of nodes){
   const inside=ranges?.some(([start,end])=>call.start>=start&&call.end<=end);
-  const parent=parents.get(call);
-  const standalone=parent?.type==='ExpressionStatement'&&parent.expression===call||
-   parent?.type==='ReturnStatement'&&parent.argument===call||
-   parent?.type==='ArrowFunctionExpression'&&parent.body===call;
+  let current=call,parent=parents.get(current);
+  while(parent?.type==='SequenceExpression'&&parent.expressions.includes(current)){current=parent;parent=parents.get(current);}
+  const standalone=parent?.type==='ExpressionStatement'&&parent.expression===current||
+   parent?.type==='ReturnStatement'&&parent.argument===current||
+   parent?.type==='ArrowFunctionExpression'&&parent.body===current;
   if(ranges&&!inside&&!standalone)continue;
   if(!isForwarder(call))continue;
-  edits.push({start:call.start,end:call.end,replacement:'$done('+source.slice(call.arguments[1].start,call.arguments[1].end)+')',line:source.slice(0,call.start).split('\n').length});
+  const payload=call.arguments.length===2?source.slice(call.arguments[1].start,call.arguments[1].end):'';
+  edits.push({start:call.start,end:call.end,replacement:'$done('+payload+')',line:source.slice(0,call.start).split('\n').length});
  }
  if(!edits.length)return {source,transformations:[],edits:[]};
  let output=source;

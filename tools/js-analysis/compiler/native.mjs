@@ -117,12 +117,15 @@ function compile(original,format,options,libraries){
   const factories=lowerHTTPFactoryFields(lowerHTTPHelpers(lowerSelectedHTTP(lowerAPIObjectAliases(alternate.source))),format);
   libraries.transformations.push(...alternate.transformations);
   const messageSource=lowerMessageParameters(factories.source);
-  const closedSource=lowerClosedMessageObjects(messageSource);
+  // 字符串表键在早期转发器证明时仍可能是未解码调用；最终收口阶段再执行一次
+  // 同一封闭转发器证明，只改写已能解析到纯转交函数的直接完成调用。
+  const lateForwarders=lowerCompletionForwarders(messageSource);
+  const closedSource=lowerClosedMessageObjects(lateForwarders.source);
   const rebound=lowerReboundHostGlobals(closedSource);
   const wrapped=lowerClosedCompletionWrappers(rebound.source,format);
   const storage=lowerClosedStorageFacades(wrapped.source,format);
   const result=emitNative(storage.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
-  libraries.transformations.push(...factories.transformations,...wrapped.transformations,...storage.transformations);return result;
+  libraries.transformations.push(...lateForwarders.transformations,...factories.transformations,...wrapped.transformations,...storage.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
  // been lowered. Expanding the earlier class input misses newly exposed calls.
@@ -2326,7 +2329,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const binding=bindings.get(request);
     if(!binding||!binding.refs.length)return false;
     const parameter=nodes.some(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding));
-    const fields=['url','method','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode',...(qx?['opts']:[])];
+    const fields=['url','method','headers','header','body','bodyBytes','timeout','policy','policy-descriptor','node','params','redirection','followRedirect','follow-redirect','auto-redirect','auto-cookie','insecure','binary-mode','full-header-mode','opts'];
     const sameBinding=ref=>bindings.get(ref)===binding;
     const parameterCallSites=target=>{
      const fn=nodes.find(n=>functions.has(n.type)&&n.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===target));
@@ -2367,10 +2370,20 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     // 参数绑定未复制、未逃逸、只访问白名单字段且只有一个派发点时才会走到这里。
     // 参数入口的一次自我快照（如 t={...defaults,...t}）仍要求旧字段集合由
     // 所有调用点的闭合实参共同证明。
+    const selfStringRecord=node=>{
+     if(node?.type!=='ConditionalExpression'||node.test.type!=='BinaryExpression'||!['===','=='].includes(node.test.operator)||
+        node.test.left.type!=='UnaryExpression'||node.test.left.operator!=='typeof'||node.test.left.argument.type!=='Identifier'||
+        node.test.right.type!=='Literal'||node.test.right.value!=='string'||node.alternate.type!=='Identifier'||
+        bindings.get(node.test.left.argument)!==bindings.get(node.alternate)||node.consequent.type!=='ObjectExpression'||
+        node.consequent.properties.length!==1||node.consequent.properties[0].type!=='Property'||key(node.consequent.properties[0])!=='url'||
+        node.consequent.properties[0].value.type!=='Identifier'||bindings.get(node.consequent.properties[0].value)!==bindings.get(node.alternate))return null;
+     return node.alternate;
+    };
     const recordFields=(node,seen=new Set(),selfFields=null,boundary=null)=>{
      if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
      if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
-     if(node?.type==='ConditionalExpression'&&node.test.type==='BinaryExpression'&&['===','=='].includes(node.test.operator)&&node.test.left.type==='UnaryExpression'&&node.test.left.operator==='typeof'&&node.test.left.argument.type==='Identifier'&&node.test.right.type==='Literal'&&node.test.right.value==='string'&&node.alternate.type==='Identifier'&&bindings.get(node.test.left.argument)===bindings.get(node.alternate)&&node.consequent.type==='ObjectExpression'&&node.consequent.properties.length===1&&node.consequent.properties[0].type==='Property'&&key(node.consequent.properties[0])==='url'&&node.consequent.properties[0].value.type==='Identifier'&&bindings.get(node.consequent.properties[0].value)===bindings.get(node.alternate))return recordFields(node.alternate,seen,selfFields,boundary)??new Set(['url']);
+     const selfString=selfStringRecord(node);
+     if(selfString)return recordFields(selfString,seen,selfFields,boundary)??new Set(['url']);
      if(node?.type==='Identifier'){
       if(sameBinding(node))return selfFields?new Set(selfFields):null;
       const source=bindings.get(node);
@@ -2726,6 +2739,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<firstDispatch.start))return false;continue;}
      if(q?.type==='CallExpression'&&q.arguments.includes(p)){
       if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<firstDispatch.start))return false;continue;}
+      // `req.opts=Object.assign({},req.opts,...)` 只把旧选项复制进新对象，
+      // 不会改写原记录；以 opts 本身为目标或复制后再逃逸仍由后续检查拒绝。
+      if(field==='opts'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'&&
+         q.arguments[0]?.type==='ObjectExpression'&&!q.arguments[0].properties.length&&q.arguments[1]===p&&q.end<firstDispatch.start)continue;
       // 所有闭合调用点都缺席的字段值恒为 undefined；把该值交给未知函数只会
       // 观察一个不可变的基本值，不可能借此修改请求记录。
       if(absent||fieldValueAbsent(p))continue;

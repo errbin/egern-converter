@@ -63,6 +63,18 @@ const members={
 const staticProperty=n=>n.computed?(n.property.type==='Literal'?n.property.value:undefined):n.property.name;
 const standardPrototypes=new Set(['Object','Date','String','Number','Boolean','Array','RegExp','Map','Set','Promise','Error','TypeError','RangeError','ArrayBuffer','DataView','Uint8Array','Uint16Array','Uint32Array','Int8Array','Int16Array','Int32Array','Float32Array','Float64Array']);
 const ordinary=options.nativeMethods?ordinaryReceivers(tree,options.nativeLibraryValues):null;
+const boundNames=new Set(nodes.filter(({node})=>node.type==='Identifier'&&bindings.has(node)).map(({node})=>node.name));
+const freeReadUse=node=>{
+ const use=parents.get(node);
+ return !(use?.type==='AssignmentExpression'&&use.left===node||use?.type==='UpdateExpression'||
+  use?.type==='UnaryExpression'&&use.operator==='delete'||['ForInStatement','ForOfStatement'].includes(use?.type)&&use.left===node);
+};
+const freeReadNames=new Set(nodes.filter(({node,parent,key})=>node.type==='Identifier'&&!bindings.has(node)&&!bound(node.name,scopes.get(node))&&
+ !(parent?.type==='MemberExpression'&&key==='property'&&!parent.computed)&&
+ !((parent?.type==='Property'||parent?.type==='MethodDefinition')&&key==='key'&&!parent.computed)&&
+ !(['LabeledStatement','BreakStatement','ContinueStatement'].includes(parent?.type)&&key==='label')&&
+ freeReadUse(node)&&/^[A-Za-z_$][\w$]*$/.test(node.name)).map(({node})=>node.name));
+const deniedGlobalAliases=new Set(['window','global','process','require','module','exports','document','self','navigator','location','fetch','crypto','console','setTimeout','setInterval','setImmediate','queueMicrotask','structuredClone','performance','WebSocket','XMLHttpRequest','localStorage','sessionStorage','Egern','Cloudflare','__proto__','prototype','constructor']);
 for(const {node:n,parent:p,key} of nodes) {
   if(n.type==='Identifier') {
     if(n.name.startsWith('__egern'))reasons.add('与转换器保留标识符冲突');
@@ -81,6 +93,19 @@ for(const {node:n,parent:p,key} of nodes) {
     if(n.name.startsWith('$')&&!allowed.has(n.name))reasons.add('未适配 API：'+n.name);
     const standardGlobal=options.nativeStandardGlobals&&n.name==='globalThis'&&p?.type==='MemberExpression'&&p.object===n&&standardGlobals.has(staticProperty(p));
     const privateGlobalWrite=privateGlobalAssignment({parents,free:item=>!bound(item.name,scopes.get(item))},n);
+    // 动态 UMD 安装器会让同一脚本混用裸标识符与 globalThis 限定读取。
+    // 只有全程序无同名词法绑定、脚本自身另有同名自由读取且这里是纯读取时，
+    // 二者才都指向同一个全局记录；原表达式保持不变，因此缺失属性仍安全。
+    const globalReadName=p?.type==='MemberExpression'&&p.object===n?staticProperty(p):undefined;
+    const installedGlobalRead=options.nativeStandardGlobals&&n.name==='globalThis'&&typeof globalReadName==='string'&&
+      !globalReadName.startsWith('$')&&!deniedGlobalAliases.has(globalReadName)&&!boundNames.has(globalReadName)&&
+      freeReadNames.has(globalReadName)&&freeReadUse(p);
+    // 动态安装器把真实全局对象作为 Function 构造函数的 thisArg；保留的是
+    // 原样对象而不是新的宿主能力。仅接受直接 `Function(...).call(globalThis)`。
+    const dynamicFunctionThis=options.nativeStandardGlobals&&n.name==='globalThis'&&p?.type==='CallExpression'&&
+      p.arguments.length===1&&p.arguments[0]===n&&p.callee.type==='MemberExpression'&&staticProperty(p.callee)==='call'&&
+      p.callee.object?.type==='CallExpression'&&p.callee.object.arguments.every(a=>a.type!=='SpreadElement')&&
+      p.callee.object.callee.type==='Identifier'&&p.callee.object.callee.name==='Function'&&!bound('Function',scopes.get(p.callee.object.callee));
     if(standardGlobal){const q=parents.get(p);if(q?.type==='AssignmentExpression'&&q.left===p||q?.type==='UpdateExpression'||q?.operator==='delete')reasons.add('不能覆写标准 JavaScript 全局字段');}
     const callback=p?.arguments?.[0];
     const boundCallback=callback?.type==='CallExpression'&&callback.callee.type==='MemberExpression'&&callback.callee.object.type==='Identifier'&&staticProperty(callback.callee)==='bind'&&callback.arguments[0]?.type==='Literal'&&callback.arguments[0].value===null;
@@ -90,7 +115,7 @@ for(const {node:n,parent:p,key} of nodes) {
     // observable ordering. String callbacks still imply dynamic code.
     const nativeTimer=options.nativeStandardGlobals&&n.name==='setTimeout'&&p?.type==='CallExpression'&&p.callee===n&&[1,2].includes(p.arguments.length)&&callback?.type!=='Literal'&&(['Identifier','ArrowFunctionExpression','FunctionExpression','CallExpression','MemberExpression','ConditionalExpression','LogicalExpression','SequenceExpression'].includes(callback?.type)||boundCallback);
     const nativeEvaluation=options.nativeStandardGlobals&&['eval','Function'].includes(n.name);
-    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!privateGlobalWrite&&!nativeTimer&&!nativeEvaluation)reasons.add('运行环境或动态/异步依赖：'+n.name);
+    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!installedGlobalRead&&!dynamicFunctionThis&&!privateGlobalWrite&&!nativeTimer&&!nativeEvaluation)reasons.add('运行环境或动态/异步依赖：'+n.name);
     if(n.name==='$done')done=true;
     if(n.name==='$task'||n.name==='$httpClient')asynchronous=true;
     if(members[n.name]) {

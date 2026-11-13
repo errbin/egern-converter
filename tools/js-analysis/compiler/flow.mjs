@@ -395,6 +395,128 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b&&!b.writes.length&&!seen.has(b)&&(b.fn||b.init)){seen.add(b);return resolve(b.fn??b.init,seen);}}
   return n;
  }
+ // 闭表谓词只用于证明完成函数引用落在不可达分支。对象表必须是唯一字面量、
+ // 无改绑、无成员写入，属性键静态且唯一；整体引用只有自身分支已可判死时才
+ // 允许。函数调用仅展开“单 return 表达式”，参数按引用身份替换。
+ const checkedTables=new WeakMap(),checkingTables=new Set();let validatedTableCount=0;
+ function tableValue(node){
+  if(node?.type!=='Identifier')return null;
+  const binding=bindings.get(node);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  if(checkedTables.has(binding))return checkedTables.get(binding);
+  const object=binding.init,names=new Set();
+  for(const entry of object.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method)return null;
+   const name=key(entry);if(name===undefined||name==='__proto__')return null;
+   if(names.has(String(name)))return null;names.add(String(name));
+  }
+  if(!checkingTables.has(binding)){
+   checkingTables.add(binding);
+   for(const ref of binding.refs){
+    const member=parents.get(ref);
+    if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined){checkingTables.delete(binding);return null;}
+    const use=parents.get(member);
+    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||
+       use?.type==='UnaryExpression'&&use.operator==='delete'){checkingTables.delete(binding);return null;}
+    if(deadReference(ref))continue;
+   }
+   checkingTables.delete(binding);
+  }
+  checkedTables.set(binding,object);validatedTableCount++;return object;
+ }
+ function staticMember(node){
+  if(node?.type!=='MemberExpression')return null;
+  const object=tableValue(node.object),name=property(node);
+  if(!object||name===undefined)return null;
+  const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)===name);
+  return entries.length===1?entries[0].value:null;
+ }
+ function staticValue(node,environment=new Map()){
+  if(node?.type==='Literal'&&!node.regex)return {value:node.value};
+  if(node?.type==='TemplateLiteral'&&node.expressions.length===0)return {value:node.quasis[0].value.cooked};
+  if(node?.type==='Identifier'){
+   const binding=bindings.get(node);
+   if(binding&&environment.has(binding))return environment.get(binding);
+   if(free(node,'undefined'))return {value:undefined};
+   if(binding&&!binding.writes.length&&binding.init?.type==='Literal'&&!binding.init.regex)return {value:binding.init.value};
+   return null;
+  }
+  if(node?.type==='MemberExpression'){
+   const value=staticMember(node);
+   if(value?.type==='Literal'&&!value.regex)return {value:value.value,fn:value};
+   if(functions.has(value?.type))return {fn:value};
+  }
+  return null;
+ }
+ function staticFunction(callee,environment){
+  if(functions.has(callee?.type))return callee;
+  return staticValue(callee,environment)?.fn??null;
+ }
+ function staticBoolean(node,environment=new Map(),seen=new Set()){
+  if(node?.type==='Literal')return typeof node.value==='boolean'?node.value:null;
+  if(node?.type==='UnaryExpression'&&node.operator==='!'){const value=staticBoolean(node.argument,environment,seen);return value===null?null:!value;}
+  if(node?.type==='BinaryExpression'&&['===','!==','==','!='].includes(node.operator)){
+   const left=staticValue(node.left,environment),right=staticValue(node.right,environment);
+   if(!left||!right||!('value'in left)||!('value'in right))return null;
+   // 松散相等必须按 JS 标量转换求值；若直接套用严格相等，`'0' == 0`
+   // 之类的谓词会被误判为 false，从而错误放行完成函数引用。
+   const primitive=value=>value===null||['undefined','boolean','number','string'].includes(typeof value);
+   if(!primitive(left.value)||!primitive(right.value))return null;
+   let equal;
+   if(node.operator==='==='||node.operator==='!==')equal=left.value===right.value;
+   else if(left.value===right.value)equal=true;
+   else if(left.value==null||right.value==null)equal=left.value==null&&right.value==null;
+   else{
+    let a=typeof left.value==='boolean'?Number(left.value):left.value;
+    let b=typeof right.value==='boolean'?Number(right.value):right.value;
+    if(typeof a==='number'&&typeof b==='string'||typeof a==='string'&&typeof b==='number')equal=Number(a)===Number(b);
+    else equal=false;
+   }
+   return ['===','=='].includes(node.operator)?equal:!equal;
+  }
+  if(node?.type==='CallExpression'&&!node.optional&&!node.arguments.some(argument=>argument.type==='SpreadElement')){
+   const fn=staticFunction(node.callee,environment);
+   if(!fn||seen.has(fn)||fn.async||fn.generator||fn.params.length!==node.arguments.length)return null;
+   const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+   if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return null;
+   const bindingsAtCall=new Map(environment);
+   for(let index=0;index<fn.params.length;index++){
+    const parameter=fn.params[index];if(parameter.type!=='Identifier')return null;
+    const binding=bindings.get(parameter);if(!binding||binding.writes.length)return null;
+    const value=staticValue(node.arguments[index],environment);if(!value)return null;
+    bindingsAtCall.set(binding,value);
+   }
+   return staticBoolean(statements[0].argument,bindingsAtCall,new Set([...seen,fn]));
+  }
+  return null;
+ }
+ // 表闭包证明与分支死路径证明互为前提：一次求值可能只验证了部分表，
+ // 下一轮可继续利用新增闭表。每轮验证表数严格增加，因此最多迭代表的数量。
+ function staticBranchBoolean(node){
+  for(;;){
+   const before=validatedTableCount,value=staticBoolean(node);
+   if(value!==null)return value;
+   if(validatedTableCount===before)return null;
+  }
+ }
+ const deadReferenceCache=new WeakMap();
+ function deadReference(ref){
+  if(deadReferenceCache.has(ref))return deadReferenceCache.get(ref);
+  let result=false;
+  for(let child=ref,parent=parents.get(child);parent;child=parent,parent=parents.get(parent)){
+   if(parent.type==='IfStatement'){
+    const value=staticBranchBoolean(parent.test);
+    if(child===parent.consequent&&value===false||child===parent.alternate&&value===true){result=true;break;}
+   }
+   if(parent.type==='ConditionalExpression'){
+    const value=staticBranchBoolean(parent.test);
+    if(child===parent.consequent&&value===false||child===parent.alternate&&value===true){result=true;break;}
+   }
+  }
+  // 闭表验证是单调增强的：同一次求值现在失败的谓词，后续可能因更多表被
+  // 证明而可判死。因此只缓存 true，false 必须允许在迭代中重新求值。
+  if(result)deadReferenceCache.set(ref,true);return result;
+ }
  // 赋值只有在文本上也必然位于读取之前时才可参与目标解析。写入若位于
  // if/循环/try/条件表达式等容器内，可能被跳过；位置更靠前不等于支配读取。
  function unconditionalWrite(write,common){
@@ -709,6 +831,31 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(p?.type!=='CallExpression'||p.arguments[1]!==ref||p.callee.type!=='MemberExpression'||property(p.callee)!=='wrap'||!regeneratorMachines.has(p))return false;
   return targets(ref).some(fn=>owners.get(p)===fn);
  };
+ // 动态安装器常见的 `Function(text).call(globalThis)` 不转换全局对象本身；
+ // 只有 thisArg 精确位于该位置时才保留。其它整体传递仍会让未知代码获得
+ // 宿主全局，必须继续拒绝。
+ const dynamicFunctionThisArg=node=>{
+  const call=parents.get(node);
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==1||call.arguments[0]!==node)return false;
+  const callee=call.callee;
+  if(callee.type!=='MemberExpression'||callee.optional||property(callee)!=='call')return false;
+  const construction=callee.object;
+  if(construction?.type!=='CallExpression'||construction.optional||construction.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+  return construction.callee.type==='Identifier'&&free(construction.callee,'Function')&&!bindings.has(construction.callee);
+ };
+ // `globalThis.name` 与裸 `name` 在目标模块中指向同一个全局对象属性，前提是
+ // 全程序没有同名词法绑定，且脚本自身确实读取过该自由标识符。这里只放行
+ // 读取；写入/更新/删除、动态键和宿主敏感名称仍走原有拒绝。
+ const boundNames=new Set(nodes.filter(n=>n.type==='Identifier'&&bindings.has(n)).map(n=>n.name));
+ const freeGlobalNames=new Set(nodes.filter(n=>n.type==='Identifier'&&ix.reference(n)&&free(n)&&/^[A-Za-z_$][\w$]*$/.test(n.name)).map(n=>n.name));
+ const deniedGlobalAliases=new Set(['window','global','process','require','module','exports','document','self','navigator','location','fetch','crypto','console','setTimeout','setInterval','setImmediate','queueMicrotask','structuredClone','performance','WebSocket','XMLHttpRequest','localStorage','sessionStorage','Egern','Cloudflare','__proto__','prototype','constructor']);
+ const installedGlobalRead=node=>{
+  const member=parents.get(node),name=member?.type==='MemberExpression'&&member.object===node?property(member):undefined;
+  if(typeof name!=='string'||name.startsWith('$')||deniedGlobalAliases.has(name)||boundNames.has(name)||!freeGlobalNames.has(name))return false;
+  const use=parents.get(member);
+  return !(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||
+   use?.type==='UnaryExpression'&&use.operator==='delete'||['ForInStatement','ForOfStatement'].includes(use?.type)&&use.left===member);
+ };
  for(const n of nodes){
   if(n.type==='VariableDeclarator'&&n.id.type==='Identifier'&&(targets(n.init).some(fn=>done.has(fn)||asyncAdded.has(fn))||n.init?.type==='ObjectExpression'&&n.init.properties.some(p=>targets(p.value).some(fn=>done.has(fn)||asyncAdded.has(fn))))){
    const binding=bindings.get(n.id);
@@ -726,6 +873,8 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    const p=parents.get(n);
    if(privateGlobalAssignment(ix,n))continue;
    if(p?.type==='MemberExpression'&&p.object===n&&builtin.has(property(p)))continue;
+   if(p?.type==='UnaryExpression'&&p.operator==='typeof'&&p.argument===n)continue;
+   if(dynamicFunctionThisArg(n)||installedGlobalRead(n))continue;
    if(p?.type==='CallExpression'&&p.arguments.includes(n)){
     const fns=targets(p.callee),param=p.arguments.indexOf(n);
     if(fns.length===1){const fn=fns[0],b=bindings.get(fn.params[param]);if(b&&b.refs.every(r=>{const q=parents.get(r);return q?.type==='MemberExpression'&&q.object===r&&builtin.has(property(q));}))continue;}
@@ -736,6 +885,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
    const p=parents.get(n);
    if(p?.type==='UnaryExpression'&&p.operator==='typeof')continue;
    if(p?.type==='CallExpression'&&p.callee===n||p?.type==='VariableDeclarator'&&p.init===n||p?.type==='Property'&&p.value===n)continue;
+   if(deadReference(n))continue;
    if(p?.type==='CallExpression'&&p.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(p.callee)))continue;
    if(p?.type==='CallExpression'&&closedCallback(p,n))continue;
    if(p?.type==='NewExpression'&&closedCallback(p,n))continue;
