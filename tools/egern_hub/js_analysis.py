@@ -186,9 +186,9 @@ def analyze_many(jobs, *, mode='convert', progress_items=None):
 
     for job in unique:
         length = len(job[0].encode('utf-8'))
-        # Native compilation runs several scope/provenance passes. Keep a batch
-        # small enough that unrelated dependencies cannot exhaust its timeout.
-        max_batch = 8 if mode == 'native' else 32
+        # 原生编译要跑多轮作用域与来源证明。每个输入单独占用一次 60 秒预算，
+        # 避免一个慢脚本耗尽整批预算，导致其它脚本的失败集合随机器负载漂移。
+        max_batch = 1 if mode == 'native' else 32
         max_bytes = 512 if mode == 'native' else 1024
         if batch and (len(batch) >= max_batch or size + length > max_bytes * 1024):
             flush()

@@ -222,13 +222,13 @@ console.log(JSON.stringify({ok:true}));
         result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True)
         self.assertEqual(json.loads(result.stdout),{'ok':True})
 
-    def test_native_batches_limit_combined_compiler_work_and_keep_duplicates(self):
+    def test_native_batches_keep_duplicates_and_grant_each_input_a_full_budget(self):
         jobs=[('$done({body:"'+str(i)+'"});','surge') for i in range(19)]
         jobs += [jobs[2]]
         def analyze(batch):return [{'source':job['source']} for job in batch]
         with patch.object(js_analysis,'_run_batch',side_effect=analyze) as run:
             reports=js_analysis.analyze_many(jobs,mode='native')
-        self.assertEqual([len(call.args[0]) for call in run.call_args_list],[8,8,3])
+        self.assertEqual([len(call.args[0]) for call in run.call_args_list],[1]*19)
         self.assertEqual(reports[-1],reports[2])
 
     def test_timed_out_batch_splits_without_hiding_single_script_timeout(self):
