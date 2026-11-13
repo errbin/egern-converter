@@ -888,7 +888,7 @@ function platformProbe(method,ix){
 // 传递、枚举或改绑；平台探测方法必须唯一且可静态验证；class 内不允许动态 this 成员。
 // 任一条件不成立即跳过整个候选，保持原文并让后续分析继续拒绝。
 function multiPlatformEnv(ix,source){
- const {nodes,parents,bindings}=ix,candidates=[];
+ const {nodes,parents,bindings,owners}=ix,candidates=[];
  // 打包器偶尔把实例临时存进局部别名，仅用于在后续 `.call` 中保留接收者。
  // 别名必须只有这一次写入、没有初始化，并且所有读取都只是静态成员或 `.call`
  // 的第一个参数；任何重绑、动态成员、方法写入或其它逃逸都让整个候选失效。
@@ -1003,15 +1003,137 @@ function multiPlatformEnv(ix,source){
   }
   if(!valid||!instances.length)continue;
   // 旧 Env 常把 this 交给内部 HTTP helper；helper 可能再以 this.env 调用
-  // 同一批方法。这里把这类间接调用的方法名视为根，避免在改写委托前误删。
+  // 同一批方法。只保留从 Env 实例的 helper 字段实际可达、且确实会以 Env
+  // 作为 this 执行的方法；仅按同名保留会把 mdsq2 一类死方法也当成活代码。
   const helpers=new Map();
   for(const n of nodes)if(n.type==='ClassDeclaration'&&n.start>=factory.start&&n.end<=factory.end){const b=bindings.get(n.id);if(b)helpers.set(b,n);}
-  for(const n of nodes)if(n.start>=cls.start&&n.end<=cls.end&&n.type==='NewExpression'&&n.callee.type==='Identifier'&&n.arguments.some(a=>a.type==='ThisExpression')){
-   const helper=helpers.get(bindings.get(n.callee));if(!helper)continue;
+  const instanceBindings=new Set(instances.map(d=>bindings.get(d.id)).filter(Boolean));
+  const conservativeHelperRoots=helper=>{
    for(const m of helper.body.body)if(m.type==='MethodDefinition'&&m.kind==='method'){
     if(methods.has(key(m)))roots.add(key(m));
     for(const x of index(m.value).nodes)if(x.type==='MemberExpression'&&x.object.type==='ThisExpression'&&methods.has(property(x)))roots.add(property(x));
    }
+  };
+  const helperRoots=(helper,construction)=>{
+   const helperMethods=new Map(helper.body.body.filter(m=>m.type==='MethodDefinition'&&m.kind==='method'&&typeof key(m)==='string').map(m=>[key(m),m]));
+   const ctor=helper.body.body.find(m=>m.type==='MethodDefinition'&&m.kind==='constructor');
+   const position=construction.arguments.findIndex(a=>a.type==='ThisExpression');
+   const parameter=ctor?.value.params[position],parameterBinding=parameter?.type==='Identifier'?bindings.get(parameter):null;
+   const envFields=new Set();
+   if(parameterBinding&&!parameterBinding.writes.length&&parameterBinding.refs.length===1){
+    const ref=parameterBinding.refs[0],use=parents.get(ref);
+    if(use?.type==='AssignmentExpression'&&use.operator==='='&&use.right===ref&&use.left.type==='MemberExpression'&&use.left.object.type==='ThisExpression'&&typeof property(use.left)==='string')envFields.add(property(use.left));
+   }
+   const assignment=parents.get(construction);
+   const helperField=assignment?.type==='AssignmentExpression'&&assignment.operator==='='&&assignment.right===construction&&assignment.left.type==='MemberExpression'&&assignment.left.object.type==='ThisExpression'&&typeof property(assignment.left)==='string'?property(assignment.left):null;
+   // 无法证明字段映射时保留旧的保守根集合，避免误删仍可能被调用的方法。
+   if(!helperField||!envFields.size)return false;
+   const normal=new Set(),bound=new Set(),queue=[],boundCalls=new Map(),boundMembers=[];
+   const add=(name,isBound,args=null)=>{
+    if(!helperMethods.has(name))return;
+    if(isBound&&Array.isArray(args)){
+     const calls=boundCalls.get(name)??[];calls.push(args);boundCalls.set(name,calls);
+    }
+    const set=isBound?bound:normal;
+    if(set.has(name))return;
+    set.add(name);queue.push({name,isBound});
+   };
+   for(const member of nodes){
+    if(member.type!=='MemberExpression'||property(member)!==helperField)continue;
+    const owner=member.object.type==='Identifier'?bindings.get(member.object):null;
+    const ownThis=member.object.type==='ThisExpression'&&member.start>=cls.start&&member.end<=cls.end;
+    if(!(owner&&instanceBindings.has(owner)||ownThis))continue;
+    const use=parents.get(member);
+    if(use?.type==='AssignmentExpression'&&use.left===member&&use.right===construction)continue;
+    if(use?.type==='MemberExpression'&&use.object===member&&typeof property(use)==='string'){add(property(use),false);continue;}
+    // helper 实例作为值逃逸或直接调用时，无法证明具体方法，回退保守根集合。
+    return false;
+   }
+   const lexicalOwner=n=>{
+    let owner=owners.get(n);
+    while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));
+    return owner;
+   };
+   while(queue.length){
+    const {name,isBound}=queue.shift(),method=helperMethods.get(name);
+    if(!method)continue;
+    for(const n of nodes){
+     if(n.start<method.value.start||n.end>method.value.end||lexicalOwner(n)!==method.value)continue;
+     if(n.type!=='MemberExpression'||n.object.type!=='ThisExpression'||typeof property(n)!=='string')continue;
+     const member=property(n),use=parents.get(n);
+     if(envFields.has(member)){
+      if(use?.type==='MemberExpression'&&use.object===n&&typeof property(use)==='string'){
+       if(methods.has(property(use)))roots.add(property(use));
+       else return false;
+       continue;
+      }
+      if(use?.type==='CallExpression'&&use.callee.type==='MemberExpression'&&['call','apply'].includes(property(use.callee))&&use.arguments[0]===n){
+       const target=use.callee.object;
+       if(target?.type==='MemberExpression'&&target.object.type==='ThisExpression'&&helperMethods.has(property(target)))continue;
+       return false;
+      }
+      return false;
+     }
+     // 以 Env 为 this 执行的方法里，this.<name> 只能解析到 Env 方法。
+     // 但同名 helper 方法也可能是条件分支里的自身引用；先记录候选，
+     // 等全部可达 helper 调用实参收集完再判断该分支是否可能执行。
+     if(isBound&&methods.has(member)){boundMembers.push({member,method,node:n});continue;}
+     if(!helperMethods.has(member))continue;
+     if(use?.type==='CallExpression'&&use.callee===n){add(member,false);continue;}
+     if(use?.type==='MemberExpression'&&use.object===n&&['call','apply'].includes(property(use))){
+      const call=parents.get(use),args=call?.type==='CallExpression'&&call.callee===use?call.arguments:[],thisArg=args[0]??null;
+      if(thisArg?.type==='MemberExpression'&&thisArg.object.type==='ThisExpression'&&envFields.has(property(thisArg))){
+       add(member,true,property(use)==='call'?args.slice(1):null);continue;
+      }
+      if(thisArg?.type==='ThisExpression'){add(member,false);continue;}
+      return false;
+     }
+     if(use?.type==='MemberExpression'&&use.object===n){add(member,false);continue;}
+     return false;
+    }
+   }
+   // helper 方法的形参值只能来自已证明的 `.call(this.env, ...)` 调用点；
+   // 如果条件明确排除了某个方法名的分支，就不再把它当作 Env 方法根。
+   const boundParamValues=(method,param)=>{
+    const position=method.value.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===bindings.get(param));
+    const values=new Set(),calls=boundCalls.get(key(method))??[];
+    if(position<0||!calls.length)return {values,unknown:true};
+    let unknown=false;
+    for(const args of calls){
+     let actual=args[position],formal=method.value.params[position];
+     if(!actual)actual=formal?.type==='AssignmentPattern'?formal.right:null;
+     if(!actual){unknown=true;continue;}
+     if(actual.type==='Literal')values.add(actual.value);else unknown=true;
+    }
+    return {values,unknown};
+   };
+   const literalGuard=(test,method)=>{
+    if(test?.type!=='BinaryExpression'||!['===','==','!==','!='].includes(test.operator))return undefined;
+    for(const [value,name] of [[test.left,test.right],[test.right,test.left]]){
+     if(name.type!=='Identifier'||value.type!=='Literal')continue;
+     const binding=bindings.get(name);
+     if(!binding||!method.value.params.some(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===binding))continue;
+     const {values,unknown}=boundParamValues(method,name);
+     if(unknown)return undefined;
+     const equal=[...values].some(item=>item===value.value||test.operator==='=='&&item==value.value);
+     return test.operator.startsWith('!')?!equal:equal;
+    }
+    return undefined;
+   };
+   const guardAllows=(node,method)=>{
+    for(let child=node,parent=parents.get(child);parent&&parent!==method.value;child=parent,parent=parents.get(child)){
+     if(parent.type==='LogicalExpression'&&parent.operator==='&&'&&parent.right===child&&literalGuard(parent.left,method)===false)return false;
+     if(parent.type==='IfStatement'&&parent.consequent===child&&literalGuard(parent.test,method)===false)return false;
+     if(parent.type==='ConditionalExpression'&&parent.consequent===child&&literalGuard(parent.test,method)===false)return false;
+    }
+    return true;
+   };
+   for(const candidate of boundMembers)if(guardAllows(candidate.node,candidate.method))roots.add(candidate.member);
+   return true;
+  };
+  for(const n of nodes)if(n.start>=cls.start&&n.end<=cls.end&&n.type==='NewExpression'&&n.callee.type==='Identifier'&&n.arguments.some(a=>a.type==='ThisExpression')){
+   const helper=helpers.get(bindings.get(n.callee));if(!helper)continue;
+   if(!helperRoots(helper,n))conservativeHelperRoots(helper);
   }
   candidates.push({factory,cls,methods,methodList,probeName,probeMethod,predicates,roots,instances});
  }

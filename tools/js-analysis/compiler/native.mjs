@@ -2280,7 +2280,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const position=fn?.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===target);
      if(!fn||position<0)return null;
      let calls;
-     if(fnParent?.type==='MethodDefinition')calls=closedMethodCalls(fnParent).map(call=>({call,actual:call.arguments[position]}));
+     if(fnParent?.type==='MethodDefinition'){
+      // 方法调用点无法闭合时不能继续做参数记录证明，否则会越过拒绝面。
+      const methodCalls=closedMethodCalls(fnParent);
+      if(!methodCalls)return null;
+      calls=methodCalls.map(call=>({call,actual:call.arguments[position]}));
+     }
      else if(fnParent?.type==='CallExpression'&&fnParent.callee===fn&&!fnParent.optional&&!fnParent.arguments.some(a=>a.type==='SpreadElement'))calls=[{call:fnParent,actual:fnParent.arguments[position]}];
      else if(fnParent?.type==='Property'&&fnParent.value===fn&&!fnParent.computed&&key(fnParent)!==undefined)calls=replyCallers(fn).map(call=>({call,actual:call.arguments[position]}));
      else{

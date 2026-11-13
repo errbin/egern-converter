@@ -51,9 +51,9 @@ runtime.done({body: runtime.getdata('key')});
 HELPER_FIXTURE = '''function Env(name) {
   class Http {
     constructor(env) { this.env = env; }
-    send(url) { return this.env.get(url); }
-    get(url) { return this.send.call(this.env, url); }
-    post(url) { return this.send.call(this.env, url); }
+    send(url, method) { return (method === 'POST' ? this.post : this.get).call(this, url); }
+    get(url) { return this.send.call(this.env, url, 'GET'); }
+    post(url) { return this.send.call(this.env, url, 'POST'); }
   }
   return new class {
     constructor(name) { this.name = name; this.http = new Http(this); }
@@ -70,7 +70,7 @@ HELPER_FIXTURE = '''function Env(name) {
   }(name);
 }
 const runtime = new Env('fixture');
-runtime.done({body: runtime.http.get('key')});
+runtime.done({body: runtime.http.get('key') + runtime.http.post('key')});
 '''
 
 
