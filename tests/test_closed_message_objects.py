@@ -152,6 +152,24 @@ const result=finish($response);$done({body:result.unknown});''',
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 self.convert(source)
 
+    def test_response_alias_with_empty_fallback_materializes_body(self):
+        source = ('const snapshot=$response||{};'
+                  '(function(message){$done({body:message.body})})(snapshot);')
+        native = self.convert(source)
+        self.assertIn('await ctx.response.text()', native)
+        for body in ['', 'plain', '中文正文']:
+            with self.subTest(body=body):
+                case = {'name': 'response empty fallback', 'request': {'url': URL},
+                        'response': {'status': 200, 'headers': {}, 'body': body},
+                        'expected': {'result': {'body': body}}}
+                result = compare(source, native, 'surge', URL, case)
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_unproven_response_empty_fallback_still_rejects(self):
+        source = 'const snapshot=$response||{};unknown(snapshot);$done({});'
+        with self.assertRaisesRegex(ConversionError, '请求 / 响应对象整体传递'):
+            self.convert(source)
+
 
 if __name__ == '__main__':
     unittest.main()

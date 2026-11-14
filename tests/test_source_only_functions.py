@@ -52,7 +52,7 @@ class SourceOnlyFunctionTests(unittest.TestCase):
             with self.subTest(source_format=source_format):
                 output = convert_script(source, 'Fixture', URL, '',
                                         source_format=source_format)
-                self.assertIn('ctx.response||{}', output)
+                self.assertIn('await ctx.response.text()', output)
                 self.assertIn('response.body', output)
 
     def test_response_whole_object_escape_still_rejects(self):

@@ -4287,7 +4287,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const p=parents.get(n);
     const other=p?.left===n?p.right:p?.left;
     const nullCheck=p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined'));
-    if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
+    // `$response || {}` / `$response ?? {}` 只有在别名字段封闭证明通过后才会
+    // 被替换为本地纯数据快照；仍残留宿主引用说明正文/头部读取未证明，必须拒绝。
+    const emptyFallback=p?.type==='LogicalExpression'&&['||','??'].includes(p.operator)&&p.left===n&&
+      p.right.type==='ObjectExpression'&&!p.right.properties.length;
+    if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n&&!emptyFallback)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
    }
    if(map[n.name])return map[n.name];
    // QX 脚本常用裸 $prefs 和成员真值探测来兼容多平台存储。目标宿主只暴露

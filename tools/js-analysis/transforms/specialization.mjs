@@ -239,6 +239,14 @@ export function lowerClosedMessageObjects(source){
  const {nodes,parents,bindings,owners,free}=ix;
  const fieldsByKind={$request:new Set(['url','method','headers','body','bodyBytes']),$response:new Set(['status','statusCode','headers','body','bodyBytes'])};
  const nullish=n=>free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void';
+ // `$response || {}` / `$response ?? {}` 是常见的空响应兜底。空对象分支本身
+ // 是纯数据，但宿主对象仍必须与直接别名一样完成字段封闭证明，否则正文读取
+ // 会落到原生响应占位对象上。
+ const emptyFallback=n=>{
+  const p=parents.get(n);
+  return p?.type==='LogicalExpression'&&['||','??'].includes(p.operator)&&p.left===n&&
+   p.right.type==='ObjectExpression'&&!p.right.properties.length?p:null;
+ };
  function target(callee){
   if(functions.has(callee?.type))return callee;
   if(callee?.type!=='Identifier')return null;
@@ -373,7 +381,15 @@ export function lowerClosedMessageObjects(source){
    if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
    const other=parent?.left===ref?parent.right:parent?.right===ref?parent.left:null;
    if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||nullish(other)))continue;
+   const wrapped=emptyFallback(ref);
+   if(wrapped&&proveValue(wrapped,kind,fields,state,seen))continue;
    if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+    // 只对就地调用的函数表达式沿用参数级字段封闭证明；命名 helper 的
+    // 复杂度仍由既有的 scalarOnly 判据限制，避免放大对象强制转换面。
+    if(functions.has(parent.callee.type)){
+     const parameter=parent.callee.params[parent.arguments.indexOf(ref)];
+     if(parameter?.type==='Identifier'&&proveParameter(parent.callee,parameter,kind,fields,state,seen))continue;
+    }
     const fn=methodTarget(parent.callee);
     if(fn&&scalarOnly(fn))continue;
    }
@@ -432,20 +448,20 @@ export function lowerClosedMessageObjects(source){
   const plans=[];let valid=true,directRefs=0,directWrites=0;
   for(const ref of refs){
    if(ignored(ref))continue;
-   const parent=parents.get(ref);
-   if(parent?.type==='MemberExpression'&&parent.object===ref){
+   const wrapped=emptyFallback(ref),value=wrapped??ref,parent=parents.get(value);
+   if(!wrapped&&parent?.type==='MemberExpression'&&parent.object===ref){
     directRefs++;
     const outer=parents.get(parent);if(outer?.type==='UpdateExpression'||outer?.type==='UnaryExpression'&&outer.operator==='delete'||outer?.type==='AssignmentExpression'&&outer.left===parent)directWrites++;
     continue;
    }
-   if(parent?.type==='VariableDeclarator'&&parent.init===ref&&parent.id.type==='Identifier'){
+   if(parent?.type==='VariableDeclarator'&&parent.init===value&&parent.id.type==='Identifier'){
     const binding=bindings.get(parent.id);if(!binding||binding.writes.length){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},binding});continue;
    }
-   if(parent?.type==='AssignmentExpression'&&parent.right===ref&&parent.operator==='='&&parent.left.type==='Identifier'){
+   if(parent?.type==='AssignmentExpression'&&parent.right===value&&parent.operator==='='&&parent.left.type==='Identifier'){
     const binding=bindings.get(parent.left);if(!binding||binding.writes.length!==1||binding.writes[0]!==parent){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},binding});continue;
    }
-   if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
-    const fn=target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(ref)];
+   if(parent?.type==='CallExpression'&&parent.arguments.includes(value)){
+    const fn=target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(value)];
     if(!fn||parameter?.type!=='Identifier'){valid=false;break;}plans.push({ref,fields:new Set(),state:{write:false},fn,parameter});continue;
    }
    valid=false;break;
