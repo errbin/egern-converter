@@ -71,7 +71,8 @@ globalThis.URL=class{
 const FixtureBody=${FixtureBody.toString()};
 globalThis.Request=${FixtureRequest.toString()};
 globalThis.Response=${FixtureResponse.toString()};
-const headers=v=>Object.fromEntries([...new Headers(v).entries()].map(([k,v])=>[k.toLowerCase(),v]).sort(([a],[b])=>a.localeCompare(b)));
+// Headers 只按自身可枚举键和大小写无关属性访问读取；数组多值必须原样保留。
+const headers=v=>Object.fromEntries(Object.entries(v??{}).map(([k,v])=>[k.toLowerCase(),Array.isArray(v)?v.map(String):String(v)]).sort(([a],[b])=>a.localeCompare(b)));
 const status=v=>typeof v==='string'?Number(v.match(/^HTTP\/[\d.]+\s+(\d{3})/)?.[1]??NaN):v;
 const clean=(v)=>{
  if(!v||typeof v!=='object')return v;

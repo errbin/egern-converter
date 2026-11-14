@@ -33,31 +33,32 @@ export class FixtureSearchParams {
  toString(){const encode=value=>encodeURIComponent(value).replace(/[!'()~]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase()).replace(/%20/g,'+');return this.pairs.map(pair=>pair.map(encode).join('=')).join('&');}
 }
 
-// Fixture host only: model Egern's documented case-insensitive property API.
-// This is never imported by converted scripts or published with the website.
+// 仅用于差分 fixture：按真机已观察契约建模。Headers 只提供大小写无关属性
+// 访问和可枚举键，不提供 entries/getAll；类源码会被 verify.mjs 嵌入 VM，
+// 因此必须保持自包含。
 export class FixtureHeaders {
+ static #state=Symbol('headers');
+ static #normalize(value){return Array.isArray(value)?value.map(String):String(value);}
  constructor(value={}) {
-  Object.defineProperty(this,'values',{value:new Map()});
-  for(const [k,v] of value instanceof FixtureHeaders?value.entries():Object.entries(value))this.values.set(k,{name:k,value:Array.isArray(v)?v.map(String):String(v)});
-  const find=k=>[...this.values.keys()].find(n=>n.toLowerCase()===String(k).toLowerCase());
+  const values=new Map();
+  Object.defineProperty(this,FixtureHeaders.#state,{value:values,configurable:true});
+  for(const key of Object.keys(value??{}))values.set(key,{name:key,value:FixtureHeaders.#normalize(value[key])});
+  const find=k=>[...values.keys()].find(name=>name.toLowerCase()===String(k).toLowerCase());
   return new Proxy(this,{
-   get:(t,k,receiver)=>{const found=typeof k==='string'?find(k):undefined;if(found!==undefined)return t.values.get(found).value;const v=Reflect.get(t,k);return typeof v==='function'?v.bind(receiver):v;},
-   set:(t,k,v)=>{const found=find(k);t.values.set(found??k,{name:found??k,value:Array.isArray(v)?v.map(String):String(v)});return true;},
-   deleteProperty:(t,k)=>{const found=find(k);return found===undefined||t.values.delete(found);},
+   get:(t,k,receiver)=>{const found=typeof k==='string'?find(k):undefined;if(found!==undefined)return values.get(found).value;const v=Reflect.get(t,k);return typeof v==='function'?v.bind(receiver):v;},
+   set:(t,k,v)=>{if(typeof k==='symbol')return Reflect.set(t,k,v);const found=find(k);const name=found??String(k);values.set(name,{name,value:FixtureHeaders.#normalize(v)});return true;},
+   deleteProperty:(t,k)=>{if(typeof k==='symbol')return Reflect.deleteProperty(t,k);const found=find(k);return found===undefined||values.delete(found);},
    has:(t,k)=>typeof k==='string'&&find(k)!==undefined||Reflect.has(t,k),
-   ownKeys:t=>['values',...t.values.keys()],
-   getOwnPropertyDescriptor:(t,k)=>{const found=typeof k==='string'?find(k):undefined;return found===undefined?Reflect.getOwnPropertyDescriptor(t,k):{value:t.values.get(found).value,writable:true,enumerable:true,configurable:true};}
+   ownKeys:()=>[...values.keys()],
+   getOwnPropertyDescriptor:(t,k)=>{if(typeof k!=='string')return Reflect.getOwnPropertyDescriptor(t,k);const found=find(k);return found===undefined?undefined:{value:values.get(found).value,writable:true,enumerable:true,configurable:true};}
   });
  }
- find(k){return [...this.values.keys()].find(n=>n.toLowerCase()===String(k).toLowerCase());}
- get(k){const v=this.values.get(this.find(k))?.value;return v===undefined?null:Array.isArray(v)?v.join(', '):v;}
- getAll(k){const v=this.values.get(this.find(k))?.value;return v===undefined?[]:Array.isArray(v)?v:[v];}
+ find(k){return [...this[FixtureHeaders.#state].keys()].find(name=>name.toLowerCase()===String(k).toLowerCase());}
+ get(k){const value=this[FixtureHeaders.#state].get(this.find(k))?.value;return value===undefined?null:Array.isArray(value)?value.join(', '):value;}
  has(k){return this.find(k)!==undefined;}
- set(k,v){const name=this.find(k)??k;this.values.set(name,{name,value:Array.isArray(v)?v.map(String):String(v)});}
- append(k,v){this.set(k,[...this.getAll(k),String(v)]);}
- delete(k){this.values.delete(this.find(k));}
- *entries(){for(const {name,value} of this.values.values())yield [name,value];}
- [Symbol.iterator](){return this.entries();}
+ set(k,v){const name=this.find(k)??String(k);this[FixtureHeaders.#state].set(name,{name,value:FixtureHeaders.#normalize(v)});}
+ append(k,v){const current=this[FixtureHeaders.#state].get(this.find(k))?.value;this.set(k,current===undefined?String(v):[...(Array.isArray(current)?current:[current]),String(v)]);}
+ delete(k){this[FixtureHeaders.#state].delete(this.find(k));}
 }
 
 // Independent, deliberately limited Fetch body model for differential fixtures.

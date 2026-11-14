@@ -11,6 +11,25 @@ URL='https://example.test/task.js'
 
 
 class FixtureEventLoopTests(unittest.TestCase):
+    def test_fixture_headers_only_expose_the_verified_runtime_contract(self):
+        # 真机只保证大小写无关属性访问和可枚举键；entries/getAll/迭代会掩盖
+        # 生成产物对不存在宿主方法的依赖，必须在差分 fixture 中直接失败。
+        probe = r'''import {FixtureHeaders} from './tools/js-analysis/verification/fixtures.mjs';
+import assert from 'node:assert/strict';
+const headers = new FixtureHeaders({'Set-Cookie': ['a=1', 'b=2'], 'X-Test': 'yes'});
+assert.equal(typeof headers.entries, 'undefined');
+assert.equal(typeof headers.getAll, 'undefined');
+assert.equal(typeof headers[Symbol.iterator], 'undefined');
+assert.deepEqual(headers['set-cookie'], ['a=1', 'b=2']);
+assert.deepEqual(Object.keys(headers), ['Set-Cookie', 'X-Test']);
+assert.deepEqual(Object.fromEntries(Object.entries(headers)),
+                 {'Set-Cookie': ['a=1', 'b=2'], 'X-Test': 'yes'});
+console.log(JSON.stringify({ok: true}));
+'''
+        result = subprocess.run(['node', '--input-type=module', '-e', probe], cwd=ROOT,
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {'ok': True})
+
     def test_callback_request_starts_synchronously_but_reply_remains_asynchronous(self):
         source="""$httpClient.get('https://example.test/api',(e,r,b)=>{
           $persistentStore.write(b,'late');$done({body:'callback'});
