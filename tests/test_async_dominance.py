@@ -114,6 +114,66 @@ class AsyncDominanceTests(unittest.TestCase):
         )
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_conditional_root_requires_both_branches_to_reach_completion(self):
+        source = ("function finishB(){$done({body:'b'})}"
+                  "const flag=$request.url.endsWith('/a');"
+                  "const run=async()=>{await Promise.resolve()};"
+                  "if(flag){run().finally(()=>$done({body:'a'}))}else{finishB()}")
+        self.assertTrue(proved(source))
+        output = convert_script(source, 'Fixture', URL, '')
+        for suffix in ['a', 'b']:
+            case = {'name': 'conditional completion root', 'event_loop': True,
+                    'request': {'url': URL + '/' + suffix},
+                    'expected': {'result': {'body': suffix}}}
+            result = compare(source, output, 'surge', URL, case)
+            self.assertEqual(result['status'], 'passed', result)
+        one_branch = ("const flag=$request.url.endsWith('/a');"
+                      "const run=async()=>{await Promise.resolve()};"
+                      "if(flag){run().finally(()=>$done({body:'a'}))}")
+        self.assertFalse(proved(one_branch))
+        unreachable = ("const flag=true;const run=async()=>{await Promise.resolve()};"
+                       "if(flag){run().finally(()=>$done({body:'a'}))}"
+                       "else{return;$done({body:'b'})}")
+        self.assertFalse(proved(unreachable))
+
+    def test_hoisted_function_and_inert_declaration_after_root_are_accepted(self):
+        source = ("run().finally(()=>$done({body:'ok'}));"
+                  "function run(){return Promise.resolve()}const answer=1+2;")
+        self.assertTrue(proved(source))
+        output = convert_script(source, 'Fixture', URL, '')
+        case = {'name': 'hoisted completion root', 'event_loop': True,
+                'request': {'url': URL}, 'expected': {'result': {'body': 'ok'}}}
+        self.assertEqual(compare(source, output, 'surge', URL, case)['status'], 'passed')
+
+    def test_effectful_trailing_call_or_variable_initializer_is_rejected(self):
+        sources = [
+            ("run().finally(()=>$done({}));unknown();"
+             "function run(){return Promise.resolve()}"),
+            ("run().finally(()=>$done({}));const answer=compute();"
+             "function run(){return Promise.resolve()}function compute(){return 1}"),
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertFalse(proved(source))
+                with self.assertRaises(ConversionError):
+                    convert_script(source, 'Fixture', URL, '')
+
+    def test_trailing_local_iife_must_not_call_or_use_host_globals(self):
+        source = ("const run=async()=>{await Promise.resolve()};"
+                  "run().finally(()=>$done({body:'ok'}));(()=>{const answer=1+2;})();")
+        self.assertTrue(proved(source))
+        output = convert_script(source, 'Fixture', URL, '')
+        case = {'name': 'closed trailing iife', 'event_loop': True,
+                'request': {'url': URL}, 'expected': {'result': {'body': 'ok'}}}
+        self.assertEqual(compare(source, output, 'surge', URL, case)['status'], 'passed')
+        for suffix in ['(()=>{unknown();})();', '(()=>{$persistentStore.read("key");})();']:
+            with self.subTest(suffix=suffix):
+                rejected = ("const run=async()=>{await Promise.resolve()};"
+                            "run().finally(()=>$done({body:'ok'}));" + suffix)
+                self.assertFalse(proved(rejected))
+                with self.assertRaises(ConversionError):
+                    convert_script(rejected, 'Fixture', URL, '')
+
 
 if __name__ == '__main__':
     unittest.main()

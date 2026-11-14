@@ -311,27 +311,110 @@ export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set()){
    if(!binding||binding.writes.length||!fn||!binding.refs.length)return false;
    if(binding.refs.some(ref=>{const use=parents.get(ref);return use?.type!=='CallExpression'||use.callee!==ref||use.optional||use.arguments.some(argument=>argument.type==='SpreadElement');}))return false;
    const declaration=declarationStatement(fn);
-   if(!declaration||binding.refs.some(ref=>!initializedAfter(ix,declaration,ref)))return false;
+   if(!declaration||!hoistedFunctionBinding(ix,binding)&&binding.refs.some(ref=>!initializedAfter(ix,declaration,ref)))return false;
   }else if(base.callee.type==='MemberExpression'){
    const knownPromise=free(base.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any'].includes(property(base.callee));
    const closedFetch=free(base.callee.object,'$task')&&property(base.callee)==='fetch';
    if(!knownPromise&&!closedFetch)return false;
   }else return false;
  }else return false;
+ // 条件分支中的完成根只在另一分支也必然到达完成点时成立；此时整个条件
+ // 是一次根任务，任一分支的完成都按首次完成处理，未选中的分支不会启动。
+ const completionTarget=node=>{
+  if(functions.has(node?.type))return node;
+  if(node?.type!=='Identifier')return null;
+  const binding=bindings.get(node);
+  return binding?.fn??(functions.has(binding?.init?.type)?binding.init:null);
+ };
+ const completesExpression=node=>{
+  if(!node)return false;
+  if(node.type==='SequenceExpression')return completesExpression(node.expressions.at(-1));
+  if(node.type==='ConditionalExpression')return completesExpression(node.consequent)&&completesExpression(node.alternate);
+  if(node.type!=='CallExpression'||node.optional)return false;
+  if(free(node.callee,'$done'))return true;
+  const fn=completionTarget(node.callee);
+  return !!fn&&completes(fn);
+ };
+ // 根之后的声明只有在求值不调用函数、不读取宿主对象时才可能在微任务完成
+ // 前同步执行；内联立即执行函数还要求函数体完全没有调用、await、宿主 API
+ // 或自由全局，只允许闭合的本地数据运算。
+ const inertTrailing=node=>{
+  if(!node)return true;
+  if(node.type==='Literal')return true;
+  if(node.type==='TemplateLiteral')return node.expressions.length===0;
+  if(['FunctionExpression','ArrowFunctionExpression'].includes(node.type))return true;
+  if(node.type==='ArrayExpression')return node.elements.every(element=>element?.type!=='SpreadElement'&&inertTrailing(element));
+  if(node.type==='ObjectExpression')return node.properties.every(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.computed&&key(entry)!=='__proto__'&&inertTrailing(entry.value));
+  if(node.type==='UnaryExpression')return ['!','void','+','-','~','typeof'].includes(node.operator)&&inertTrailing(node.argument);
+  if(['BinaryExpression','LogicalExpression'].includes(node.type))return inertTrailing(node.left)&&inertTrailing(node.right);
+  if(node.type==='ConditionalExpression')return inertTrailing(node.consequent)&&inertTrailing(node.alternate);
+  if(node.type==='Identifier')return free(node)&&['undefined','NaN','Infinity'].includes(node.name);
+  return false;
+ };
+ const inertStatement=node=>{
+  if(['FunctionDeclaration','EmptyStatement'].includes(node.type))return true;
+  if(node.type==='VariableDeclaration')return node.declarations.every(declaration=>declaration.id.type==='Identifier'&&inertTrailing(declaration.init));
+  return node.type==='ExpressionStatement'&&inertTrailing(node.expression);
+ };
+ // 普通表达式和声明即使可能抛错也会保持原有抛错路径；真正会绕过完成点的是
+ // 显式 return/throw/break/continue，或可能走另一路径的条件/循环/异常结构。
+ const normalFallthrough=node=>['ExpressionStatement','VariableDeclaration','FunctionDeclaration','ClassDeclaration','EmptyStatement','DebuggerStatement'].includes(node.type);
+ // 另一分支必须存在可达完成点；沿块顺序扫描，完成点之前的控制转移一律否决。
+ const completesStatement=node=>{
+  if(!node)return false;
+  if(node.type==='BlockStatement'){
+   for(const statement of node.body){
+    if(completesStatement(statement))return true;
+    if(!normalFallthrough(statement))return false;
+   }
+   return false;
+  }
+  if(node.type==='ExpressionStatement')return completesExpression(node.expression);
+  if(node.type==='IfStatement')return !!node.alternate&&completesStatement(node.consequent)&&completesStatement(node.alternate);
+  return false;
+ };
+ const closedLocalIIFE=node=>{
+  if(node?.type!=='CallExpression'||node.optional||!['FunctionExpression','ArrowFunctionExpression'].includes(node.callee.type))return false;
+  const fn=node.callee;
+  if(fn.async||fn.generator||fn.body.type!=='BlockStatement')return false;
+  if(!node.arguments.every(argument=>argument.type!=='SpreadElement'&&inertTrailing(argument)))return false;
+  for(const child of ix.nodes){
+   if(child.start<fn.start||child.end>fn.end||child===fn)continue;
+   if(['AwaitExpression','YieldExpression','CallExpression','NewExpression','ThisExpression','Super','MetaProperty','ImportExpression','TaggedTemplateExpression'].includes(child.type))return false;
+   if(child.type==='UnaryExpression'&&child.operator==='delete')return false;
+   if(child.type==='Identifier'){
+    if(standardGlobals.has(child.name))continue;
+    const binding=bindings.get(child);
+    if(!binding)return false;
+    const local=binding.init&&binding.init.start>=fn.start&&binding.init.end<=fn.end;
+    const parameter=!binding.init&&!binding.refs.some(ref=>ref.start<fn.start||ref.end>fn.end);
+    if(local||parameter||inertTrailing(binding.init))continue;
+    return false;
+   }
+  }
+  return true;
+ };
+ const trailingSafe=node=>inertStatement(node)||node.type==='ExpressionStatement'&&closedLocalIIFE(node.expression);
  // 根任务之前不能处于条件、循环或异常处理分支，否则原生 Promise 的启动和
- // 拒绝路径会与作者代码不同。透明的 BlockStatement 只承载作用域，不构成旁路。
+ // 拒绝路径会与作者代码不同。唯一例外是另一分支也必然完成的条件：整条条件
+ // 等价于同一个根任务。透明的 BlockStatement 只承载作用域，不构成旁路。
  for(let child=statement,parent=parents.get(child);parent;child=parent,parent=parents.get(child)){
   if(parent.type==='Program'||functions.has(parent.type))break;
-  if(['IfStatement','ConditionalExpression','LogicalExpression','SwitchStatement','SwitchCase','ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement','TryStatement','CatchClause'].includes(parent.type))return false;
+  if(parent.type==='IfStatement'){
+   const other=parent.consequent===child?parent.alternate:parent.alternate===child?parent.consequent:null;
+   if(!other||!completesStatement(other)||completesExpression(parent.test))return false;
+   continue;
+  }
+  if(['ConditionalExpression','LogicalExpression','SwitchStatement','SwitchCase','ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement','TryStatement','CatchClause'].includes(parent.type))return false;
   if(!['BlockStatement','LabeledStatement'].includes(parent.type))return false;
  }
- // 根之后只能有声明或另一个可证完成根；普通语句会在原生汇合后产生无法证明
- // 的额外执行路径。逐层越过透明块，直到函数/程序边界。
+ // 根之后只能有无副作用的声明、闭合本地立即执行函数或另一个可证完成根；
+ // 普通语句会在微任务完成前产生无法证明的额外执行路径。
  const nextSeen=new Set(seen);nextSeen.add(call);
  for(let child=statement,parent=parents.get(child);parent;child=parent,parent=parents.get(child)){
   if(parent.type==='Program'||parent.type==='BlockStatement'){
    for(const next of parent.body.slice(parent.body.indexOf(child)+1)){
-    if(['FunctionDeclaration','EmptyStatement'].includes(next.type))continue;
+    if(trailingSafe(next))continue;
     if(next.type==='ExpressionStatement'&&closedAsyncCompletionRoot(ix,next.expression,completes,nextSeen))continue;
     return false;
    }

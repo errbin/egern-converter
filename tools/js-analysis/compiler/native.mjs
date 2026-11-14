@@ -8,7 +8,7 @@ import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,collectSloppyMemberWrites,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
 import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
-import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances} from '../transforms/factories.mjs';
+import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances,lowerClosedInstanceLiteralFields} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
@@ -94,7 +94,8 @@ function compile(original,format,options,libraries){
  let platform=platformFold(specializeParameters(lowerGlobalMessages(reviewed)),format,options).source;
  if(options.entry_types?.length)for(let pass=0;pass<4;pass++){const next=pruneGeneratedFunctions(pruneTargetEnvironments(simplify(platformFold(foldFactoryProbes(lowerFiniteMethodCalls(lowerClosedReceiverArguments(normalizeRecordParameters(platform))),format,options),format,options).source),format),new Set(),true);if(next===platform)break;platform=next;}
  const generatedFunctions=new Set();
- let closures=lowerStatefulFactories(lowerLegacyFactories(normalizeRecordParameters(lowerHTTPDelegates(platform)),generatedFunctions),generatedFunctions);
+ const literalFields=lowerClosedInstanceLiteralFields(platform);
+ let closures=lowerStatefulFactories(lowerLegacyFactories(normalizeRecordParameters(lowerHTTPDelegates(literalFields)),generatedFunctions),generatedFunctions);
  for(let pass=0;pass<8;pass++){const next=pruneGeneratedFunctions(simplify(platformFold(specializeParameters(closures),format,options).source),generatedFunctions,!!options.entry_types?.length);if(next===closures)break;closures=next;}
  closures=specializeCallbacks(lowerSelectedHTTP(closures),generatedFunctions);
  let folded=platformFold(completionStatements(lowerClosedEnv(closures)),format,options);
@@ -871,8 +872,38 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const calls=collect();
   return calls.length?calls:null;
  }
+ // 回调值经过局部转发函数时，只有每个调用点都传入可静态识别的本地函数，
+ // 才允许把响应快照继续交给该形参。与 target 不同，这里不要求所有调用点
+ // 是同一个函数，因为快照只是普通本地数据；但任何非本地函数、逃逸或
+ // 重绑定都保持失败关闭。
+ function closedCallbackValue(n,seen=new Set()){
+  if(functions.has(n?.type))return true;
+  if(n?.type!=='Identifier')return false;
+  const binding=bindings.get(n);
+  if(!binding||seen.has(binding)||binding.writes.length)return false;
+  if(binding.fn)return true;
+  if(binding.init){const next=new Set(seen);next.add(binding);return closedCallbackValue(binding.init,next);}
+  const entries=parameterFunctions.get(binding);
+  if(!entries||entries.length!==1)return false;
+  const {fn,position}=entries[0],parent=parents.get(fn),parameter=fn.params[position];
+  const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fb=id?.type==='Identifier'?bindings.get(id):null;
+  let calls;
+  if(parent?.type==='MethodDefinition'){calls=closedMethodCalls(parent);if(!calls)return false;}
+  else{
+   if(!fb||fb.writes.length)return false;
+   calls=fb.refs.map(ref=>parents.get(ref));
+   if(calls.some((call,i)=>call?.type!=='CallExpression'||call.optional||call.callee!==fb.refs[i]||call.arguments.some(a=>a.type==='SpreadElement')))return false;
+  }
+  if(!calls?.length)return false;
+  const next=new Set(seen);next.add(binding);
+  return calls.every(call=>{
+   const actual=call.arguments[position]??(parameter?.type==='AssignmentPattern'?parameter.right:null);
+   return !!actual&&closedCallbackValue(actual,next);
+  });
+ }
+
  // 只有回调形参本身及其所有调用点都闭合时，才允许把响应快照原样转交。
- // 形参不得逃逸；每次传参都必须是可追溯的本地函数或默认函数。
+ // 形参不得逃逸；每次传参都必须是可追溯的本地函数或默认函数；转发形参按调用点递归证明。
  function closedCallbackParameter(n){
   if(n?.type!=='Identifier')return false;
   const binding=bindings.get(n);
@@ -890,7 +921,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(!calls?.length||calls.some((call,i)=>call?.type!=='CallExpression'||call.optional||call.arguments.some(a=>a.type==='SpreadElement')||parent?.type!=='MethodDefinition'&&call.callee!==fb.refs[i]))return false;
   return calls.every(call=>{
    const parameter=fn.params[position],actual=call.arguments[position]??(parameter?.type==='AssignmentPattern'?parameter.right:null);
-   return !!actual&&!!target(actual);
+   return !!actual&&closedCallbackValue(actual);
   });
  }
  const compressionNames={ungzip:'gunzip'};
@@ -3766,6 +3797,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   seen=new Set(seen);seen.add(binding);
   for(const ref of binding.refs){
    const [current,parent]=replyValueContext(ref);
+   if(parent?.type==='UnaryExpression'&&parent.operator==='typeof')continue;
+   const other=parent?.left===current?parent.right:parent?.right===current?parent.left:null;
+   if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')))continue;
+   if(parent?.type==='LogicalExpression'&&parent.left===current||['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(parent?.type)&&parent.test===current||parent?.type==='UnaryExpression'&&parent.operator==='!')continue;
    if(parent?.type==='MemberExpression'&&parent.object===current){
     const name=property(parent);
     if(name===undefined||!responsePassFields.has(String(name)))return false;
@@ -3791,6 +3826,40 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return true;
  }
+ // 整体响应交给闭合回调形参时，沿每个调用点递归确认实际回调函数；实际函数
+ // 只能读取稳定响应字段或继续把响应交给已闭合 helper，null/缺失响应按错误
+ // 路径处理。任何逃逸、改绑或未知字段都会否决该调用参数。
+ function closedResponseCallbackValue(n,responseIndex,seen=new Set()){
+  if(!Number.isInteger(responseIndex)||responseIndex<0)return false;
+  if(n?.type==='Literal'&&n.value===null||free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void')return true;
+  if(functions.has(n?.type)){
+   const parameter=n.params[responseIndex],id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
+   return id?.type==='Identifier'&&responsePassParameter(n,id,new Set());
+  }
+  if(n?.type!=='Identifier')return false;
+  const binding=bindings.get(n);
+  if(!binding||seen.has(binding)||binding.writes.length)return false;
+  const next=new Set(seen);next.add(binding);
+  if(binding.fn)return closedResponseCallbackValue(binding.fn,responseIndex,next);
+  if(binding.init)return closedResponseCallbackValue(binding.init,responseIndex,next);
+  const entries=parameterFunctions.get(binding);
+  if(!entries||entries.length!==1)return false;
+  const {fn,position}=entries[0],parent=parents.get(fn),parameter=fn.params[position];
+  const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fb=id?.type==='Identifier'?bindings.get(id):null;
+  let calls;
+  if(parent?.type==='MethodDefinition'){calls=closedMethodCalls(parent);if(!calls)return false;}
+  else{
+   if(!fb||fb.writes.length)return false;
+   calls=fb.refs.map(ref=>parents.get(ref));
+   if(calls.some((call,i)=>call?.type!=='CallExpression'||call.optional||call.callee!==fb.refs[i]||call.arguments.some(a=>a.type==='SpreadElement')))return false;
+  }
+  if(!calls?.length)return false;
+  return calls.every(call=>{
+   if(call.arguments.length<=position)return true;
+   const actual=call.arguments[position];
+   return closedResponseCallbackValue(actual,responseIndex,next);
+  });
+ }
  function reply(binding,fn=null,allowSnapshot=false){
   if(binding&&allowSnapshot){
    const fields=new Set(),state={write:false,whole:false};
@@ -3799,18 +3868,19 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     httpReplies.set(binding,info);return info;
    }
   }
-  const refs=binding?.refs??[],uses=new Set();for(const ref of refs){const p=parents.get(ref);
+  const refs=binding?.refs??[],uses=new Set(),callbackCalls=new Set();for(const ref of refs){const p=parents.get(ref);
    if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='ObjectPattern'){
     for(const entry of p.id.properties){const name=entry.type==='Property'?key(entry):null;if(!['body','bodyBytes','status','statusCode','headers'].includes(name))fail(entry,'未知 HTTP 响应解构字段');uses.add(name);}continue;
    }
    if(closedWholeResponseUse(ref))continue;
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
-    const targetFn=replyTarget(p.callee),parameter=targetFn?.params[p.arguments.indexOf(ref)];
+    const position=p.arguments.indexOf(ref),targetFn=replyTarget(p.callee),parameter=targetFn?.params[position];
     const id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
     if(targetFn&&id?.type==='Identifier'&&responsePassParameter(targetFn,id,new Set([binding])))continue;
+    if(closedResponseCallbackValue(p.callee,position,new Set([binding]))){callbackCalls.add(p);continue;}
    }
    if(p?.type!=='MemberExpression'||p.object!==ref)fail(ref,'HTTP 响应整体传递无法静态转换');const k=property(p);if(!['body','bodyBytes','status','statusCode','headers'].includes(k))fail(p,'未知 HTTP 响应字段');uses.add(k);}
-  const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
+  const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn,callbackForward:callbackCalls.size>0,replyCalls:callbackCalls};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
  }
  function replyPrelude(info,name){const out=[];if(info.bytes)out.push(`const ${info.bytes} = await ${name}.arrayBuffer();`);if(info.body)out.push(`const ${info.body} = ${info.bytes?`new TextDecoder().decode(${info.bytes})`:`await ${name}.text()`};`);return out.join('\n');}
  // Promise 执行器把宿主响应整体交给 resolver 时，响应对象会穿过局部工厂和
@@ -3942,7 +4012,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   return false;
  }
  function sameReplyMember(left,right){
-  return left?.type==='MemberExpression'&&right?.type==='MemberExpression'&&left.object.type==='Identifier'&&right.object.type==='Identifier'&&bindings.get(left.object)===bindings.get(right.object)&&property(left)!==undefined&&property(left)===property(right);
+  if(!(left?.type==='MemberExpression'&&right?.type==='MemberExpression'&&left.object.type==='Identifier'&&right.object.type==='Identifier'&&bindings.get(left.object)===bindings.get(right.object)))return false;
+  const name=property(left),other=property(right),status=new Set(['status','statusCode']);
+  return name!==undefined&&(name===other||status.has(String(name))&&status.has(String(other)));
  }
  function forwardedReply(binding,fn){
   if(!binding)return null;
@@ -4082,8 +4154,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.callee.name===device.deviceTypeToken&&!n.arguments.length)return `(${context}.env.EGH_DEVICE_TYPE || 'iPhone')`;
   if(n.type==='CallExpression'&&free(n.callee,'setTimeout')&&n.arguments.length===2&&n.arguments[0]?.type==='CallExpression'&&n.arguments[1].type==='Literal'&&typeof n.arguments[1].value==='number'&&target(n.arguments[0].callee)&&parents.get(n)?.type==='ExpressionStatement')return render(n.arguments[0]);
   if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='Identifier'){
-   const info=httpReplies.get(bindings.get(n.left.object));
-   if(info?.promiseForward&&sameReplyMember(n.right,n.left))return property(n.left)==='bodyBytes'?info.bytes:info.body;
+   const info=httpReplies.get(bindings.get(n.left.object)),name=property(n.left);
+   if(info?.promiseForward&&['body','bodyBytes'].includes(String(name))&&sameReplyMember(n.right,n.left))return name==='bodyBytes'?info.bytes:info.body;
   }
   if(n.type==='AssignmentExpression'&&n.operator==='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+n.left.name+' = ('+render(n.right)+'), '+guardedImplicit.get(n.left.name)+' = true, '+n.left.name+')';
   if(n.type==='AssignmentExpression'&&n.operator!=='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+guardedImplicit.get(n.left.name)+' ? ('+n.left.name+' '+n.operator+' ('+render(n.right)+')) : (() => {throw new '+(referenceError??'ReferenceError')+'('+JSON.stringify(n.left.name+' is not defined')+');})())';
@@ -4214,7 +4286,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(!['url','method','status','headers'].includes(k))fail(n,'未知请求 / 响应字段');
    }
    const info=o.type==='Identifier'?httpReplies.get(bindings.get(o)):null;
-   if(info?.promiseForward){
+   if(info?.promiseForward||info?.callbackForward){
     if(k==='body')return info.body;
     if(k==='bodyBytes')return info.bytes;
     if(k==='headers')return forwardedHeaders(render(o));
@@ -4234,6 +4306,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(free(o,'$network')){const map={wifi:'wifi',v4:'ipv4',v6:'ipv6',dns:'dnsServers','cellular-data':'cellular'};if(!map[k])fail(n,'未知网络字段');return context+'.device.'+map[k];}
   }
   if(n.type==='CallExpression'){
+   const forwardedIndex=n.arguments.findIndex(argument=>argument.type==='Identifier'&&httpReplies.get(bindings.get(argument))?.replyCalls?.has(n));
+   if(forwardedIndex>=0){const info=httpReplies.get(bindings.get(n.arguments[forwardedIndex])),args=n.arguments.map((argument,index)=>index===forwardedIndex?forwardedSnapshot(info,render(argument)):render(argument));return `${render(n.callee)}(${args.join(', ')})`;}
    const compression=compressionMethod(n.callee);
    if(compression){if(n.arguments.length!==1||n.arguments[0].type==='SpreadElement')fail(n,'压缩 API 必须接收一个二进制参数');return `(await ${context}.compress.${compression}(${bytes(n.arguments[0])}))`;}
    if(isDone(n)){const value=payload(n.arguments[0]);return pending?`((value) => (${pendingFinished} = true, value))(${value})`:value;}

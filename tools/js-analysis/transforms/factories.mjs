@@ -222,6 +222,119 @@ export function lowerImplicitInstances(source){
  return renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null);
 }
 
+// 折叠封闭本地实例上“只写一次且写入无条件先于全部读取”的字面量字段。
+// 目的只是暴露由该常量决定的不可达分支，让后续原生证明可以删除与目标宿主
+// 无关的代码（例如 `if (instance.merge) instance.msg = ...`）。实例必须由
+// 本地构造函数创建且从不整体逃逸；构造函数不能安装同名访问器、改写原型或
+// 返回对象，否则字段写入不一定是普通数据属性。任何额外写入、条件写入或
+// 读取先于写入都保持原样，继续走失败关闭路径。
+export function lowerClosedInstanceLiteralFields(source){
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
+ catch{return source;}
+ const {nodes,parents,bindings}=ix,replace=new WeakMap(),UNKNOWN=Symbol('not a closed literal');let changed=false;
+ const staticField=n=>n?.type==='MemberExpression'?!n.computed&&n.property.type==='Identifier'?n.property.name:n.computed&&n.property.type==='Literal'&&typeof n.property.value==='string'?n.property.value:undefined:undefined;
+ const inertLiteral=n=>{
+  if(!n)return UNKNOWN;
+  if(n.type==='Literal')return n.regex?UNKNOWN:{value:n.value};
+  if(n.type==='TemplateLiteral'&&!n.expressions.length&&n.quasis.length===1)return {value:n.quasis[0].value.cooked};
+  if(n.type==='Identifier'&&ix.free(n,'undefined'))return {value:undefined};
+  if(n.type==='UnaryExpression'){
+   const inner=inertLiteral(n.argument);if(inner===UNKNOWN)return UNKNOWN;
+   if(n.operator==='void')return {value:undefined};
+   if(['!','+','-','~'].includes(n.operator)&&(['string','number','boolean'].includes(typeof inner.value)||inner.value===null)){
+    try{return {value:n.operator==='!'?!inner.value:n.operator==='+'?+inner.value:n.operator==='-'?-inner.value:~inner.value};}catch{return UNKNOWN;}
+   }
+  }
+  return UNKNOWN;
+ };
+ const written=member=>{const use=parents.get(member);return use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===member;};
+ const unsafeInstanceMember=new Set(['__proto__','prototype','constructor','__defineGetter__','__defineSetter__']);
+ const constructorRegions=ctor=>ctor.type==='ClassDeclaration'||ctor.type==='ClassExpression'
+  ?ctor.body.body.map(member=>member.value).filter(Boolean)
+  :[ctor];
+ // 构造过程不得把 this 整体交给未知代码，也不得通过原型/访问器机制改变字段属性；
+ // 实例方法同样在区域内，任何 `this.<field>` 写入都会在字段级检查中否决折叠。
+ const constructorSafe=ctor=>{
+  if(!ctor)return false;
+  let constructorMethod=null;
+  if(ctor.type==='ClassDeclaration'||ctor.type==='ClassExpression'){
+   if(ctor.superClass)return false;
+   if(!ctor.body.body.every(member=>member.type==='MethodDefinition'&&!member.static&&!member.computed&&member.kind==='method'||member.type==='PropertyDefinition'&&!member.static&&!member.computed&&(member.value==null||inertLiteral(member.value)!==UNKNOWN)))return false;
+   constructorMethod=ctor.body.body.find(member=>member.type==='MethodDefinition'&&member.kind==='constructor')?.value??null;
+  }else{
+   if(ctor.type!=='FunctionDeclaration'&&ctor.type!=='FunctionExpression')return false;
+   if(ctor.async||ctor.generator||ctor.body.type!=='BlockStatement')return false;
+   constructorMethod=ctor;
+  }
+  for(const region of constructorRegions(ctor)){
+   for(const n of index(region).nodes){
+    if(n.type==='ReturnStatement'&&n.argument&&ix.owners.get(n)===constructorMethod)return false;
+    if(n.type==='MemberExpression'&&unsafeInstanceMember.has(staticField(n)))return false;
+    if(n.type==='ThisExpression'){
+     const use=parents.get(n);
+     if(use?.type!=='MemberExpression'||use.object!==n||use.optional||staticField(use)===undefined||unsafeInstanceMember.has(staticField(use)))return false;
+    }
+   }
+  }
+  return true;
+ };
+ const constructionSafe=binding=>binding.refs.length>0&&binding.refs.every(ref=>{
+  const use=parents.get(ref);
+  return use?.type==='NewExpression'&&use.callee===ref&&!use.optional;
+ });
+ const methodWritesField=(ctor,name)=>constructorRegions(ctor).some(region=>index(region).nodes.some(n=>
+  n.type==='MemberExpression'&&n.object.type==='ThisExpression'&&!n.optional&&staticField(n)===name&&written(n)));
+ for(const declaration of nodes){
+  if(declaration.type!=='VariableDeclarator'||declaration.id.type!=='Identifier'||declaration.init?.type!=='NewExpression'||declaration.init.callee.type!=='Identifier')continue;
+  const callee=bindings.get(declaration.init.callee),ctor=callee?.fn??callee?.init;
+  if(!callee||callee.writes.length||!constructionSafe(callee)||!constructorSafe(ctor))continue;
+  const instance=bindings.get(declaration.id);
+  if(!instance||instance.writes.length||nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===instance).length!==1)continue;
+  const statement=parents.get(declaration),block=parents.get(statement),owner=ix.owners.get(statement);
+  if(!statement||!['Program','BlockStatement'].includes(block?.type))continue;
+  const members=[];let closed=true;
+  for(const ref of instance.refs){
+   const member=parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref||member.optional||staticField(member)===undefined){closed=false;break;}
+   members.push(member);
+  }
+  if(!closed)continue;
+  const fields=new Map();
+  for(const member of members){const name=staticField(member);if(!fields.has(name))fields.set(name,[]);fields.get(name).push(member);}
+  for(const [name,accesses] of fields){
+   const writes=accesses.filter(written);
+   if(writes.length!==1)continue;
+   const write=writes[0],assignment=parents.get(write),writeStatement=parents.get(assignment);
+   if(assignment?.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.left!==write)continue;
+   if(writeStatement?.type!=='ExpressionStatement'||parents.get(writeStatement)!==block||writeStatement.start<statement.end)continue;
+   if(ix.owners.get(write)!==owner)continue;
+   if(methodWritesField(ctor,name))continue;
+   const literal=inertLiteral(assignment.right);
+   if(literal===UNKNOWN)continue;
+   const reads=accesses.filter(member=>member!==write);
+   if(!reads.length||reads.some(member=>member.start<assignment.end||ix.owners.get(member)!==owner))continue;
+   const replacement=source.slice(assignment.right.start,assignment.right.end);
+   for(const member of reads){
+    const use=parents.get(member);
+    if(use?.type==='IfStatement'&&use.test===member){
+     const branch=literal.value?use.consequent:use.alternate;
+     replace.set(use,branch?{children:[branch],render:child=>child(branch)}:{direct:true,value:';'});changed=true;
+    }else if(use?.type==='ConditionalExpression'&&use.test===member){
+     const branch=literal.value?use.consequent:use.alternate;
+     replace.set(use,{children:[branch],render:child=>child(branch)});changed=true;
+    }else{replace.set(member,replacement);changed=true;}
+   }
+  }
+ }
+ if(!changed)return source;
+ return renderTree(source,tree,n=>{
+  if(!replace.has(n))return null;
+  const value=replace.get(n);
+  return typeof value==='string'?{direct:true,value}:value;
+ });
+}
+
 // Scalar replacement of a closed SDK instance. Ordinary captured state stays
 // ordinary JS; only reachable methods are retained for native API compilation.
 export function lowerStatefulFactories(source,generated=new Set()){
