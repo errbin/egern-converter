@@ -1358,19 +1358,47 @@ export function regeneratorStateMachine(ix,source){
 // 任何动态键、改绑、成员写入、未知调用或副作用都返回 unknown。
 export const CONSTANT_UNKNOWN=Symbol('constant-unknown');
 
-const closedTableCache=new WeakMap(),closedLiteralCache=new WeakMap();
-// 闭合字面量表只能通过静态成员读取，且任何成员都不得被赋值/更新/删除；
-// 否则同名属性的当前值不再由初始化器决定。整体别名或动态键都会让证明失效。
-function closedTable(ix,binding){
+const closedTableCache=new WeakMap(),closedFieldCache=new WeakMap(),closedLiteralCache=new WeakMap();
+// 正在证明“整体逃逸都不可达”的表绑定。证明期间允许暂时忽略这些绑定的
+// 逃逸点，以便用同一张表的常量键判断分支；逃逸点若实际可达，证明会在
+// 外层否决，因此这个临时假设最终必须被逐项解除。
+const provisionalEscapeBindings=new Set();
+// 闭合字面量表的稳定性按“被写键”隔离：写入其它键不会改变当前读取键由
+// 初始化器决定的值。动态键写入无法确定目标键，仍否决整份证明；整体别名
+// 或绑定改绑同样否决，除非每个整体逃逸点都能证明位于不可达分支。
+// 整体逃逸容忍只服务“键隔离可变表”：没有任何键写入的纯不可变表维持既有
+// 保守边界（任何整体逃逸即 unknown），避免把新证明扩张到无关解码表。
+function tableState(ix,binding){
  if(closedTableCache.has(binding))return closedTableCache.get(binding);
- let closed=!binding.writes.length;
- if(closed)for(const ref of binding.refs){
+ const state={closed:!binding.writes.length,written:new Set(),escapes:[]};
+ if(state.closed)for(const ref of binding.refs){
   const member=ix.parents.get(ref);
-  if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined){closed=false;break;}
+  if(member?.type!=='MemberExpression'||member.object!==ref){state.escapes.push(ref);continue;}
   const use=ix.parents.get(member);
-  if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'){closed=false;break;}
+  const write=use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete';
+  if(!write)continue;
+  const field=property(member);
+  if(field===undefined){state.closed=false;break;}
+  state.written.add(String(field));
  }
- closedTableCache.set(binding,closed);
+ closedTableCache.set(binding,state);
+ return state;
+}
+function closedTable(ix,binding,field){
+ const state=tableState(ix,binding);
+ if(!state.closed)return false;
+ if(field===undefined)return state.written.size===0;
+ if(state.written.has(String(field)))return false;
+ if(!state.escapes.length)return true;
+ if(!state.written.size)return false;
+ if(provisionalEscapeBindings.has(binding))return true;
+ const cacheable=!provisionalEscapeBindings.size;
+ if(cacheable&&closedFieldCache.has(binding)&&closedFieldCache.get(binding).has(String(field)))return closedFieldCache.get(binding).get(String(field));
+ provisionalEscapeBindings.add(binding);
+ let closed=true;
+ try{for(const escape of state.escapes)if(!provablyDead(ix,escape)){closed=false;break;}}
+ finally{provisionalEscapeBindings.delete(binding);}
+ if(cacheable){if(!closedFieldCache.has(binding))closedFieldCache.set(binding,new Map());closedFieldCache.get(binding).set(String(field),closed);}
  return closed;
 }
 function closedLiteral(object){
@@ -1426,7 +1454,7 @@ export function constantValue(ix,node,environment=new Map(),seen=new Set(),depth
   if(typeof name!=='string'&&typeof name!=='number')return CONSTANT_UNKNOWN;
   const object=constantValue(ix,node.object,environment,seen,depth+1);
   if(!object?.object)return CONSTANT_UNKNOWN;
-  if(object.binding&&!closedTable(ix,object.binding))return CONSTANT_UNKNOWN;
+  if(object.binding&&!closedTable(ix,object.binding,name))return CONSTANT_UNKNOWN;
   if(!closedLiteral(object.object)||name==='__proto__')return CONSTANT_UNKNOWN;
   const entries=object.object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)!==undefined&&String(key(entry))===String(name));
   if(entries.length!==1)return CONSTANT_UNKNOWN;

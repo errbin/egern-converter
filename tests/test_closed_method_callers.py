@@ -99,6 +99,41 @@ class ClosedMethodCallerTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_only_dead_instance_writes_still_resolve_the_completion_method(self):
+        # 正例：写入位于已证不可达分支，无论写入原始值还是对象都不改变运行期接收者。
+        for write in ['null', '{}']:
+            source = BASE.replace('const runtime=', 'let runtime=').replace(
+                "runtime.done({body:'ok'});",
+                "const ops={key:'target',same:function(a,b){return a===b;}};"
+                "if(ops.same(ops.key,'target'))runtime.done({body:'ok'});else runtime="
+                + write + ";",
+            )
+            with self.subTest(write=write):
+                output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+                self.assertNotIn('$done', output)
+                result = compare(source, output, 'loon', URL, {
+                    'name': '死分支实例写入',
+                    'request': {'url': URL},
+                    'expected': {'result': {'body': 'ok'}},
+                })
+                self.assertEqual(result['status'], 'passed', result)
+
+    def test_live_instance_write_or_mutated_predicate_rejects_the_completion_method(self):
+        # 反例 1：未知条件分支里的改绑仍可能执行。
+        # 反例 2：写入谓词读取的键会改变分支结果。
+        cases = [
+            "if(unknown())runtime.done({body:'ok'});else runtime=null;",
+            "const ops={key:'target',same:function(a,b){return a===b;}};"
+            "ops.key='other';"
+            "if(ops.same(ops.key,'target'))runtime.done({body:'ok'});else runtime=null;",
+        ]
+        for replacement in cases:
+            source = BASE.replace('const runtime=', 'let runtime=').replace(
+                "runtime.done({body:'ok'});", replacement,
+            )
+            with self.subTest(replacement=replacement), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')
+
 
 if __name__ == '__main__':
     unittest.main()

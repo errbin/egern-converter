@@ -347,6 +347,59 @@ class MultiPlatformEnvTests(unittest.TestCase):
             with self.subTest(after=after):
                 self.assert_unknown(changed)
 
+    def test_keyed_table_write_only_rejects_the_written_key(self):
+        source = DEAD_INSTANCE_FIXTURE.replace(
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }, other: 1};\n"
+            "ops.other = 2;",
+        )
+        self.assertNotEqual(source, DEAD_INSTANCE_FIXTURE)
+        self.assert_folded(source)
+
+    def test_dynamic_or_read_key_write_rejects_table_proof(self):
+        # 反例 1：写入正在读取的键会改变谓词结果。
+        # 反例 2：动态键无法确定目标键，必须整表拒绝。
+        mutations = ["ops.key = 'other';", "ops[String('key')] = 'other';"]
+        for mutation in mutations:
+            source = DEAD_INSTANCE_FIXTURE.replace(
+                "const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+                "const ops = {key: 'target', same: function (a, b) { return a === b; }};\n" + mutation,
+            )
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(source, DEAD_INSTANCE_FIXTURE)
+                self.assert_unknown(source)
+
+    def test_dead_whole_table_escape_is_ignored_but_live_escape_rejects(self):
+        # 正例：键隔离写入 + 不可达整体逃逸。逃逸容忍只对已存在键写入的
+        # 可变表生效；先写 other 再读 key/same 不会改变谓词结果。
+        dead = DEAD_INSTANCE_FIXTURE.replace(
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }, other: 1};\n"
+            "ops.other = 2;\n"
+            "if (!ops.same(ops.key, 'target')) unknown(ops);",
+        )
+        self.assertNotEqual(dead, DEAD_INSTANCE_FIXTURE)
+        self.assert_folded(dead)
+        # 反例 1：没有键写入的纯不可变表维持保守边界，即使逃逸不可达也不放行。
+        # 反例 2：同一作用域内可直接执行的整体逃逸。
+        # 反例 3：逃逸位于未知条件分支，无法证明不可达。
+        immutable = DEAD_INSTANCE_FIXTURE.replace(
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};\n"
+            "if (!ops.same(ops.key, 'target')) unknown(ops);",
+        )
+        self.assertNotEqual(immutable, DEAD_INSTANCE_FIXTURE)
+        self.assert_unknown(immutable)
+        for escape in ["unknown(ops);", "if (unknown()) unknown(ops);"]:
+            live = DEAD_INSTANCE_FIXTURE.replace(
+                "const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+                "const ops = {key: 'target', same: function (a, b) { return a === b; }, other: 1};\n"
+                "ops.other = 2;\n" + escape,
+            )
+            with self.subTest(escape=escape):
+                self.assertNotEqual(live, DEAD_INSTANCE_FIXTURE)
+                self.assert_unknown(live)
+
     def test_simplify_removes_only_closed_predicate_dead_branches(self):
         data = fold(SIMPLIFY_FIXTURE)
         self.assertNotIn('error', data)
