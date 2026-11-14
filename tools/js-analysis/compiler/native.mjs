@@ -20,21 +20,149 @@ import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 export function native(source,format='surge',options={}){
  return withSyntaxCache(()=>compileNative(source,format,options));
 }
-// 真机 Headers 只提供大小写无关属性访问，不提供 entries/getAll。所有生成
-// 路径一经修复仍可能在后续改动中回归，因此在最终产物（含公共库恢复）上做
-// 一次统一拒绝，避免差分 fixture 再次掩盖宿主不存在的方法。
+// 真机 Headers 只提供大小写无关属性访问，不提供 entries/getAll/keys/values/
+// forEach/has。只匹配 `*.headers.entries()` 会漏掉局部别名、解构、函数返回值
+// 和数组/对象承载，因此这里对宿主 message/headers 值做静态别名污点跟踪。
+// Object.entries/Object.keys 等安全投影不会把结果继续标记为 Headers 值。
+const headerMethods=new Set(['entries','getall','keys','values','foreach','has']);
 export function assertNoUnverifiedHeaderCalls(code,analysis=index(parse(code,{ecmaVersion:'latest',sourceType:'module'}))){
  const unwrap=n=>n?.type==='ChainExpression'?unwrap(n.expression):n;
- for(const node of analysis.nodes){
-  if(node.type!=='CallExpression')continue;
-  const callee=unwrap(node.callee);
-  if(callee?.type!=='MemberExpression')continue;
-  const method=String(property(callee)??'').toLowerCase();
-  if(method!=='entries'&&method!=='getall')continue;
-  const receiver=unwrap(callee.object);
-  if(receiver?.type!=='MemberExpression'||String(property(receiver)??'').toLowerCase()!=='headers')continue;
+ const {nodes,bindings,owners,free}=analysis;
+ const MESSAGE=1,HEADERS=2,METHOD=4,CONTAINER=8;
+ const bindingTaint=new Map(),methodNames=new Map(),returnTaint=new Map(),exprTaint=new Map();
+ let changed=false;
+ const addBinding=(binding,taint,names)=>{
+  if(!binding)return;
+  if(taint){const previous=bindingTaint.get(binding)||0,next=previous|taint;if(next!==previous){bindingTaint.set(binding,next);changed=true;}}
+  if(names?.size){let known=methodNames.get(binding);if(!known){known=new Set();methodNames.set(binding,known);}for(const name of names)if(!known.has(name)){known.add(name);changed=true;}}
+ };
+ const methodName=n=>{const name=String(property(n)??'');return headerMethods.has(name.toLowerCase())?name:null;};
+ const derive=(taint,name)=>{
+  if(!taint)return 0;
+  const lower=String(name??'').toLowerCase();
+  if(taint&HEADERS&&headerMethods.has(lower))return METHOD;
+  if(taint&CONTAINER)return taint&(MESSAGE|HEADERS|METHOD);
+  if(taint&MESSAGE&&lower==='headers')return HEADERS;
+  return 0;
+ };
+ const applyPattern=(pattern,taint,names)=>{
+  if(!pattern||(!taint&&!names?.size))return;
+  if(pattern.type==='Identifier')return addBinding(bindings.get(pattern),taint,names);
+  if(pattern.type==='AssignmentPattern')return applyPattern(pattern.left,taint,names);
+  if(pattern.type==='RestElement')return applyPattern(pattern.argument,taint,names);
+  if(pattern.type==='ArrayPattern'){
+   for(const element of pattern.elements)applyPattern(element,taint&(MESSAGE|HEADERS|METHOD),names);
+   return;
+  }
+  if(pattern.type!=='ObjectPattern')return;
+  for(const entry of pattern.properties){
+   if(entry.type==='RestElement'){applyPattern(entry.argument,taint&(MESSAGE|HEADERS|METHOD|CONTAINER),names);continue;}
+   const name=key(entry),derived=derive(taint,name),method=taint&HEADERS?methodName(entry):null;
+   let nextNames=names;
+   if(method){nextNames=new Set(names??[]);nextNames.add(method);}
+   applyPattern(entry.value,derived,nextNames);
+  }
+ };
+ const patternNames=expression=>{
+  const value=unwrap(expression),method=value?.type==='MemberExpression'?methodName(value):null;
+  if(method&&(exprTaint.get(value)||0)&METHOD)return new Set([method]);
+  const binding=value?.type==='Identifier'&&bindings.get(value);
+  return binding?methodNames.get(binding):null;
+ };
+ const objectMethod=(callee,name)=>{
+  const value=unwrap(callee);
+  return value?.type==='MemberExpression'&&free(value.object,'Object')&&property(value)===name;
+ };
+ const assignTaint=args=>{
+  let target=0,sources=0;
+  args.forEach((argument,index)=>{if(argument.type==='SpreadElement')return;const value=exprTaint.get(argument)||0;if(index)sources|=value;else target|=value;});
+  let taint=target|sources;
+  if(sources&(MESSAGE|HEADERS|METHOD))taint&=~CONTAINER;
+  return taint;
+ };
+ const localFunction=callee=>{
+  let value=unwrap(callee),seen=new Set();
+  while(value){
+   if(functions.has(value.type))return value;
+   if(value.type!=='Identifier')return null;
+   const binding=bindings.get(value);if(!binding||seen.has(binding))return null;
+   seen.add(binding);
+   const fn=binding.fn??(functions.has(binding.init?.type)?binding.init:null);if(fn)return fn;
+   value=unwrap(binding.init);
+  }
+  return null;
+ };
+ const taintOf=node=>{
+  const n=unwrap(node);if(!n)return 0;
+  if(n.type==='Identifier'){
+   const binding=bindings.get(n);if(binding)return bindingTaint.get(binding)||0;
+   return free(n,'$request')||free(n,'$response')?MESSAGE:0;
+  }
+  if(n.type==='MemberExpression'){
+   const object=unwrap(n.object),name=property(n);
+   if(name!==undefined&&object?.type==='Identifier'&&object.name==='ctx'&&['request','response'].includes(String(name).toLowerCase()))return MESSAGE;
+   return derive(exprTaint.get(object)||0,name);
+  }
+  if(n.type==='LogicalExpression'||n.type==='ConditionalExpression')return (exprTaint.get(n.left)??exprTaint.get(n.test)??0)|(exprTaint.get(n.right)??exprTaint.get(n.alternate)??0);
+  if(n.type==='SequenceExpression')return exprTaint.get(n.expressions.at(-1))||0;
+  if(n.type==='AwaitExpression')return exprTaint.get(n.argument)||0;
+  if(n.type==='AssignmentExpression')return exprTaint.get(n.right)||0;
+  if(n.type==='ArrayExpression'){
+   let taint=CONTAINER;
+   for(const element of n.elements)if(element)taint|=exprTaint.get(element)||0;
+   return taint;
+  }
+  if(n.type==='ObjectExpression'){
+   let taint=CONTAINER;
+   for(const entry of n.properties)if(entry.type==='SpreadElement')taint|=exprTaint.get(entry.argument)||0;else taint|=exprTaint.get(entry.value)||0;
+   return taint;
+  }
+  if(n.type==='CallExpression'){
+   if(objectMethod(n.callee,'assign'))return assignTaint(n.arguments);
+   const fn=localFunction(n.callee);return fn?returnTaint.get(fn)||0:0;
+  }
+  return 0;
+ };
+ const methodLabel=(binding,fallback)=>{
+  const names=methodNames.get(binding);return names?.size?[...names][0]:(fallback??'entries');
+ };
+ const reject=(node,method)=>{
   const line=code.slice(0,node.start).split('\n').length;
   throw Error(`生成结果调用了真机 Headers 不存在的 .${method}()（第 ${line} 行）；只能使用大小写无关属性访问或自身可枚举键`);
+ };
+ for(let pass=0;pass<64;pass++){
+  changed=false;
+  for(let i=nodes.length-1;i>=0;i--)exprTaint.set(nodes[i],taintOf(nodes[i]));
+  for(const node of nodes){
+   if(node.type==='VariableDeclarator'&&node.init)applyPattern(node.id,exprTaint.get(node.init)||0,patternNames(node.init));
+   else if(node.type==='AssignmentExpression'&&node.operator==='=')applyPattern(node.left,exprTaint.get(node.right)||0,patternNames(node.right));
+   else if(node.type==='CallExpression'){
+    const fn=localFunction(node.callee);
+    if(fn)for(let i=0;i<fn.params.length&&i<node.arguments.length;i++){const argument=node.arguments[i];if(argument.type!=='SpreadElement')applyPattern(fn.params[i],exprTaint.get(argument)||0,patternNames(argument));}
+    if(objectMethod(node.callee,'assign')&&node.arguments.length){
+     const taint=assignTaint(node.arguments);
+     if(taint)applyPattern(node.arguments[0],taint);
+    }
+   }else if(node.type==='ReturnStatement'&&node.argument){
+    const fn=owners.get(node);if(fn){const previous=returnTaint.get(fn)||0,next=previous|(exprTaint.get(node.argument)||0);if(next!==previous){returnTaint.set(fn,next);changed=true;}}
+   }else if(functions.has(node.type)&&node.body.type!=='BlockStatement'){
+    const previous=returnTaint.get(node)||0,next=previous|(exprTaint.get(node.body)||0);if(next!==previous){returnTaint.set(node,next);changed=true;}
+   }
+  }
+  if(!changed)break;
+ }
+ for(const node of nodes){
+  if(node.type!=='CallExpression')continue;
+  const callee=unwrap(node.callee),taint=exprTaint.get(callee)||0;
+  if(taint&METHOD){
+   const method=callee.type==='MemberExpression'?String(property(callee)??''):methodLabel(bindings.get(callee));
+   reject(node,method);
+  }
+  if(callee.type==='MemberExpression'){
+   const method=methodName(callee);if(!method)continue;
+   const receiver=unwrap(callee.object),receiverTaint=exprTaint.get(receiver)||0;
+   if(receiverTaint&HEADERS&&!(receiverTaint&CONTAINER))reject(node,method);
+  }
  }
 }
 function compileNative(source,format,options){

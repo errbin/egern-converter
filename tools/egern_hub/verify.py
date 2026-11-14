@@ -8,6 +8,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import zlib
@@ -18,6 +19,7 @@ from .verification_probes import generated_cases
 from .device_parameters import device_cases
 
 ROOT = Path(__file__).resolve().parents[2]
+HEADER_METHOD_ERROR = re.compile(r'(?:entries|getAll|keys|values|forEach|has)[^\n]{0,120}?is not a function')
 
 
 def compression_vectors(fixture):
@@ -141,6 +143,11 @@ def compare(source, converted, platform, url, fixture, *, native_evaluation=()):
                 except ValueError:pass
             if value!=previous:changed=True
         result['observable_change']=changed
+    # 两边以同一 TypeError 失败并不等于等价：真机 Headers 缺失这些方法时，
+    # 原始脚本与产物会同步报错，反而会掩盖不兼容实现。必须显式判为失败。
+    if (original.get('error') and native.get('error') and original.get('error')==native.get('error')
+            and HEADER_METHOD_ERROR.search(original['error'])):
+        result.update(status='header_method_error', reason='原脚本和转换产物都调用了真机 Headers 不存在的方法')
     return result
 
 
@@ -256,7 +263,7 @@ def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
         successful=[r for r in results if r['status']=='passed']
         effective=[r for r in successful if r.get('observable_change') and (r['origin']=='curated' or
                    r.get('generation',{}).get('url_matched') or r.get('generation',{}).get('entry_matched'))]
-        failed=any(r['status'] in {'mismatch','converted_error','expectation_failed'} or (r['origin']=='curated' and r['status']!='passed') for r in results)
+        failed=any(r['status'] in {'mismatch','converted_error','expectation_failed','header_method_error'} or (r['origin']=='curated' and r['status']!='passed') for r in results)
         if failed:status='failed'
         elif not results:status='not_covered'
         elif curated and all(r['status']=='passed' for r in results):status='passed'

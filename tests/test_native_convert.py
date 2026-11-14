@@ -18,8 +18,8 @@ class NativeCompilerTests(unittest.TestCase):
     execute = execution.ScriptTests.execute
 
     def test_generated_artifacts_reject_unverified_header_methods(self):
-        # 真机 Headers 没有 entries/getAll；最终产物护栏必须同时覆盖点访问、
-        # 计算属性和可选调用，且不能误伤 Object.entries 投影。
+        # 真机 Headers 没有这些集合方法；最终产物护栏必须跟踪局部别名、解构、
+        # 函数返回值和数组/对象承载，且不能误伤 Object.entries 安全投影。
         probe = r'''import {assertNoUnverifiedHeaderCalls} from './tools/js-analysis/compiler/native.mjs';
 import assert from 'node:assert/strict';
 const unsafe = [
@@ -27,18 +27,79 @@ const unsafe = [
   'ctx.response.headers.getAll("set-cookie")',
   'ctx.request["headers"]["getAll"]("set-cookie")',
   'ctx.response?.headers?.entries?.()',
+  'const h=ctx.response.headers; h.entries();',
+  'const h=ctx.request.headers; h.getAll("set-cookie");',
+  'const {headers:h}=ctx.response; h.entries();',
+  'const {headers}=ctx.request; headers.getAll("x");',
+  'const h=ctx.response.headers; const {entries}=h; entries();',
+  'function pick(){return ctx.response.headers} pick().entries();',
+  'function identity(value){return value} identity(ctx.request.headers).getAll("x");',
+  'const box=[ctx.response.headers]; box[0].entries();',
+  'const box={headers:ctx.request.headers}; box.headers.getAll("x");',
+  'const h=Object.assign({},ctx.response.headers); h.entries();',
+  'const h={}; Object.assign(h,ctx.response.headers); h.keys();',
+  'const h=ctx.request.headers; h["entries"]();',
+  'const h=ctx.response.headers; h.keys();',
+  'const h=ctx.response.headers; h.values();',
+  'const h=ctx.response.headers; h.forEach(()=>{});',
+  'const h=ctx.response.headers; h.has("x");',
+  'const h=ctx.response.headers; const entries=h.entries; entries();',
 ];
 for (const code of unsafe) assert.throws(() => assertNoUnverifiedHeaderCalls(code), /Headers/);
 for (const code of [
   'Object.fromEntries(Object.entries(ctx.request["headers"]))',
   'Object.keys(ctx.response.headers)',
+  'Object.values(ctx.request.headers)',
   'ctx.request.headers["x-test"]',
+  'const h=ctx.response.headers; Object.entries(h)',
+  'const values=[1,2]; values.entries()',
+  'const params=new URLSearchParams(""); params.has("x")',
 ]) assert.doesNotThrow(() => assertNoUnverifiedHeaderCalls(code));
 console.log(JSON.stringify({ok: true}));
 '''
         result = subprocess.run(['node', '--input-type=module', '-e', probe], cwd=execution.ROOT,
                                 text=True, capture_output=True, check=True)
         self.assertEqual(json.loads(result.stdout), {'ok': True})
+
+    def test_header_method_alias_shapes_fail_conversion(self):
+        # 故障注入：这些输入都会在最终产物中保留宿主 Headers 方法调用，必须由
+        # 转换入口直接抛出 ConversionError，而不是留给差分 fixture 掩盖。
+        unsafe = [
+            'const l=[...$response.headers.entries()];$done({body:l.join(",")});',
+            'const h=$response.headers;const l=[...h.entries()];$done({body:l.join(",")});',
+            'const h=$response.headers;const l=h.getAll("set-cookie");$done({body:l.join(",")});',
+            'const h=$request.headers;const l=[...h.entries()];$done({body:l.join(",")});',
+            'const {entries}=$response.headers;const l=[...entries()];$done({body:l.join(",")});',
+            'const h=$response.headers;const {getAll}=h;const l=getAll("set-cookie");$done({body:l.join(",")});',
+            'function pick(){return $response.headers}const h=pick();const l=[...h.entries()];$done({body:l.join(",")});',
+            'function identity(value){return value}const l=[...identity($response.headers).entries()];$done({body:l.join(",")});',
+            'const box=[$response.headers];const l=[...box[0].entries()];$done({body:l.join(",")});',
+            'const box={headers:$response.headers};const l=[...box.headers.entries()];$done({body:l.join(",")});',
+            'const h=Object.assign({},$response.headers);const l=[...h.entries()];$done({body:l.join(",")});',
+            'const h={};Object.assign(h,$response.headers);const l=[...h.entries()];$done({body:l.join(",")});',
+            'const h=$response.headers;const l=[...h?.entries?.()];$done({body:l.join(",")});',
+            'const h=$response.headers;const l=[...h["entries"]()];$done({body:l.join(",")});',
+        ]
+        for method in ('entries', 'getAll', 'keys', 'values', 'forEach', 'has'):
+            unsafe.append(f'const h=$response.headers;const value=h.{method}("x");$done({{body:String(value)}});')
+        for source in unsafe:
+            with self.subTest(source=source), self.assertRaisesRegex(ConversionError, 'Headers'):
+                compile_source(source)
+        safe = '$done({body:Object.entries($response.headers).join(",")});'
+        self.assertIn('Object.entries(ctx.response.headers)', compile_source(safe))
+
+    def test_equal_header_method_errors_are_not_differential_equivalence(self):
+        # 2dd0e05 后原脚本与产物都会因同一缺失方法报 TypeError；差分不能把
+        # “两边同错”当成通过，否则不兼容产物会静默发布。
+        from tools.egern_hub.verify import compare
+        original = 'const h=$response.headers;const l=[...h.entries()];$done({body:l.join(",")});'
+        converted = ('export default async function(ctx){const h=ctx.response.headers;'
+                     'const l=[...h.entries()];return{body:l.join(",")};}')
+        fixture = {'name': 'header method error', 'request': {'url': 'https://example.test/'},
+                   'response': {'status': 200, 'headers': {'X-Test': 'yes'}, 'body': 'x'}}
+        result = compare(original, converted, 'surge', 'https://example.test/source.js', fixture)
+        self.assertEqual(result['status'], 'header_method_error', result)
+        self.assertEqual(result['original_error'], result['converted_error'])
 
     def test_awaited_completion_expression_runs_once(self):
         from tools.egern_hub.verify import compare
