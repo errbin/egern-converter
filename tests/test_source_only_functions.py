@@ -20,7 +20,10 @@ class SourceOnlyFunctionTests(unittest.TestCase):
             with self.subTest(source_format=source_format):
                 output = convert_script(INJECTED_FUNCTION, 'Fixture', URL, '',
                                         source_format=source_format)
-                self.assertIn('patch.toString()', output)
+                # 源码在转换开始时冻结，最终字符串必须携带原始函数文本；
+                # 运行时不再调用可能被优化改写的 patch.toString()。
+                self.assertIn('<script>(function patch(){', output)
+                self.assertNotIn('patch.toString()', output)
                 self.assertIn('window.patchMarker', output)
 
     def test_executable_or_escaped_function_remains_rejected(self):

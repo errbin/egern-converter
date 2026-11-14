@@ -1742,6 +1742,40 @@ export function lowerDiscardedSelfCheckCallbacks(source){
  return {source:output,transformations:[{kind:'discarded-self-check-shell',callbacks:edits.length,reason:'工厂与回调注入路径闭合、回调只做源码自检、包装调用结果被丢弃；短路自检回调体'}]};
 }
 
+// 本地函数被 `.toString()` 字符串化时，函数源码本身就是可观察输出；后续
+// 优化（常量内联、死分支折叠等）会改变该字符串。转换开始前把这类调用
+// 固化为原始源码字面量，既保留原始返回值，也让函数体继续参与其余证明。
+export function preserveLocalFunctionSources(source){
+ const tree=parse(source,options),ix=index(tree),replace=new Map();
+ const functionOf=(receiver,call)=>{
+  if(functions.has(receiver?.type))return receiver;
+  if(receiver?.type!=='Identifier')return null;
+  const binding=ix.bindings.get(receiver);
+  if(!binding||binding.writes.length)return null;
+  const fn=binding.fn??binding.init;
+  if(fn?.type==='FunctionDeclaration')return fn;
+  // 函数表达式必须先完成初始化，且调用与声明处于同一层；跨层/提前调用
+  // 原本可能抛错，不能用一个源码字面量替换掉该时序语义。
+  const parent=ix.parents.get(fn);
+  return functions.has(fn?.type)&&parent?.type==='VariableDeclarator'&&parent.init===fn&&
+   call.start>=fn.end&&ix.owners.get(call)===ix.owners.get(parent)?fn:null;
+ };
+ for(const node of ix.nodes){
+  if(node.type!=='CallExpression'||node.arguments.length||node.callee.type!=='MemberExpression'||node.callee.computed||property(node.callee)!=='toString')continue;
+  // 源码自检的 `toString().search(...)` 必须留给自检短路/终止门槛识别；
+  // 提前固化成字符串会隐藏这个危险构造。
+  const parent=ix.parents.get(node);
+  if(parent?.type==='MemberExpression'&&parent.object===node&&property(parent)==='search'&&
+     ix.parents.get(parent)?.type==='CallExpression'&&ix.parents.get(parent).callee===parent)continue;
+  const fn=functionOf(node.callee.object,node);
+  if(!fn)continue;
+  replace.set(node,JSON.stringify(source.slice(fn.start,fn.end)));
+ }
+ if(!replace.size)return {source,transformations:[]};
+ return {source:renderTree(source,tree,n=>replace.has(n)?{direct:true,value:replace.get(n)}:null),
+  transformations:[{kind:'preserved-function-source',calls:replace.size,reason:'本地函数被字符串化，固化为原始源码字面量'}]};
+}
+
 // 残留的源码自检无法证明终止：格式化会改变被检源码的长度与换行，
 // `(((.+)+)+)+$` 一类自检正则可能在失败路径上灾难性回溯。无论自检壳
 // 由哪种工厂/声明形态承载，只要产物里还存在“包装函数源码 -> search”

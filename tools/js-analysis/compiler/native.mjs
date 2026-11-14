@@ -12,7 +12,7 @@ import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowe
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
-import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
+import {preserveLocalFunctionSources,lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
 // Compile legacy HTTP scripts to direct Egern APIs. No runtime bridge is emitted.
@@ -23,9 +23,11 @@ export function native(source,format='surge',options={}){
 function compileNative(source,format,options){
  let libraries,stateMachineProof;
  try{
+  // 先冻结被字符串化的本地函数源码，再进入任何优化/折叠阶段。
+  const preservedSources=preserveLocalFunctionSources(source);
   // Reveal a closed, data-only Function-constructor shell before identifying
   // embedded libraries. No input body is evaluated during this reduction.
-  const functionSource=lowerFunctionConstructorSource(source);
+  const functionSource=lowerFunctionConstructorSource(preservedSources.source);
   libraries=protectLibraries(functionSource.source);
   const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
@@ -56,7 +58,7 @@ function compileNative(source,format,options){
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
   return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
-   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...preservedSources.transformations,...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[],...(stateMachineProof?{state_machine:stateMachineProof}:{})};}
 }
 function normalizeLegacyNumbers(source){
@@ -527,7 +529,6 @@ const sourceStringMethods=new Set(['replace','replaceAll','concat','includes','i
 // 是零参 toString；拼接结果存入 const，之后只流向字符串拼接或已审查的字符串
 // 方法。任何直接调用、别名、传参、动态成员或可重绑变量都会让证明失败。
 function sourceOnlyFunctionRanges(source){
- if(!source.includes('toString'))return [];
  let tree;
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});}catch{return [];}
  const {nodes,parents,bindings}=index(tree),ranges=[];
@@ -550,13 +551,34 @@ function sourceOnlyFunctionRanges(source){
   if(parent.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return stringFlowSafe(bindings.get(parent.id),seen);
   return false;
  };
+ // 源码固化会把唯一的 `fn.toString()` 引用替换为与函数原文完全相等的字符串
+ // 字面量。零引用函数若存在这样的字面量并仍流向安全的字符串通道，说明它同样
+ // 只作为源码文本注入，可以继续豁免函数体内的浏览器 API。
+ const preservedLiterals=new Map(),sourceLiterals=[];
+ for(const node of nodes){
+  if(node.type!=='Literal'||typeof node.value!=='string')continue;
+  const list=preservedLiterals.get(node.value);
+  if(list)list.push(node);else preservedLiterals.set(node.value,[node]);
+  if(node.value.includes('function')||node.value.includes('=>'))sourceLiterals.push(node);
+ }
  for(const fn of nodes){
   if(!functions.has(fn.type))continue;
   // 完成/HTTP 平台 API 仍由后续数据流分析处理；源码字符串里的这类调用若被
   // 误当成宿主完成路径会改变终止边界，因此含 `$` API 的函数不做源码豁免。
   if(hasApi(fn.start,fn.end))continue;
   const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'&&parent.init===fn?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
-  if(!binding||binding.writes.length||binding.refs.length!==1)continue;
+  if(!binding||binding.writes.length)continue;
+  if(!binding.refs.length){
+   const text=source.slice(fn.start,fn.end);
+   // 固化字面量可能随后被常量折叠进更大的字符串；此时函数原文仍是该
+   // 字符串的完整子串。精确等值优先，找不到时再接受完整子串匹配；只要
+   // 任一包含该原文的字面量进入不安全通道，就不能授予源码注入豁免。
+   const candidates=preservedLiterals.get(text)??sourceLiterals.filter(literal=>literal.value.includes(text));
+   if(!candidates.length||!candidates.every(literal=>stringUseSafe(literal,new Set())))continue;
+   ranges.push({start:fn.start,end:fn.end});
+   continue;
+  }
+  if(binding.refs.length!==1)continue;
   const use=binding.refs[0],member=parents.get(use);
   if(!member||member.type!=='MemberExpression'||member.object!==use||member.computed||property(member)!=='toString')continue;
   const call=parents.get(member);
