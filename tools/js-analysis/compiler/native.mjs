@@ -517,6 +517,57 @@ function lowerDirectPlatformForwarders(source){
  for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.replacement+output.slice(edit.end);
  return {source:output,transformations:edits.map(({api})=>({kind:'direct-platform-value-forwarder',api}))};
 }
+const sourceStringMethods=new Set(['replace','replaceAll','concat','includes','indexOf','lastIndexOf','startsWith','endsWith','slice','substring','substr','split','match','search','test','join']);
+// 证明函数只作为源码文本注入，从未在宿主执行：函数绑定只有一个引用，且该引用
+// 是零参 toString；拼接结果存入 const，之后只流向字符串拼接或已审查的字符串
+// 方法。任何直接调用、别名、传参、动态成员或可重绑变量都会让证明失败。
+function sourceOnlyFunctionRanges(source){
+ if(!source.includes('toString'))return [];
+ let tree;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});}catch{return [];}
+ const {nodes,parents,bindings}=index(tree),ranges=[];
+ const apiPositions=nodes.filter(node=>node.type==='Identifier'&&node.name.startsWith('$')).map(node=>node.start).sort((a,b)=>a-b);
+ const hasApi=(start,end)=>{let low=0,high=apiPositions.length;while(low<high){const middle=low+high>>1;if(apiPositions[middle]<start)low=middle+1;else high=middle;}return low<apiPositions.length&&apiPositions[low]<=end;};
+ const stringFlowSafe=(binding,seen=new Set())=>{
+  if(!binding||binding.writes.length||!binding.init||seen.has(binding))return false;
+  const declarator=parents.get(binding.init),declaration=parents.get(declarator);
+  if(declarator?.type!=='VariableDeclarator'||declarator.init!==binding.init||declarator.id.type!=='Identifier'||bindings.get(declarator.id)!==binding||declaration?.type!=='VariableDeclaration'||declaration.kind!=='const')return false;
+  seen=new Set(seen);seen.add(binding);
+  return binding.refs.every(ref=>stringUseSafe(ref,seen));
+ };
+ const stringUseSafe=(node,seen)=>{
+  let current=node,parent=parents.get(current);
+  while(parent&&['ParenthesizedExpression','ChainExpression'].includes(parent.type)){current=parent;parent=parents.get(current);}
+  if(!parent)return false;
+  if(parent.type==='BinaryExpression'&&parent.operator==='+'&&(parent.left===current||parent.right===current))return stringUseSafe(parent,seen);
+  if(parent.type==='TemplateLiteral'&&parent.expressions.includes(current))return stringUseSafe(parent,seen);
+  if(parent.type==='CallExpression'&&parent.arguments.includes(current)&&parent.callee.type==='MemberExpression'&&sourceStringMethods.has(property(parent.callee)))return true;
+  if(parent.type==='VariableDeclarator'&&parent.init===current&&parent.id.type==='Identifier')return stringFlowSafe(bindings.get(parent.id),seen);
+  return false;
+ };
+ for(const fn of nodes){
+  if(!functions.has(fn.type))continue;
+  // 完成/HTTP 平台 API 仍由后续数据流分析处理；源码字符串里的这类调用若被
+  // 误当成宿主完成路径会改变终止边界，因此含 `$` API 的函数不做源码豁免。
+  if(hasApi(fn.start,fn.end))continue;
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'&&parent.init===fn?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
+  if(!binding||binding.writes.length||binding.refs.length!==1)continue;
+  const use=binding.refs[0],member=parents.get(use);
+  if(!member||member.type!=='MemberExpression'||member.object!==use||member.computed||property(member)!=='toString')continue;
+  const call=parents.get(member);
+  if(!call||call.type!=='CallExpression'||call.callee!==member||call.arguments.length||call.optional)continue;
+  let top=call,next=parents.get(top);
+  while(next&&['ParenthesizedExpression','ChainExpression'].includes(next.type)){top=next;next=parents.get(top);}
+  if(!next||next.type!=='BinaryExpression'||next.operator!=='+'||next.left!==top&&next.right!==top)continue;
+  top=next;next=parents.get(top);
+  while(next&&next.type==='BinaryExpression'&&next.operator==='+'&&(next.left===top||next.right===top)){top=next;next=parents.get(top);}
+  while(next&&['ParenthesizedExpression','ChainExpression'].includes(next.type)){top=next;next=parents.get(top);}
+  if(!next||next.type!=='VariableDeclarator'||next.init!==top||next.id.type!=='Identifier')continue;
+  if(!stringFlowSafe(bindings.get(next.id)))continue;
+  ranges.push({start:fn.start,end:fn.end});
+ }
+ return ranges;
+}
 function emitNative(source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures,hostRebinds=[]}){
  const compressionFallback=lowerCompressionFallbacks(source);
  source=compressionFallback.source;
@@ -530,7 +581,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const detachedAliases=lowerDetachedGlobalObjectAliases(source);
  source=detachedAliases;
  assertSafeMissingGlobalProbes(source);
- const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper,allowNoCompletion:options.allowNoCompletion});
+ const sourceOnlyRanges=sourceOnlyFunctionRanges(source);
+ const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper,allowNoCompletion:options.allowNoCompletion,sourceOnlyRanges});
  if(report.errors.length)throw Error(report.errors.join('；'));
  const comments=[];
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true,onComment:comments}),ix=index(tree);

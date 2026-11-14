@@ -740,6 +740,10 @@ function fold(source,format,options,qxHint){
   if(n.type==='LogicalExpression'){
    const a=value(n.left);
    const b=value(n.right);
+   // 宿主请求/响应对象是完成上下文里的特殊值：`$response || {}` 这类回退
+   // 表达式必须原样保留，交给原生分析按字段闭合规则处理；若折成括号包裹的
+   // 宿主值，会丢失“仅作回退探测”的语义并被误判为整体传递。
+   if(['||','??'].includes(n.operator)&&(ix.free(n.left,'$request')||ix.free(n.left,'$response')))return;
    if(n.operator==='&&'&&b===false&&pureRead(n.left))return {direct:true,value:'false'};
    if(n.operator==='||'&&b===true&&pureRead(n.left))return {direct:true,value:'true'};
    if(a===PRESENT_VERSION&&n.operator==='&&')return {children:[n.right],render:child=>'('+child(n.right)+')'};

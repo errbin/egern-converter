@@ -1353,3 +1353,178 @@ export function regeneratorStateMachine(ix,source){
  return {detected:machines.length,proved:machines.length>0&&gaps.length===0,machines,gaps,release:false,
   summary:{machines:machines.length,proved:machines.filter(machine=>machine.proved).length,states:machines.reduce((sum,machine)=>sum+machine.states,0),reachableStates:machines.reduce((sum,machine)=>sum+machine.reachableStates,0),edges:machines.reduce((sum,machine)=>sum+machine.edges_count,0),saveSlots:machines.reduce((sum,machine)=>sum+machine.saveSlots.length,0),driveCount:runtimeInfo.driveCount??0,externalDrives:runtimeInfo.externalDrives??0}};
 }
+
+// 静态常量证明：只读取闭合字面量表与单条 return 的闭合谓词，不执行输入。
+// 任何动态键、改绑、成员写入、未知调用或副作用都返回 unknown。
+export const CONSTANT_UNKNOWN=Symbol('constant-unknown');
+
+const closedTableCache=new WeakMap(),closedLiteralCache=new WeakMap();
+// 闭合字面量表只能通过静态成员读取，且任何成员都不得被赋值/更新/删除；
+// 否则同名属性的当前值不再由初始化器决定。整体别名或动态键都会让证明失效。
+function closedTable(ix,binding){
+ if(closedTableCache.has(binding))return closedTableCache.get(binding);
+ let closed=!binding.writes.length;
+ if(closed)for(const ref of binding.refs){
+  const member=ix.parents.get(ref);
+  if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined){closed=false;break;}
+  const use=ix.parents.get(member);
+  if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'){closed=false;break;}
+ }
+ closedTableCache.set(binding,closed);
+ return closed;
+}
+function closedLiteral(object){
+ if(closedLiteralCache.has(object))return closedLiteralCache.get(object);
+ const names=new Set();
+ let closed=true;
+ for(const entry of object.properties){
+  if(entry.type!=='Property'||entry.kind!=='init'||entry.method){closed=false;break;}
+  const name=key(entry);
+  if(name===undefined||name==='__proto__'||names.has(String(name))){closed=false;break;}
+  names.add(String(name));
+ }
+ closedLiteralCache.set(object,closed);
+ return closed;
+}
+
+function instanceValueTruth(value){
+ if(value===CONSTANT_UNKNOWN||value?.late)return null;
+ return value&&typeof value==='object'?true:!!value;
+}
+
+export function constantValue(ix,node,environment=new Map(),seen=new Set(),depth=0){
+ if(!node||depth>12||seen.has(node))return CONSTANT_UNKNOWN;
+ if(node.type==='Literal'){
+  if(node.regex)return CONSTANT_UNKNOWN;
+  return node.value;
+ }
+ if(node.type==='TemplateLiteral'&&!node.expressions.length)return node.quasis[0]?.value.cooked??CONSTANT_UNKNOWN;
+ if(node.type==='ParenthesizedExpression'||node.type==='ChainExpression')return constantValue(ix,node.expression,environment,seen,depth+1);
+ if(node.type==='Identifier'){
+  const binding=ix.bindings.get(node);
+  if(environment.has(binding))return environment.get(binding);
+  if(node.name==='undefined'&&ix.free(node))return undefined;
+  if(!binding||binding.writes.length||!binding.init)return CONSTANT_UNKNOWN;
+  const declarator=ix.parents.get(binding.init),statement=ix.parents.get(declarator);
+  if(statement?.type!=='VariableDeclaration'||!initializedAfter(ix,statement,node)){
+   // 对象/函数初始化前读取会直接抛出；只要后续成员读取真正完成，值必然来自
+   // 初始化器。保留 late 标记，禁止把未初始化对象本身当作确定真值使用。
+   if(binding.init.type==='ObjectExpression')return {object:binding.init,binding,late:true};
+   if(functions.has(binding.init.type))return {fn:binding.init,late:true};
+   return CONSTANT_UNKNOWN;
+  }
+  const value=constantValue(ix,binding.init,environment,new Set([...seen,node]),depth+1);
+  // 成员读取必须携带声明绑定，才能让 closedTable 看到整体逃逸或成员写入。
+  // 别名初始化器已解析出真实表绑定时保留它，避免把别名绑定误当作根表。
+  if(value?.object&&value.binding===undefined)return {...value,binding};
+  return value;
+ }
+ if(node.type==='ObjectExpression')return {object:node};
+ if(functions.has(node.type))return {fn:node};
+ if(node.type==='MemberExpression'){
+  const name=property(node);
+  if(typeof name!=='string'&&typeof name!=='number')return CONSTANT_UNKNOWN;
+  const object=constantValue(ix,node.object,environment,seen,depth+1);
+  if(!object?.object)return CONSTANT_UNKNOWN;
+  if(object.binding&&!closedTable(ix,object.binding))return CONSTANT_UNKNOWN;
+  if(!closedLiteral(object.object)||name==='__proto__')return CONSTANT_UNKNOWN;
+  const entries=object.object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)!==undefined&&String(key(entry))===String(name));
+  if(entries.length!==1)return CONSTANT_UNKNOWN;
+  return constantValue(ix,entries[0].value,environment,new Set([...seen,node]),depth+1);
+ }
+ if(node.type==='UnaryExpression'){
+  if(node.operator==='void')return undefined;
+  const value=constantValue(ix,node.argument,environment,seen,depth+1);
+  if(value===CONSTANT_UNKNOWN)return CONSTANT_UNKNOWN;
+  if(value?.late)return CONSTANT_UNKNOWN;
+  if(value&&typeof value==='object')return node.operator==='typeof'?(value.fn?'function':'object'):CONSTANT_UNKNOWN;
+  if(node.operator==='typeof')return typeof value;
+  if(node.operator==='!')return !value;
+  if(node.operator==='+')return +value;
+  if(node.operator==='-')return -value;
+  if(node.operator==='~')return ~value;
+  return CONSTANT_UNKNOWN;
+ }
+ if(node.type==='LogicalExpression'){
+  const left=constantValue(ix,node.left,environment,seen,depth+1);
+  if(left===CONSTANT_UNKNOWN)return CONSTANT_UNKNOWN;
+  const truthy=instanceValueTruth(left);
+  if(truthy===null)return CONSTANT_UNKNOWN;
+  if(node.operator==='&&')return truthy?constantValue(ix,node.right,environment,seen,depth+1):left;
+  if(node.operator==='||')return truthy?left:constantValue(ix,node.right,environment,seen,depth+1);
+  if(node.operator==='??')return left===null||left===undefined?constantValue(ix,node.right,environment,seen,depth+1):left;
+  return CONSTANT_UNKNOWN;
+ }
+ if(node.type==='ConditionalExpression'){
+  const test=constantValue(ix,node.test,environment,seen,depth+1);
+  if(test===CONSTANT_UNKNOWN)return CONSTANT_UNKNOWN;
+  const truthy=instanceValueTruth(test);
+  if(truthy===null)return CONSTANT_UNKNOWN;
+  return constantValue(ix,truthy?node.consequent:node.alternate,environment,seen,depth+1);
+ }
+ if(node.type==='BinaryExpression'){
+  const left=constantValue(ix,node.left,environment,seen,depth+1);
+  if(left===CONSTANT_UNKNOWN)return CONSTANT_UNKNOWN;
+  const right=constantValue(ix,node.right,environment,seen,depth+1);
+  if(right===CONSTANT_UNKNOWN)return CONSTANT_UNKNOWN;
+  if(left?.late||right?.late)return CONSTANT_UNKNOWN;
+  const primitive=value=>value===null||!['object','function'].includes(typeof value);
+  if(!primitive(left)||!primitive(right)){
+   if(['===','!=='].includes(node.operator)&&typeof left==='object'&&typeof right==='object'&&left.object&&right.object&&left.object===right.object)return node.operator==='===';
+   return CONSTANT_UNKNOWN;
+  }
+  switch(node.operator){
+   case '===':return left===right;
+   case '!==':return left!==right;
+   case '==':return left==right;
+   case '!=':return left!=right;
+   case '<':return left<right;
+   case '<=':return left<=right;
+   case '>':return left>right;
+   case '>=':return left>=right;
+   case '+':return left+right;
+   default:return CONSTANT_UNKNOWN;
+  }
+ }
+ if(node.type==='CallExpression'){
+  const callee=constantValue(ix,node.callee,environment,seen,depth+1);
+  if(!callee?.fn||node.optional||node.arguments.some(argument=>argument.type==='SpreadElement'))return CONSTANT_UNKNOWN;
+  const fn=callee.fn;
+  if(fn.async||fn.generator||fn.params.some(parameter=>parameter.type!=='Identifier')||fn.params.length!==node.arguments.length)return CONSTANT_UNKNOWN;
+  const values=node.arguments.map(argument=>constantValue(ix,argument,environment,seen,depth+1));
+  if(values.some(value=>value===CONSTANT_UNKNOWN))return CONSTANT_UNKNOWN;
+  const local=new Map();
+  fn.params.forEach((parameter,index)=>local.set(ix.bindings.get(parameter),values[index]));
+  const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+  if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return CONSTANT_UNKNOWN;
+  return constantValue(ix,statements[0].argument,local,new Set([...seen,fn]),depth+1);
+ }
+ return CONSTANT_UNKNOWN;
+}
+
+export function constantTruth(ix,node,environment,seen){
+ return instanceValueTruth(constantValue(ix,node,environment,seen));
+}
+
+// 沿父链检查该节点是否只位于已证明不可达的分支：if/条件表达式的未选分支、
+// 逻辑短路后不会求值的右侧。未知条件一律视为可达。
+export function provablyDead(ix,node,cache){
+ if(cache?.has(node))return cache.get(node);
+ let dead=false;
+ for(let child=node,parent=ix.parents.get(child);parent;child=parent,parent=ix.parents.get(parent)){
+  if(parent.type==='IfStatement'){
+   const truth=constantTruth(ix,parent.test);
+   if(child===parent.consequent&&truth===false){dead=true;break;}
+   if(child===parent.alternate&&truth===true){dead=true;break;}
+  }else if(parent.type==='ConditionalExpression'){
+   const truth=constantTruth(ix,parent.test);
+   if(child===parent.consequent&&truth===false){dead=true;break;}
+   if(child===parent.alternate&&truth===true){dead=true;break;}
+  }else if(parent.type==='LogicalExpression'&&child===parent.right){
+   const left=constantTruth(ix,parent.left);
+   if(parent.operator==='&&'&&left===false||parent.operator==='||'&&left===true){dead=true;break;}
+  }
+ }
+ cache?.set(node,dead);
+ return dead;
+}

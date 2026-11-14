@@ -1,5 +1,6 @@
 import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument} from '../core/ast.mjs';
+import {provablyDead} from '../analysis/values.mjs';
 import {methodContract} from './clients.mjs';
 import {platformFold} from './globals.mjs';
 import {simplify} from '../transforms/simplify.mjs';
@@ -884,11 +885,24 @@ function platformProbe(method,ix){
  walk(body[0].argument,null);
  return valid&&sawTypeof&&sawTarget;
 }
+// 部分 Env 把平台直接写死为常量，例如 getEnv(){return "Surge"}。这种情况下
+// 探测结果本身已经是目标平台，不依赖任何宿主能力；只接受无表达式模板或字符串
+// 字面量且必须等于折叠目标，避免把写死其它平台或动态拼接的脚本误折到 Surge。
+function constantPlatformProbe(method){
+ if(!method||method.kind!=='method'||method.value.params.length||method.value.async||method.value.generator)return false;
+ const body=method.value.body?.body;
+ if(body?.length!==1||body[0].type!=='ReturnStatement')return false;
+ const expression=body[0].argument;
+ const value=expression?.type==='Literal'&&typeof expression.value==='string'?expression.value
+  :expression?.type==='TemplateLiteral'&&!expression.expressions.length&&expression.quasis.length===1?expression.quasis[0].value.cooked:null;
+ return value===FOLDED_PLATFORM;
+}
 // 识别"工厂返回封闭 class 实例"的多平台 Env：实例只能通过静态成员访问，不能整体
 // 传递、枚举或改绑；平台探测方法必须唯一且可静态验证；class 内不允许动态 this 成员。
 // 任一条件不成立即跳过整个候选，保持原文并让后续分析继续拒绝。
 function multiPlatformEnv(ix,source){
  const {nodes,parents,bindings,owners}=ix,candidates=[];
+ const deadCache=new WeakMap();
  // 打包器偶尔把实例临时存进局部别名，仅用于在后续 `.call` 中保留接收者。
  // 别名必须只有这一次写入、没有初始化，并且所有读取都只是静态成员或 `.call`
  // 的第一个参数；任何重绑、动态成员、方法写入或其它逃逸都让整个候选失效。
@@ -945,7 +959,7 @@ function multiPlatformEnv(ix,source){
    methodList.push(element);
   }
   if(!valid||!methodList.length)continue;
-  const probes=[...methods].filter(([,method])=>platformProbe(method,ix));
+  const probes=[...methods].filter(([,method])=>platformProbe(method,ix)||constantPlatformProbe(method));
   if(probes.length!==1)continue;
   const [probeName,probeMethod]=probes[0];
   const predicates=new Map();
@@ -980,10 +994,15 @@ function multiPlatformEnv(ix,source){
    const construction=parents.get(ref);
    if(construction?.type!=='NewExpression'||construction.callee!==ref){valid=false;break;}
    const declarator=parents.get(construction),declaration=parents.get(declarator);
-   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'||declaration.declarations.length!==1){valid=false;break;}
+   // 旧脚本常把 Env 实例和正文临时变量写在同一条 var 声明里。实例封闭性
+   // 只取决于该 declarator 自己的初始化与后续读取，兄弟声明不参与证明。
+   if(declarator?.type!=='VariableDeclarator'||declarator.init!==construction||declarator.id.type!=='Identifier'||declaration?.type!=='VariableDeclaration'){valid=false;break;}
    const instance=bindings.get(declarator.id);
-   if(!instance||!instance.refs.length||instance.writes.length){valid=false;break;}
+   if(!instance||!instance.refs.length){valid=false;break;}
+   const liveWrites=instance.writes.filter(write=>!provablyDead(ix,write,deadCache));
+   if(liveWrites.length){valid=false;break;}
    for(const use of instance.refs){
+    if(provablyDead(ix,use,deadCache))continue;
     const receiver=receiverMember(use);
     if(!receiver){valid=false;break;}
     const {member,aliased}=receiver;

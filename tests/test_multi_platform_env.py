@@ -73,6 +73,48 @@ const runtime = new Env('fixture');
 runtime.done({body: runtime.http.get('key') + runtime.http.post('key')});
 '''
 
+CONSTANT_PROBE_FIXTURE = '''function Env(name) {
+  return new class {
+    constructor(name) { this.name = name; }
+    getEnv() { return 'Surge'; }
+    isNode() { return this.getEnv() === 'Node.js'; }
+    getdata(key) {
+      if (this.isNode()) return require('fs').readFileSync(key, 'utf8');
+      return $persistentStore.read(key);
+    }
+    done(value) { $done(value); }
+  }(name);
+}
+const runtime = new Env('fixture');
+runtime.done({body: runtime.getdata('key')});
+'''
+
+DEAD_INSTANCE_FIXTURE = '''function Env(name) {
+  return new class {
+    constructor(name) { this.name = name; }
+    getEnv() {
+      return typeof $environment !== 'undefined' && $environment['surge-version'] ? 'Surge'
+        : typeof $task !== 'undefined' ? 'Quantumult X' : 'Node.js';
+    }
+    isNode() { return this.getEnv() === 'Node.js'; }
+    getdata(key) {
+      if (this.isNode()) return require('fs').readFileSync(key, 'utf8');
+      return $persistentStore.read(key);
+    }
+    done(value) { $done(value); }
+  }(name);
+}
+const ops = {key: 'target', same: function (a, b) { return a === b; }};
+let runtime = new Env('fixture');
+if (ops.same(ops.key, 'target')) runtime.done({body: runtime.getdata('key')});
+else runtime = null;
+'''
+
+SIMPLIFY_FIXTURE = '''const ops = {key: 'target', same: function (a, b) { return a === b; }};
+if (ops.same(ops.key, 'target')) keep();
+else decoy();
+'''
+
 
 def fold(source):
     result = subprocess.run(
@@ -253,6 +295,74 @@ class MultiPlatformEnvTests(unittest.TestCase):
         data = fold(changed)
         self.assertGreater(data['normalized'], 0)
         self.assertEqual(data['stages']['normalize']['source'].count('mark()'), 1)
+
+    def test_constant_platform_probe_folds_only_surge(self):
+        self.assert_folded(CONSTANT_PROBE_FIXTURE)
+        for replacement in ["return 'Node.js';", 'return `Sur${ge}`;', "return 'Surge' + '';"]:
+            changed = CONSTANT_PROBE_FIXTURE.replace("return 'Surge';", replacement)
+            self.assertNotEqual(changed, CONSTANT_PROBE_FIXTURE)
+            with self.subTest(replacement=replacement):
+                self.assert_unknown(changed)
+
+    def test_instance_declaration_may_share_a_var_statement(self):
+        changed = CLASS_FIXTURE.replace(
+            "const runtime = new Env('fixture');\nruntime.done({body: runtime.getdata('key')});",
+            "const runtime = new Env('fixture'), payload = {value: 1};\n"
+            "runtime.done({body: runtime.getdata('key') + payload.value});",
+        )
+        self.assertNotEqual(changed, CLASS_FIXTURE)
+        self.assert_folded(changed)
+
+    def test_sibling_declarations_do_not_bypass_instance_closure(self):
+        for replacement in [
+            "const runtime = new Env('fixture'), alias = runtime;\nuse(alias);\n"
+            "runtime.done({body: runtime.getdata('key')});",
+            "const runtime = new Env('fixture'), other = new Env('other');\nuse(other);\n"
+            "runtime.done({body: runtime.getdata('key')});",
+        ]:
+            changed = CLASS_FIXTURE.replace(
+                "const runtime = new Env('fixture');\nruntime.done({body: runtime.getdata('key')});",
+                replacement,
+            )
+            self.assertNotEqual(changed, CLASS_FIXTURE)
+            with self.subTest(replacement=replacement):
+                self.assert_unknown(changed)
+
+    def test_closed_dead_branch_write_does_not_break_instance_closure(self):
+        self.assert_folded(DEAD_INSTANCE_FIXTURE)
+        data = fold(DEAD_INSTANCE_FIXTURE)
+        self.assertNotIn('runtime = null', data['stages']['simplify']['source'])
+
+    def test_unknown_or_mutated_predicate_branch_still_rejects(self):
+        replacements = [
+            ("if (ops.same(ops.key, 'target'))", 'if (unknown())'),
+            ("const ops = {key: 'target', same: function (a, b) { return a === b; }};",
+             "const ops = {key: 'target', same: function (a, b) { return a === b; }};\nops.key = 'other';"),
+            ("same: function (a, b) { return a === b; }",
+             "same: function (a, b) { sideEffect(); return a === b; }"),
+        ]
+        for before, after in replacements:
+            changed = DEAD_INSTANCE_FIXTURE.replace(before, after)
+            self.assertNotEqual(changed, DEAD_INSTANCE_FIXTURE)
+            with self.subTest(after=after):
+                self.assert_unknown(changed)
+
+    def test_simplify_removes_only_closed_predicate_dead_branches(self):
+        data = fold(SIMPLIFY_FIXTURE)
+        self.assertNotIn('error', data)
+        self.assertNotIn('decoy()', data['stages']['simplify']['source'])
+        counterexamples = [
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};\n"
+            "ops.key = 'other';\nif (ops.same(ops.key, 'target')) keep();\nelse decoy();",
+            "const ops = {key: 'target', same: function (a, b) { return a === b; }};\n"
+            "unknown(ops);\nif (ops.same(ops.key, 'target')) keep();\nelse decoy();",
+            "if (unknown()) keep();\nelse decoy();",
+        ]
+        for source in counterexamples:
+            with self.subTest(source=source):
+                data = fold(source)
+                self.assertNotIn('error', data)
+                self.assertIn('decoy()', data['stages']['simplify']['source'])
 
 
 if __name__ == '__main__':

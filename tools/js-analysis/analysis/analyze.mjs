@@ -61,6 +61,11 @@ const members={
   $network:new Set(['wifi','v4','v6','dns','cellular-data'])
 };
 const staticProperty=n=>n.computed?(n.property.type==='Literal'?n.property.value:undefined):n.property.name;
+// 仅源码字符串化的函数体由编译器预先证明并传入区间。其中的浏览器/Node 全局
+// 只会出现在注入后的字符串里，不在宿主转换结果中求值；区间之外的任何引用仍
+// 按普通运行时依赖拒绝。
+const sourceOnlyRanges=options.sourceOnlyRanges??[];
+const sourceOnlyContext=node=>sourceOnlyRanges.some(range=>node.start>=range.start&&node.end<=range.end);
 const standardPrototypes=new Set(['Object','Date','String','Number','Boolean','Array','RegExp','Map','Set','Promise','Error','TypeError','RangeError','ArrayBuffer','DataView','Uint8Array','Uint16Array','Uint32Array','Int8Array','Int16Array','Int32Array','Float32Array','Float64Array']);
 const ordinary=options.nativeMethods?ordinaryReceivers(tree,options.nativeLibraryValues):null;
 const boundNames=new Set(nodes.filter(({node})=>node.type==='Identifier'&&bindings.has(node)).map(({node})=>node.name));
@@ -115,7 +120,7 @@ for(const {node:n,parent:p,key} of nodes) {
     // observable ordering. String callbacks still imply dynamic code.
     const nativeTimer=options.nativeStandardGlobals&&n.name==='setTimeout'&&p?.type==='CallExpression'&&p.callee===n&&[1,2].includes(p.arguments.length)&&callback?.type!=='Literal'&&(['Identifier','ArrowFunctionExpression','FunctionExpression','CallExpression','MemberExpression','ConditionalExpression','LogicalExpression','SequenceExpression'].includes(callback?.type)||boundCallback);
     const nativeEvaluation=options.nativeStandardGlobals&&['eval','Function'].includes(n.name);
-    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!installedGlobalRead&&!dynamicFunctionThis&&!privateGlobalWrite&&!nativeTimer&&!nativeEvaluation)reasons.add('运行环境或动态/异步依赖：'+n.name);
+    if(forbidden.has(n.name)&&!(options.nativeBundle&&n.name==='globalThis')&&!standardGlobal&&!installedGlobalRead&&!dynamicFunctionThis&&!privateGlobalWrite&&!nativeTimer&&!nativeEvaluation&&!sourceOnlyContext(n))reasons.add('运行环境或动态/异步依赖：'+n.name);
     if(n.name==='$done')done=true;
     if(n.name==='$task'||n.name==='$httpClient')asynchronous=true;
     if(members[n.name]) {

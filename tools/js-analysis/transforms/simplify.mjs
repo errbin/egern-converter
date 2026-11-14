@@ -1,6 +1,7 @@
 import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,initializedAfter} from '../core/ast.mjs';
 import {evaluationBindings} from './evaluation.mjs';
+import {CONSTANT_UNKNOWN,constantValue} from '../analysis/values.mjs';
 
 // Scope-aware static simplification. Input code is never executed.
 
@@ -134,6 +135,12 @@ export function simplify(source){
     const frame=stack.at(-1),n=frame.node;
     if(frame.state==='start'){
      if(!n){complete(UNKNOWN);continue;}
+     // 闭合对象表成员与单条 return 的闭合谓词可以静态求值；只接受原始值，
+     // 对象/函数描述符仍交给后续规则，避免把可变引用当成常量。
+     if(n.type==='MemberExpression'||n.type==='CallExpression'||n.type==='TemplateLiteral'&&!n.expressions.length){
+      const value=constantValue(ix,n);
+      if(value!==CONSTANT_UNKNOWN&&(value===null||!['object','function'].includes(typeof value))){complete(value);continue;}
+     }
      if(n.type==='Literal'){complete(n.value);continue;}
      if(n.type==='Identifier'&&n.name==='undefined'&&ix.free(n)){complete(undefined);continue;}
      if(n.type==='Identifier'){
