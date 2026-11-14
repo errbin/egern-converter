@@ -20,6 +20,23 @@ import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 export function native(source,format='surge',options={}){
  return withSyntaxCache(()=>compileNative(source,format,options));
 }
+// 真机 Headers 只提供大小写无关属性访问，不提供 entries/getAll。所有生成
+// 路径一经修复仍可能在后续改动中回归，因此在最终产物（含公共库恢复）上做
+// 一次统一拒绝，避免差分 fixture 再次掩盖宿主不存在的方法。
+export function assertNoUnverifiedHeaderCalls(code,analysis=index(parse(code,{ecmaVersion:'latest',sourceType:'module'}))){
+ const unwrap=n=>n?.type==='ChainExpression'?unwrap(n.expression):n;
+ for(const node of analysis.nodes){
+  if(node.type!=='CallExpression')continue;
+  const callee=unwrap(node.callee);
+  if(callee?.type!=='MemberExpression')continue;
+  const method=String(property(callee)??'').toLowerCase();
+  if(method!=='entries'&&method!=='getall')continue;
+  const receiver=unwrap(callee.object);
+  if(receiver?.type!=='MemberExpression'||String(property(receiver)??'').toLowerCase()!=='headers')continue;
+  const line=code.slice(0,node.start).split('\n').length;
+  throw Error(`生成结果调用了真机 Headers 不存在的 .${method}()（第 ${line} 行）；只能使用大小写无关属性访问或自身可枚举键`);
+ }
+}
 function compileNative(source,format,options){
  let libraries,stateMachineProof;
  try{
@@ -2131,7 +2148,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const fields=provenFields??shape(n);for(const k of fields.keys())if(!['url','method','headers','body','bodyBytes','status','response','abort'].includes(k))fail(n,'不支持的完成字段：'+k);
   if(fields.hostRequest&&!fields.variants?.length){
    const value=reference??render(n),body=readBody('$request','body');
-   return `((${value}) => ({url: ${value}.url, ...(${value}.method === undefined ? {} : {method: ${value}.method}), ...(${value}.headers === undefined ? {} : {headers: ((${value}.headers && typeof ${value}.headers.entries === 'function') ? Object.fromEntries(${value}.headers.entries()) : {...${value}.headers})}), ...(${body} === undefined ? {} : {body: ${body}})}))(${value})`;
+   return `((${value}) => ({url: ${value}.url, ...(${value}.method === undefined ? {} : {method: ${value}.method}), ...(${value}.headers === undefined ? {} : {headers: Object.fromEntries(Object.entries(${value}.headers ?? {}))}), ...(${body} === undefined ? {} : {body: ${body}})}))(${value})`;
   }
   if(fields.variants?.length>1){
    const value=reference??fresh('completionValue');
@@ -4129,7 +4146,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const info={uses:fields,body:fields.has('body')?fresh('responseText'):null,bytes:fields.has('bodyBytes')||fields.has('body')?fresh('responseBytes'):null,snapshot:true,promiseForward:true,fn};
   httpReplies.set(binding,info);if(info.body||info.bytes)asyncFns.add(fn);return info;
  }
- function forwardedHeaders(raw){return `Object.fromEntries([...${raw}.headers.entries()].map(([name, value]) => [name, ${raw}.headers.getAll(name).length > 1 ? ${raw}.headers.getAll(name) : value]))`;}
+ function forwardedHeaders(raw){return `Object.fromEntries(Object.entries(${raw}.headers))`;}
  function forwardedSnapshot(info,raw){
   const out=[];
   for(const name of ['status','statusCode','headers','body','bodyBytes','ok','statusText'])if(info.uses.has(name)){
@@ -4224,7 +4241,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const fields=[...info.uses].map(name=>{
     const value=name==='body'?info.body:name==='bodyBytes'?info.bytes:name==='statusCode'?`${raw}.statusCode ?? ${raw}.status`:
      name==='status'?`${raw}.status ?? ${raw}.statusCode`:
-     name==='headers'?`Object.fromEntries([...${raw}.headers.entries()].map(([field, value]) => [field, ${raw}.headers.getAll(field).length > 1 ? ${raw}.headers.getAll(field) : value]))`:
+     name==='headers'?`Object.fromEntries(Object.entries(${raw}.headers))`:
      name==='ok'?`${raw}.ok`:`${raw}.${name}`;
     return `${name}: ${value}`;
    });
@@ -4510,7 +4527,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   // Materialize only the documented callback data, not a host Response object
   // whose enumerable fields, methods and Headers implementation differ.
-  const responseHeaders=h.full?`[...${r}.headers.entries()].flatMap(([field,value])=>(${r}.headers.getAll(field).length > 1 ? ${r}.headers.getAll(field) : [value]).map(value=>({field,value})))`:`Object.fromEntries([...${r}.headers.entries()].map(([name,value])=>[name, ${r}.headers.getAll(name).length > 1 ? ${r}.headers.getAll(name) : value]))`;
+  const responseHeaders=h.full?`Object.entries(${r}.headers).flatMap(([field,value])=>(Array.isArray(value) ? value : [value]).map(value=>({field,value})))`:`Object.fromEntries(Object.entries(${r}.headers))`;
   const responseValue=snapshot?`(${r} === null ? null : {status: ${r}.status, statusCode: ${r}.status, headers: ${responseHeaders}})`:r;
   if(!complete.has(fn)||detached){
    function inExecutor(owner,seen=new Set()){
@@ -4810,12 +4827,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const hostResponseReads=proveHostResponseSnapshot();
  if(hostRequestReads){
   hostRequestSnapshot=fresh('hostRequest');
-  const headers=`(() => {const value = ${context}.request.headers;if (value && typeof value.entries === 'function') {const result = Object.create(null);for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return Object.assign(Object.create(null), value ?? {});})()`;
+  const headers=`Object.fromEntries(Object.entries(${context}.request.headers ?? {}))`;
   hostRequestInitializers=[`const ${hostRequestSnapshot} = {${[...hostRequestReads].map(field=>field==='body'?`body: ${readBody('$request','body')}`:field==='bodyBytes'?`bodyBytes: ${readBody('$request','bodyBytes')}`:field==='headers'?`headers: ${headers}`:`${JSON.stringify(field)}: ${context}.request[${JSON.stringify(field)}]`).join(', ')}};`];
  }
  if(hostResponseReads){
   hostResponseSnapshot=fresh('hostResponse');
-  const headers=`(() => {const value = ${context}.response?.headers;if (value && typeof value.entries === 'function') {const result = {};for (const [name, headerValue] of value.entries()) {if (result[name] === undefined) result[name] = headerValue;else result[name] = Array.isArray(result[name]) ? [...result[name], headerValue] : [result[name], headerValue];}return result;}return {...(value ?? {})};})()`;
+  const headers=`Object.fromEntries(Object.entries(${context}.response?.headers ?? {}))`;
   const raw=`${context}.response`;
   hostResponseInitializers=[`const ${hostResponseSnapshot} = ${raw} == null ? null : {status: ${raw}.status, statusCode: ${raw}.status, headers: ${headers}, body: ${readBody('$response','body')}, bodyBytes: ${readBody('$response','bodyBytes')}, ok: /^2\\d\\d$/.test(String(${raw}.status)), statusText: ${raw}.statusText ?? ''};`];
  }
@@ -4854,6 +4871,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  }else formatted=formatNative(code);
  formatted=libraries.restore(formatted);
  const restored=index(parse(formatted,{ecmaVersion:'latest',sourceType:'module'}));
+ assertNoUnverifiedHeaderCalls(formatted,restored);
  if(restored.nodes.some(n=>restored.free(n)&&n.name.startsWith('$')))throw Error('公共库恢复后残留平台 API');
  return {errors:[],code:formatted,documentation,apis:report.apis,asynchronous:report.asynchronous||lifted.size>0,mode:'native',libraries:libraries.blocks,device_type_parameter:device.deviceParameter,verification_format:pipeline.verificationFormat};
 }

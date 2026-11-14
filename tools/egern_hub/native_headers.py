@@ -19,9 +19,16 @@ def dependencies_for(obj, defaults, repository, ref, origin, path):
             value = f'ctx.env.value{i}'
             if row['action'] != 'del':
                 env['value'+str(i)] = row['value']
-            operation = {'del':f'headers.delete({field});',
-                         'add':f'if (headers.has({field})) headers.append({field}, {value}); else headers.set({field}, {value});',
-                         'replace':f'if (headers.has({field})) {{ const count = headers.getAll({field}).length; headers.set({field}, {value}); for (let n = 1; n < count; n++) headers.append({field}, {value}); }}'}[row['action']]
+            # 只依赖大小写无关属性访问与自身可枚举键，避免调用真机未提供的 Headers 方法。
+            operation = {
+                'del': f'for (const key of Object.keys(headers)) if (key.toLowerCase() === {field}.toLowerCase()) delete headers[key];',
+                'add': (f'const key = Object.keys(headers).find(k => k.toLowerCase() === {field}.toLowerCase()); '
+                        f'const current = key === undefined ? undefined : headers[key]; '
+                        f'headers[key ?? {field}] = key === undefined ? {value} : Array.isArray(current) ? [...current, {value}] : [current, {value}];'),
+                'replace': (f'for (const key of Object.keys(headers)) '
+                            f'if (key.toLowerCase() === {field}.toLowerCase()) '
+                            f'headers[key] = Array.isArray(headers[key]) ? headers[key].map(() => {value}) : {value};'),
+            }[row['action']]
             if row.get('flags'):
                 env[f'flags{i}']=row['flags']
             code.append(f'  if (new RegExp(ctx.env.match{i}, ctx.env.flags{i} || "").test(ctx.request.url)) {{ {operation} }}')

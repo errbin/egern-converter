@@ -27,7 +27,7 @@ const result=finish($response); $done({body:result.body});''',
         source = '''function snapshot(response){return {status:response.status,headers:{...response.headers}}}
 const result=snapshot($response);$done({body:JSON.stringify(result.headers)});'''
         native = self.convert(source)
-        self.assertIn('ctx.response["headers"].entries()', native)
+        self.assertIn('Object.fromEntries(Object.entries(ctx.response["headers"]))', native)
         self.assertIn('ctx.response["status"]', native)
 
     def test_whole_response_may_reach_closed_field_helper(self):

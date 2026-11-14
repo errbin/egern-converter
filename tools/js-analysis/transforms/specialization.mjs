@@ -224,7 +224,7 @@ export function lowerMessageParameters(source){
   const fields=new Set();let valid=true;
   for(const r of parameter.refs){const member=parents.get(r),key=property(member);if(member?.type!=='MemberExpression'||member.object!==r||!['url','method','headers','body','bodyBytes','status','statusCode'].includes(key)){valid=false;break;}fields.add(key);}
   if(valid)replace.set(ref,'{'+[...fields].map(key=>{
-   const value=key==='headers'?`Object.fromEntries([...${kind}["headers"].entries()].map(([name, value]) => [name, ${kind}["headers"].getAll(name).length > 1 ? ${kind}["headers"].getAll(name) : value]))`:`${kind}[${JSON.stringify(key)}]`;
+   const value=key==='headers'?`Object.fromEntries(Object.entries(${kind}["headers"]))`:`${kind}[${JSON.stringify(key)}]`;
    return JSON.stringify(key)+':'+value;
   }).join(', ')+'}');
  }
@@ -346,7 +346,7 @@ export function lowerClosedMessageObjects(source){
   const calls=[];for(const ref of binding.refs){const call=parents.get(ref);if(call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement'))return null;calls.push(call);}
   return calls;
  }
- function headerValue(kind){const value=`${kind}["headers"]`;return `Object.fromEntries([...${value}.entries()].map(([name, value]) => [name, ${value}.getAll(name).length > 1 ? ${value}.getAll(name) : value]))`;}
+ function headerValue(kind){return `Object.fromEntries(Object.entries(${kind}["headers"]))`;}
  function objectLiteral(kind,fields){
   return '{'+[...fields].map(field=>JSON.stringify(field)+': '+(field==='headers'?headerValue(kind):`${kind}[${JSON.stringify(field)}]`)).join(', ')+'}';
  }

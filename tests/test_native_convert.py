@@ -17,6 +17,29 @@ def compile_source(source, **options):
 class NativeCompilerTests(unittest.TestCase):
     execute = execution.ScriptTests.execute
 
+    def test_generated_artifacts_reject_unverified_header_methods(self):
+        # 真机 Headers 没有 entries/getAll；最终产物护栏必须同时覆盖点访问、
+        # 计算属性和可选调用，且不能误伤 Object.entries 投影。
+        probe = r'''import {assertNoUnverifiedHeaderCalls} from './tools/js-analysis/compiler/native.mjs';
+import assert from 'node:assert/strict';
+const unsafe = [
+  'ctx.request["headers"].entries()',
+  'ctx.response.headers.getAll("set-cookie")',
+  'ctx.request["headers"]["getAll"]("set-cookie")',
+  'ctx.response?.headers?.entries?.()',
+];
+for (const code of unsafe) assert.throws(() => assertNoUnverifiedHeaderCalls(code), /Headers/);
+for (const code of [
+  'Object.fromEntries(Object.entries(ctx.request["headers"]))',
+  'Object.keys(ctx.response.headers)',
+  'ctx.request.headers["x-test"]',
+]) assert.doesNotThrow(() => assertNoUnverifiedHeaderCalls(code));
+console.log(JSON.stringify({ok: true}));
+'''
+        result = subprocess.run(['node', '--input-type=module', '-e', probe], cwd=execution.ROOT,
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {'ok': True})
+
     def test_awaited_completion_expression_runs_once(self):
         from tools.egern_hub.verify import compare
         source='let calls=0;function value(){calls++;return Promise.resolve(calls)}(async()=>{$done(await value().then(async n=>({status:201,headers:{"X-Calls":String(n)},body:String(n)})))})();'
@@ -32,7 +55,7 @@ class NativeCompilerTests(unittest.TestCase):
 
     def test_fetch_constructors_read_native_fields_without_legacy_objects(self):
         from tools.egern_hub.verify import compare
-        source='(async()=>{const r=new Request($request.url,$request);const s=new Response($response.body,$response);$done(await Promise.resolve(s).then(async s=>({status:s.status,headers:Object.fromEntries(s.headers),body:new Uint8Array(await s.arrayBuffer())})))})();'
+        source='(async()=>{const r=new Request($request.url,$request);const s=new Response($response.body,$response);$done(await Promise.resolve(s).then(async s=>({status:s.status,headers:Object.fromEntries(Object.entries(s.headers)),body:new Uint8Array(await s.arrayBuffer())})))})();'
         output=compile_source(source,source_format='loon',binary=True)
         self.assertNotIn('$request',output)
         self.assertNotIn('$response',output)
