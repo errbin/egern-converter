@@ -12,7 +12,7 @@ import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowe
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
-import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks} from '../transforms/decoding.mjs';
+import {lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
 // Compile legacy HTTP scripts to direct Egern APIs. No runtime bridge is emitted.
@@ -125,8 +125,13 @@ function compile(original,format,options,libraries){
   const rebound=lowerReboundHostGlobals(closedSource);
   const wrapped=lowerClosedCompletionWrappers(rebound.source,format);
   const storage=lowerClosedStorageFacades(wrapped.source,format);
-  const result=emitNative(storage.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
-  libraries.transformations.push(...lateForwarders.transformations,...factories.transformations,...wrapped.transformations,...storage.transformations);return result;
+  // 收口阶段再识别一次丢弃式自检壳：字符串表解码与死分支清理可能才让
+  // 工厂形状闭合。残留自检随格式化改变被检源码长度，可能灾难性回溯；
+  // 因此这里既是最后一次短路机会，也是产物可证明终止的生成门槛。
+  const finalSelfChecks=lowerDiscardedSelfCheckCallbacks(storage.source);
+  assertNoResidualSelfCheckCallbacks(finalSelfChecks.source);
+  const result=emitNative(finalSelfChecks.source,original,format,options,libraries,{pipeline,bundled,device,folded,generatedFunctions,factorySignatures:factories.signatures,hostRebinds:rebound.rebindings});
+  libraries.transformations.push(...lateForwarders.transformations,...factories.transformations,...wrapped.transformations,...storage.transformations,...finalSelfChecks.transformations);return result;
  };
  // Expand callback delegates only after the reachable receiver graph has
  // been lowered. Expanding the earlier class input misses newly exposed calls.

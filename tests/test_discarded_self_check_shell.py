@@ -1,6 +1,7 @@
 """丢弃式源码自检回调只在纯度、注入路径和结果丢弃都闭合时短路。"""
 import unittest
 
+from tools.egern_hub.convert import ConversionError
 from tools.egern_hub.script_convert import convert_script
 from tools.egern_hub.verify import compare
 
@@ -64,36 +65,28 @@ class DiscardedSelfCheckShellTests(unittest.TestCase):
                 '    } : function () {};\n    return state = false, fn;',
                 '    } : function () {};\n    var leaked = callback;\n    return state = false, fn;'),
             'result read after branches': SHELL.replace(
-                '        return callback = null, result;\n      } else {\n        var seen = callback ? result : null;\n        return seen;\n      }',
-                '        return callback = null, result;\n      } else {\n        var seen = callback ? result : null;\n        return seen;\n      }\n      var tail = result;'),
+                '        return callback = null, result;\n      } else {',
+                '        var tail = result;\n        return callback = null, result;\n      } else {'),
         }
         for name, body in cases.items():
-            with self.subTest(name=name):
-                output = convert_script(body.replace('{tail}', '$done({body:"ok"});'),
-                                        'Fixture', URL, '', source_format='surge')
-                self.assertIn('search', output)
+            with self.subTest(name=name), self.assertRaisesRegex(ConversionError, '无法证明终止'):
+                convert_script(body.replace('{tail}', '$done({body:"ok"});'),
+                               'Fixture', URL, '', source_format='surge')
 
     def test_wrapper_with_multiple_writes_is_rejected(self):
         source = SHELL.replace(
             'wrapper();',
             'wrapper();\nwrapper = factory(this, function () {});\nwrapper();').replace(
             '{tail}', '$done({body:"ok"});')
-        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
-        self.assertIn('search', output)
+        with self.assertRaisesRegex(ConversionError, '无法证明终止'):
+            convert_script(source, 'Fixture', URL, '', source_format='surge')
 
-    def test_callback_with_observable_effect_is_not_short_circuited(self):
+    def test_callback_with_observable_effect_is_rejected(self):
         source = SHELL.replace('{tail}', '$done({});').replace(
             '  var alias = key;',
             '  var alias = key;\n  $notification.post("shell", "", "", {url:"https://a.test"});')
-        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
-        self.assertIn('.notify', output)
-        fixture = {'name': 'observed self check', 'request': {'url': URL},
-                   'expected': {'events': {'notifications': [
-                       {'title': 'shell', 'subtitle': '', 'body': '',
-                        'action': {'type': 'openUrl', 'url': 'https://a.test'}},
-                   ]}}}
-        result = compare(source, output, 'surge', URL, fixture)
-        self.assertEqual(result['status'], 'passed', result)
+        with self.assertRaisesRegex(ConversionError, '无法证明终止'):
+            convert_script(source, 'Fixture', URL, '', source_format='surge')
 
 
 if __name__ == '__main__':

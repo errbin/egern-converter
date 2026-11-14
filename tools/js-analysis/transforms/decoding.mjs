@@ -1377,7 +1377,216 @@ function selfCheckExpression(node,wrapper,locals,ix){
  const receiver=firstToStringMember.object;
  return receiver.type==='Identifier'&&ix.bindings.get(receiver)===wrapper;
 }
+// 闭表转发器会把工厂调用拆成 `launcher(factory, host, callback)` 的形式，
+// 工厂再按初始化状态选出一个包装函数交给另一个闭表转发器丢弃执行。这里
+// 只接受参数原序转交、状态只写一次且调用结果整体丢弃的闭合形状；任何额外
+// 引用、动态表成员或无法静态判定的状态分支都会留给终止门槛拒绝。
+function lowerExtendedSelfCheckCallbacks(source){
+ const tree=parse(source,options),ix=index(tree),edits=[];
+ const inside=(node,range)=>node.start>=range.start&&node.end<=range.end;
+ const localBinding=(node,locals)=>{const binding=node?.type==='Identifier'?ix.bindings.get(node):null;return binding&&locals.has(binding)?binding:null;};
+ const rejected=(node,locals)=>{
+  if(node.type==='ThisExpression'||node.type==='NewExpression'||node.type==='AwaitExpression'||node.type==='YieldExpression'||node.type==='TaggedTemplateExpression'||node.type==='DebuggerStatement')return true;
+  if(node.type==='Identifier'&&ix.reference(node)){
+   const binding=ix.bindings.get(node);
+   return !binding||!locals.has(binding);
+  }
+  return false;
+ };
+ const staticBoolean=node=>{
+  if(node?.type==='Literal'&&['string','number','boolean'].includes(typeof node.value))return !!node.value;
+  if(node?.type==='Literal'&&node.value===null)return false;
+  if(node?.type==='ArrayExpression')return node.elements.length?undefined:true;
+  if(node?.type==='ObjectExpression')return node.properties.length?undefined:true;
+  if(node?.type==='UnaryExpression'&&node.operator==='!'){const value=staticBoolean(node.argument);return value===undefined?undefined:!value;}
+  return undefined;
+ };
+ // 从封闭对象字面量表读取一个数据函数；对表的全部引用都必须是静态成员读取，
+  // 且任何成员写入、删除、更新或别名转存都会使证明失败。
+ const tableFunction=callee=>{
+  if(callee?.type!=='MemberExpression'||callee.optional)return null;
+  const key=staticMemberKey(callee);
+  if(typeof key!=='string'||key==='__proto__')return null;
+  if(callee.object?.type!=='Identifier')return null;
+  const binding=ix.bindings.get(callee.object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  const names=new Set();let found=null;
+  for(const entry of binding.init.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method)return null;
+   const name=entry.computed?staticStringValue(entry.key):(entry.key.name??entry.key.value);
+   if(typeof name!=='string'||name==='__proto__'||names.has(name))return null;
+   names.add(name);
+   if(name===key)found=entry.value;
+  }
+  if(!functions.has(found?.type))return null;
+  for(const ref of binding.refs){
+   const member=ix.parents.get(ref);
+   if(member?.type!=='MemberExpression'||member.object!==ref||typeof staticMemberKey(member)!=='string'||staticMemberKey(member)==='__proto__')return null;
+   const outer=ix.parents.get(member);
+   if(outer?.type==='AssignmentExpression'&&outer.left===member||outer?.type==='UpdateExpression'||outer?.type==='UnaryExpression'&&outer.operator==='delete')return null;
+  }
+  return found;
+ };
+ // 转发器只允许把一个参数原序交给首参，且函数体只有这一条返回语句。
+ const forwarder=fn=>{
+  if(!functions.has(fn?.type)||fn.async||fn.generator||fn.body?.type!=='BlockStatement'||fn.params.some(param=>param.type!=='Identifier'))return null;
+  if(fn.body.body.length!==1||fn.body.body[0].type!=='ReturnStatement')return null;
+  const call=fn.body.body[0].argument;
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==fn.params.length-1)return null;
+  if(call.callee.type!=='Identifier'||ix.bindings.get(call.callee)!==ix.bindings.get(fn.params[0]))return null;
+  for(let index=0;index<call.arguments.length;index++){
+   const argument=call.arguments[index];
+   if(argument.type!=='Identifier'||ix.bindings.get(argument)!==ix.bindings.get(fn.params[index+1]))return null;
+  }
+  return call;
+ };
+ // 收集块内声明的可写局部变量，再按文本顺序证明它们只由闭包内纯值初始化。
+ // 返回语句必须位于所在块末尾；一旦某个嵌套块返回，其后的语句全部视为不可达
+ // 并拒绝，避免状态选择证明跳过实际执行内容。
+ const readPureTail=(statements,baseLocals,writable)=>{
+  const scope=new Set(baseLocals),targets=new Set(writable);
+  const collect=list=>{
+   for(const statement of list){
+    if(statement.type==='VariableDeclaration'){
+     for(const item of statement.declarations)if(item.id.type==='Identifier'){const binding=ix.bindings.get(item.id);targets.add(binding);scope.add(binding);}
+    }else if(statement.type==='BlockStatement')collect(statement.body);
+   }
+  };
+  collect(statements);
+  let returned=null,stopped=false;
+  const localWrite=expression=>{
+   if(expression.type!=='AssignmentExpression'||expression.operator!=='='||!pureLocalValue(expression.right,scope,ix))return false;
+   const target=expression.left;
+   return localBinding(target,targets)||target.type==='MemberExpression'&&localBinding(target.object,targets)&&staticMemberKey(target)!==undefined&&staticMemberKey(target)!=='__proto__';
+  };
+  const visit=list=>{
+   for(let index=0;index<list.length;index++){
+    if(stopped)return false;
+    const statement=list[index];
+    if(statement.type==='VariableDeclaration'){
+     if(!statement.declarations.every(item=>item.id.type==='Identifier'&&item.init&&pureLocalValue(item.init,scope,ix)))return false;
+    }else if(statement.type==='ExpressionStatement'){
+     const expression=statement.expression;
+     if(expression.type==='SequenceExpression'? !expression.expressions.every(localWrite):!localWrite(expression))return false;
+    }else if(statement.type==='BlockStatement'){
+     if(!visit(statement.body))return false;
+    }else if(statement.type==='ReturnStatement'&&index===list.length-1){
+     returned=statement;stopped=true;
+    }else return false;
+   }
+   return true;
+  };
+  return visit(statements)&&returned?{returned,locals:scope,writable:targets}:null;
+ };
+ const discardedByTable=ref=>{
+  const call=ix.parents.get(ref);
+  if(call?.type!=='CallExpression'||call.optional||call.arguments.length!==1||call.arguments[0]!==ref)return false;
+  const fn=tableFunction(call.callee),invocation=fn&&forwarder(fn);
+  return !!invocation&&fn.params.length===1&&invocation.arguments.length===0&&discardedValue(call,ix);
+ };
+ const proveCallback=(wrapperId,wrapper,callback,callbackBinding,hostParameter,discarded)=>{
+  if(!callbackBinding||!callbackBinding.writes.length)return null;
+  const containsNode=(range,node)=>!!range&&node.start>=range.start&&node.end<=range.end;
+  const oppositeBranch=(node,call)=>{
+   for(let current=call;current;current=ix.parents.get(current)){
+    const parent=ix.parents.get(current);
+    if(parent?.type!=='IfStatement'||!containsNode(parent.consequent,call)&&!containsNode(parent.alternate,call))continue;
+    const branch=containsNode(parent.consequent,call)?parent.alternate:parent.consequent;
+    if(containsNode(branch,node))return true;
+   }
+   return false;
+  };
+  const applyCalls=[],nullAssignments=[],callbackExtras=[];
+  let tested=false;
+  for(const ref of callbackBinding.refs){
+   const parent=ix.parents.get(ref);
+   if(parent?.type==='IfStatement'&&parent.test===ref)tested=true;
+   else if(parent?.type==='MemberExpression'&&parent.object===ref&&staticMemberKey(parent)==='apply'){
+    const call=ix.parents.get(parent);
+    if(call?.type==='CallExpression'&&call.callee===parent)applyCalls.push(call);
+    else callbackExtras.push(ref);
+   }else if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&parent.right?.type==='Literal'&&parent.right.value===null)nullAssignments.push(parent);
+   else callbackExtras.push(ref);
+  }
+  if(callbackBinding.writes.length!==nullAssignments.length||!nullAssignments.length||!tested||!applyCalls.length)return null;
+  if(callbackExtras.some(ref=>applyCalls.some(call=>!oppositeBranch(ref,call))))return null;
+  const resets=new Set(nullAssignments);
+  for(const applyCall of applyCalls){
+   if(applyCall.arguments.length!==2)return null;
+   if(applyCall.arguments[0].type!=='Identifier'||ix.bindings.get(applyCall.arguments[0])!==ix.bindings.get(hostParameter))return null;
+   if(!ix.free(applyCall.arguments[1],'arguments'))return null;
+   const declarator=ix.parents.get(applyCall);
+   if(declarator?.type!=='VariableDeclarator'||declarator.init!==applyCall||declarator.id.type!=='Identifier')return null;
+   const declaration=ix.parents.get(declarator),block=ix.parents.get(declaration);
+   if(declaration?.type!=='VariableDeclaration'||block?.type!=='BlockStatement')return null;
+   const index=block.body.indexOf(declaration),after=block.body[index+1];
+   if(!after||after.type!=='ReturnStatement'||after.argument?.type!=='SequenceExpression'||after.argument.expressions.length!==2)return null;
+   const [resetExpression,resultExpression]=after.argument.expressions;
+   if(!resets.has(resetExpression)||resultExpression.type!=='Identifier'||ix.bindings.get(resultExpression)!==ix.bindings.get(declarator.id))return null;
+   const resultBinding=ix.bindings.get(declarator.id);
+   if(!resultBinding||resultBinding.writes.length||resultBinding.refs.some(ref=>ref!==resultExpression&&!oppositeBranch(ref,applyCall)))return null;
+  }
+  const outside=wrapper.refs.filter(ref=>!inside(ref,callback)&&ref!==wrapperId);
+  if(outside.length!==1||!discarded(outside[0]))return null;
+  const body=readPureTail(callback.body.body,new Set(),new Set());
+  if(!body||!selfCheckExpression(body.returned.argument,wrapper,body.locals,ix))return null;
+  for(const node of ix.nodes){
+   if(!inside(node,callback))continue;
+   if(rejected(node,body.locals)&&ix.bindings.get(node)!==wrapper)return null;
+  }
+  return {start:callback.body.start,end:callback.body.end,value:'{}'};
+ };
+ for(const node of ix.nodes){
+  let wrapperId=null,init=null,write=null;
+  if(node.type==='VariableDeclarator'&&node.id.type==='Identifier'&&node.init?.type==='CallExpression'){
+   wrapperId=node.id;init=node.init;write=node;
+  }else if(node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'&&node.right.type==='CallExpression'){
+   wrapperId=node.left;init=node.right;write=node;
+  }
+  if(!wrapperId)continue;
+  const wrapper=ix.bindings.get(wrapperId);
+  if(!wrapper||(write.type==='VariableDeclarator'?wrapper.writes.length:wrapper.writes.length!==1||wrapper.writes[0]!==write))continue;
+  if(init.callee.type!=='MemberExpression'||init.arguments.some(argument=>argument.type==='SpreadElement'))continue;
+  const launcher=tableFunction(init.callee),invocation=launcher&&forwarder(launcher);
+  if(!invocation||launcher.params.length!==init.arguments.length||init.arguments.length<3)continue;
+  const target=init.arguments[0];
+  if(target.type!=='Identifier')continue;
+  const factory=ix.bindings.get(target);
+  if(!factory||factory.writes.length||factory.refs.length!==1||factory.refs[0]!==target)continue;
+  const factoryInit=factory.init;
+  if(factoryInit?.type!=='CallExpression'||factoryInit.arguments.length||factoryInit.callee.type!=='FunctionExpression')continue;
+  const factoryFn=factoryInit.callee;
+  if(factoryFn.async||factoryFn.generator||factoryFn.params.length||factoryFn.body.type!=='BlockStatement')continue;
+  const factoryTail=readPureTail(factoryFn.body.body,new Set(),new Set());
+  const selector=factoryTail?.returned.argument;
+  if(!functions.has(selector?.type)||selector.async||selector.generator||selector.body.type!=='BlockStatement'||selector.params.some(param=>param.type!=='Identifier'))continue;
+  const callArgs=init.arguments.slice(1),callbackIndex=callArgs.length-1;
+  if(selector.params.length!==callArgs.length||callArgs[callbackIndex].type!=='FunctionExpression')continue;
+  const selectorTail=readPureTail(selector.body.body,factoryTail.locals,new Set());
+  const selectedReturn=selectorTail?.returned.argument;
+  if(selectedReturn?.type!=='SequenceExpression'||selectedReturn.expressions.length!==2)continue;
+  const [reset,selectedId]=selectedReturn.expressions;
+  if(reset.type!=='AssignmentExpression'||reset.operator!=='='||reset.left.type!=='Identifier'||selectedId.type!=='Identifier')continue;
+  const state=ix.bindings.get(reset.left),selectedBinding=ix.bindings.get(selectedId);
+  if(!state||state.writes.length!==1||state.writes[0]!==reset||staticBoolean(state.init)!==true||staticBoolean(reset.right)!==false)continue;
+  const choice=selectedBinding?.init;
+  if(selectedBinding?.writes.length||selectedBinding?.refs.length!==1||selectedBinding.refs[0]!==selectedId||choice?.type!=='ConditionalExpression'||choice.test.type!=='Identifier'||ix.bindings.get(choice.test)!==state)continue;
+  if(!state.refs.every(ref=>ref===choice.test||ref===reset.left))continue;
+  if(!functions.has(choice.consequent.type)||!functions.has(choice.alternate.type)||choice.consequent.async||choice.consequent.generator)continue;
+  const selected=choice.consequent,callback=callArgs[callbackIndex],callbackBinding=ix.bindings.get(selector.params[callbackIndex]);
+  if(!callbackBinding||!callbackBinding.refs.every(ref=>inside(ref,selected)))continue;
+  const edit=proveCallback(wrapperId,wrapper,callback,callbackBinding,selector.params[0],discardedByTable);
+  if(edit)edits.push(edit);
+ }
+ if(!edits.length)return {source,transformations:[]};
+ let output=source;
+ for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.value+output.slice(edit.end);
+ return {source:output,transformations:[{kind:'discarded-self-check-shell',callbacks:edits.length,reason:'闭表转发器、状态选择与丢弃调用全部闭合；短路自检回调体'}]};
+}
+
 export function lowerDiscardedSelfCheckCallbacks(source){
+ const extended=lowerExtendedSelfCheckCallbacks(source);
+ if(extended.transformations.length)return extended;
  const tree=parse(source,options),ix=index(tree),edits=[];
  const inside=(node,range)=>node.start>=range.start&&node.end<=range.end;
  const localBinding=(node,locals)=>{const binding=node?.type==='Identifier'?ix.bindings.get(node):null;return binding&&locals.has(binding)?binding:null;};
@@ -1415,14 +1624,34 @@ export function lowerDiscardedSelfCheckCallbacks(source){
   const returned=factoryStatements.at(-1);
   if(returned.type!=='ReturnStatement'||returned.argument?.type!=='FunctionExpression')continue;
   const setup=factoryStatements.slice(0,-1);
-  if(!setup.every(statement=>statement.type==='VariableDeclaration'&&statement.declarations.every(item=>item.id.type==='Identifier'&&item.init)))continue;
+  // 工厂初始化既可能是纯声明，也可能是先声明空表再逐项写入；后者只允许
+  // 写入工厂局部变量或它的静态成员，值仍必须由局部纯值构成。
+  const setupDeclaration=statement=>statement.type==='VariableDeclaration'&&
+   statement.declarations.every(item=>item.id.type==='Identifier'&&item.init);
   const factoryLocals=new Set();
-  for(const statement of setup)for(const item of statement.declarations)factoryLocals.add(ix.bindings.get(item.id));
-  if(!setup.every(statement=>statement.declarations.every(item=>pureLocalValue(item.init,factoryLocals,ix))))continue;
+  for(const statement of setup){
+   if(!setupDeclaration(statement))continue;
+   for(const item of statement.declarations)factoryLocals.add(ix.bindings.get(item.id));
+  }
+  const localWrite=expression=>{
+   if(expression.type!=='AssignmentExpression'||expression.operator!=='='||
+      !pureLocalValue(expression.right,factoryLocals,ix))return false;
+   const target=expression.left;
+   return localBinding(target,factoryLocals)||
+    target.type==='MemberExpression'&&localBinding(target.object,factoryLocals)&&
+    staticMemberKey(target)!==undefined&&staticMemberKey(target)!=='__proto__';
+  };
+  const setupPure=statement=>{
+   if(setupDeclaration(statement))return statement.declarations.every(item=>pureLocalValue(item.init,factoryLocals,ix));
+   if(statement.type!=='ExpressionStatement')return false;
+   const expression=statement.expression;
+   return expression.type==='SequenceExpression'?expression.expressions.every(localWrite):localWrite(expression);
+  };
+  if(!setup.every(setupPure))continue;
   const returnedFunction=returned.argument;
   if(returnedFunction.async||returnedFunction.generator||returnedFunction.params.length!==2||returnedFunction.params.some(param=>param.type!=='Identifier'))continue;
   const callbackBinding=ix.bindings.get(returnedFunction.params[1]);
-  if(!callbackBinding||callbackBinding.writes.length!==1)continue;
+  if(!callbackBinding||!callbackBinding.writes.length)continue;
   // 自检壳在调用回调的分支外还有一条“已被篡改”的失败分支；该分支只读写
   // 回调/结果槽位本身，包装调用的返回值又整体丢弃。只要回调调用位于会返回
   // 的分支，另一条分支的额外引用不影响短路证明。
@@ -1436,32 +1665,46 @@ export function lowerDiscardedSelfCheckCallbacks(source){
    }
    return false;
   };
-  const callbackExtras=[];
-  let applyCall=null,nullAssignment=null,tested=false;
+  const applyCalls=[],nullAssignments=[],callbackExtras=[];
+  let tested=false;
   for(const ref of callbackBinding.refs){
    const parent=ix.parents.get(ref);
    if(parent?.type==='IfStatement'&&parent.test===ref)tested=true;
    else if(parent?.type==='MemberExpression'&&parent.object===ref&&staticMemberKey(parent)==='apply'){
     const call=ix.parents.get(parent);
-    if(call?.type==='CallExpression'&&call.callee===parent)applyCall=call;
-   }else if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&parent.right?.type==='Literal'&&parent.right.value===null)nullAssignment=parent;
+    if(call?.type==='CallExpression'&&call.callee===parent)applyCalls.push(call);
+    else callbackExtras.push(ref);
+   }else if(parent?.type==='AssignmentExpression'&&parent.left===ref&&parent.operator==='='&&parent.right?.type==='Literal'&&parent.right.value===null)nullAssignments.push(parent);
    else callbackExtras.push(ref);
   }
-  if(!tested||!applyCall||!nullAssignment||applyCall.arguments.length!==2)continue;
-  if(callbackExtras.some(ref=>!oppositeBranch(ref,applyCall)))continue;
-  if(applyCall.arguments[0].type!=='Identifier'||ix.bindings.get(applyCall.arguments[0])!==ix.bindings.get(returnedFunction.params[0]))continue;
-  if(!ix.free(applyCall.arguments[1],'arguments'))continue;
-  const applyDeclarator=ix.parents.get(applyCall);
-  if(applyDeclarator?.type!=='VariableDeclarator'||applyDeclarator.init!==applyCall||applyDeclarator.id.type!=='Identifier')continue;
-  const applyDeclaration=ix.parents.get(applyDeclarator),applyBlock=ix.parents.get(applyDeclaration);
-  if(applyDeclaration?.type!=='VariableDeclaration'||applyBlock?.type!=='BlockStatement')continue;
-  const applyIndex=applyBlock.body.indexOf(applyDeclaration),afterApply=applyBlock.body[applyIndex+1];
-  if(!afterApply||afterApply.type!=='ReturnStatement'||afterApply.argument?.type!=='SequenceExpression'||afterApply.argument.expressions.length!==2)continue;
-  const [resetExpression,resultExpression]=afterApply.argument.expressions;
-  if(resetExpression!==nullAssignment||resultExpression.type!=='Identifier'||ix.bindings.get(resultExpression)!==ix.bindings.get(applyDeclarator.id))continue;
-  const resultBinding=ix.bindings.get(applyDeclarator.id);
-  if(!resultBinding||resultBinding.writes.length||resultBinding.refs[0]!==resultExpression||
-    resultBinding.refs.some(ref=>ref!==resultExpression&&!oppositeBranch(ref,applyCall)))continue;
+  // 回调参数的每一次写入都必须只是重置为 null。解绑或转存回调值会让短路
+  // 改变可观察行为，必须拒绝；重置本身不依赖回调体内容。
+  if(callbackBinding.writes.length!==nullAssignments.length||!nullAssignments.length)continue;
+  if(!tested||!applyCalls.length)continue;
+  // 未归类的额外引用必须落在每条回调调用的兄弟分支：这些分支与调用互斥，
+  // 短路回调体不会改变它们观察到的值。
+  if(callbackExtras.some(ref=>applyCalls.some(call=>!oppositeBranch(ref,call))))continue;
+  const resets=new Set(nullAssignments);
+  let applyValid=true;
+  for(const applyCall of applyCalls){
+   if(applyCall.arguments.length!==2){applyValid=false;break;}
+   if(applyCall.arguments[0].type!=='Identifier'||ix.bindings.get(applyCall.arguments[0])!==ix.bindings.get(returnedFunction.params[0])){applyValid=false;break;}
+   if(!ix.free(applyCall.arguments[1],'arguments')){applyValid=false;break;}
+   const applyDeclarator=ix.parents.get(applyCall);
+   if(applyDeclarator?.type!=='VariableDeclarator'||applyDeclarator.init!==applyCall||applyDeclarator.id.type!=='Identifier'){applyValid=false;break;}
+   const applyDeclaration=ix.parents.get(applyDeclarator),applyBlock=ix.parents.get(applyDeclaration);
+   if(applyDeclaration?.type!=='VariableDeclaration'||applyBlock?.type!=='BlockStatement'){applyValid=false;break;}
+   const applyIndex=applyBlock.body.indexOf(applyDeclaration),afterApply=applyBlock.body[applyIndex+1];
+   if(!afterApply||afterApply.type!=='ReturnStatement'||afterApply.argument?.type!=='SequenceExpression'||afterApply.argument.expressions.length!==2){applyValid=false;break;}
+   const [resetExpression,resultExpression]=afterApply.argument.expressions;
+   if(!resets.has(resetExpression)||resultExpression.type!=='Identifier'||ix.bindings.get(resultExpression)!==ix.bindings.get(applyDeclarator.id)){applyValid=false;break;}
+   // 结果槽位只允许在自检分支之外被“篡改”路径读取；这些读取位于
+   // applyCall 的兄弟分支，回调短路后不会执行，因此不要求文本顺序。
+   const resultBinding=ix.bindings.get(applyDeclarator.id);
+   if(!resultBinding||resultBinding.writes.length||
+     resultBinding.refs.some(ref=>ref!==resultExpression&&!oppositeBranch(ref,applyCall))){applyValid=false;break;}
+  }
+  if(!applyValid)continue;
   // 赋值形态的左值本身就是一次写入引用；它由上面的唯一写入点证明覆盖，
   // 不能算作包装器在回调之外的读取。
   const outside=wrapper.refs.filter(ref=>!inside(ref,callback)&&ref!==wrapperId);
@@ -1497,6 +1740,32 @@ export function lowerDiscardedSelfCheckCallbacks(source){
  let output=source;
  for(const edit of edits.sort((a,b)=>b.start-a.start))output=output.slice(0,edit.start)+edit.value+output.slice(edit.end);
  return {source:output,transformations:[{kind:'discarded-self-check-shell',callbacks:edits.length,reason:'工厂与回调注入路径闭合、回调只做源码自检、包装调用结果被丢弃；短路自检回调体'}]};
+}
+
+// 残留的源码自检无法证明终止：格式化会改变被检源码的长度与换行，
+// `(((.+)+)+)+$` 一类自检正则可能在失败路径上灾难性回溯。无论自检壳
+// 由哪种工厂/声明形态承载，只要产物里还存在“包装函数源码 -> search”
+// 的自检构造，就拒绝生成。
+export function assertNoResidualSelfCheckCallbacks(source){
+ const tree=parse(source,options),ix=index(tree),residuals=[];
+ const isCall=(node,name)=>node?.type==='CallExpression'&&staticMemberKey(node.callee)===name;
+ for(const node of ix.nodes){
+  if(!isCall(node,'search')||node.arguments.length!==1)continue;
+  const construct=node.callee.object;
+  if(construct?.type!=='CallExpression'||construct.arguments.length!==1||staticMemberKey(construct.callee)!=='constructor')continue;
+  const wrapper=construct.arguments[0];
+  if(wrapper.type!=='Identifier'||!ix.bindings.get(wrapper))continue;
+  const secondToString=construct.callee.object;
+  if(secondToString?.type!=='CallExpression'||secondToString.arguments.length||staticMemberKey(secondToString.callee)!=='toString')continue;
+  const firstSearch=secondToString.callee.object;
+  if(!isCall(firstSearch,'search')||firstSearch.arguments.length!==1)continue;
+  const firstToString=firstSearch.callee.object;
+  if(firstToString?.type!=='CallExpression'||firstToString.arguments.length||staticMemberKey(firstToString.callee)!=='toString')continue;
+  const receiver=firstToString.callee.object;
+  if(receiver.type!=='Identifier'||ix.bindings.get(receiver)!==ix.bindings.get(wrapper))continue;
+  residuals.push({name:wrapper.name,line:source.slice(0,node.start).split('\n').length});
+ }
+ if(residuals.length)throw Error('源码自检回调无法证明终止（自检正则随格式化可能灾难性回溯）：'+residuals.map(item=>item.name+' 于第 '+item.line+' 行').join('、'));
 }
 
 function proveShellWrites(ranges,ix,shellBinding){
