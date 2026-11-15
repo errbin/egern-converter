@@ -1559,15 +1559,20 @@ export function lowerAsyncRegenerator(source){
    if(fn?.async)return true;
    if(fn){
     const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
-    if(statements.length===1&&statements[0].type==='ReturnStatement'&&statements[0].argument){
-     const local=new Map(environment);
-     fn.params.forEach((parameter,index)=>{
-      const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
-      const argument=n.arguments[index]??(parameter.type==='AssignmentPattern'?parameter.right:undefined);
-      if(binding&&argument)local.set(binding,argument);
-     });
-     return promiseLike(statements[0].argument,seen,local);
-    }
+    // 闭合调用只有在函数必然以 return 结束、且所有 return 都产生 Promise
+    // 时才可视为异步挂起。return 前的局部初始化仍按原顺序执行，不影响
+    // “调用结果可 await”这一证明；缺少终止 return 或混入非 Promise 返回值
+    // 都可能让 await 观察到普通值/undefined，必须继续拒绝。
+    const terminal=statements.at(-1);
+    if(terminal?.type!=='ReturnStatement'||!terminal.argument)return false;
+    const local=new Map(environment);
+    fn.params.forEach((parameter,index)=>{
+     const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+     const argument=n.arguments[index]??(parameter.type==='AssignmentPattern'?parameter.right:undefined);
+     if(binding&&argument)local.set(binding,argument);
+    });
+    const returns=nodes.filter(r=>r.type==='ReturnStatement'&&owners.get(r)===fn);
+    return returns.length>0&&returns.every(r=>promiseLike(r.argument,seen,local));
    }
   }
   return false;

@@ -169,6 +169,9 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
             'object method': (
                 "const ops={later:function(value){return Promise.resolve(value)}};"
                 "function low(){return ops.later('ok')}"),
+            'setup before terminal return': (
+                "function later(value){const prefix='o';return Promise.resolve(prefix+value)}"
+                "function low(){return later('k')}"),
         }
         for name, replacement in forwarding.items():
             with self.subTest(name=name):
@@ -183,6 +186,12 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
             'mutated table field': (
                 "const ops={later:function(value){return Promise.resolve(value)}};"
                 "ops.later=unknown;function low(){return ops.later('ok')}"),
+            'missing terminal return': (
+                "function later(value){if(value)return Promise.resolve(value)}"
+                "function low(){return later('ok')}"),
+            'mixed terminal return': (
+                "function later(value){if(value)return Promise.resolve(value);return value}"
+                "function low(){return later('ok')}"),
         }
         for name, replacement in counterexamples.items():
             with self.subTest(name=name):
