@@ -70,6 +70,52 @@ class WindowFallbackFoldingTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 self.convert(source)
 
+    def test_missing_global_catch_assignment_preserves_reference_error(self):
+        source=("let value='ok';try{value=JSON.parse($argument).value}"
+                "catch(error){value=window}$done({body:String(value)});")
+        native=self.convert(source)
+        for usage in ('=window','(window','window.','typeof window'):
+            self.assertNotIn(usage,native)
+        self.assertIn('new ReferenceError("window is not defined")',native)
+        success={'name':'catch fallback success path','request':{'url':URL},
+                 'argument':'{"value":"parsed"}','expected':{'result':{'body':'parsed'}}}
+        result=compare(source,native,'surge',URL,success)
+        self.assertEqual(result['status'],'passed',result)
+        failure={'name':'catch fallback ReferenceError path','request':{'url':URL},
+                 'argument':'not json'}
+        result=compare(source,native,'surge',URL,failure)
+        self.assertEqual(result['status'],'original_error',result)
+        self.assertEqual(result['original_error'],'window is not defined')
+        self.assertEqual(result['converted_error'],'window is not defined')
+
+    def test_catch_fallback_only_rewrites_bare_missing_global_reads(self):
+        probe="""
+import assert from 'node:assert/strict';
+import {lowerMissingGlobalCatchFallbacks} from './tools/js-analysis/platform/globals.mjs';
+const rewrite=source=>lowerMissingGlobalCatchFallbacks(source).transformations.length;
+assert.equal(rewrite('let v;try{v=1}catch(e){v=window}$done({});'),1);
+assert.equal(rewrite('let v;try{v=1}catch(e){window=1}$done({});'),0);
+assert.equal(rewrite('let v;try{v=1}catch(e){const window=2;v=window}$done({});'),0);
+assert.equal(rewrite('let v;try{v=1}catch(e){v=window.foo}$done({});'),0);
+assert.equal(rewrite('let v;try{v=1}catch(e){v=(window,1)}$done({});'),0);
+assert.equal(rewrite('let v;try{v=1}catch(e){v=typeof window}$done({});'),0);
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],cwd=ROOT,
+                              text=True,capture_output=True,check=True)
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
+        for source in [
+            "const w=window;$done({body:w.name});",
+            "let v;try{v=1}catch(e){window=2}$done({body:String(v)});",
+            "let v;try{v=1}catch(e){v=window.foo}$done({body:String(v)});",
+            "let v;try{v=1}catch(e){v=typeof window}$done({body:String(v)});",
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                self.convert(source)
+        local=self.convert("let v;try{v=1}catch(e){const window=2;v=window}"
+                           "$done({body:String(v)});")
+        self.assertEqual(local.count('ReferenceError'),0)
+
     def test_logical_fold_does_not_skip_uninitialized_reads(self):
         probe = """
 import assert from 'node:assert/strict';

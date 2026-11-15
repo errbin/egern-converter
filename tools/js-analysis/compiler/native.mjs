@@ -7,7 +7,7 @@ import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMeth
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,collectSloppyMemberWrites,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
-import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes} from '../platform/globals.mjs';
+import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes,lowerMissingGlobalCatchFallbacks} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances,lowerClosedInstanceLiteralFields} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
@@ -752,6 +752,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  libraries.transformations.push(...conditionalReceivers.transformations);
  const detachedAliases=lowerDetachedGlobalObjectAliases(source);
  source=detachedAliases;
+ const missingFallbacks=lowerMissingGlobalCatchFallbacks(source);
+ source=missingFallbacks.source;
+ libraries.transformations.push(...missingFallbacks.transformations);
  assertSafeMissingGlobalProbes(source);
  const sourceOnlyRanges=sourceOnlyFunctionRanges(source);
  const report=analyze(source,format,{nativeMethods:true,nativeBundle:bundled,nativeStandardGlobals:true,nativeEntry:pipeline.lowered,entry_types:options.entry_types,nativeLibraryValues:libraries.valueContracts,sloppyThisHelper:options.sloppyThis?.helper,allowNoCompletion:options.allowNoCompletion,sourceOnlyRanges});

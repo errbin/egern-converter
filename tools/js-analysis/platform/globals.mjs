@@ -5,6 +5,9 @@ import {index,patch,renderTree,property,key,children,functions,initializedAfter,
 const UNKNOWN=Symbol('not statically known');
 const PRESENT_VERSION=Symbol('platform version exists; exact value unknown');
 const PRESENT_GLOBALS=new Map();
+// 目标宿主确定没有的 Node/浏览器全局。裸读取仍然抛 ReferenceError；
+// 只有明确位于 catch 回退赋值右侧时，才按这一既定语义改写为抛错表达式。
+const MISSING_HOST_GLOBALS=new Set(['window','global','module','exports','process','require','importModule','document','$drive']);
 const safeProbeCallees=new Set(['Boolean','String','Number','parseInt','parseFloat','isNaN','isFinite']);
 // 探测结果只能流入可证明不改变语义的消费点：条件、比较、布尔/字符串
 // 转换、已知完成调用，或经单次绑定继续流向前述位置。传入未知函数、
@@ -251,8 +254,32 @@ export function foldClosedLiteralMethodCalls(source){
 // 未解析代码后产生与宿主能力相关的分支。
 export function assertSafeMissingGlobalProbes(source){
  const ix=index(parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}));
- const missing=new Set(['window','global','module','exports','process','require','importModule','document','$drive']);
- for(const n of ix.nodes)if(n.type==='UnaryExpression'&&n.operator==='typeof'&&n.argument.type==='Identifier'&&missing.has(n.argument.name)&&ix.free(n.argument)&&!probeResultSafeAt(ix,n))throw Error('Node/浏览器全局缺失探测结果传入了未知代码，无法证明可折叠：'+n.argument.name);
+ for(const n of ix.nodes)if(n.type==='UnaryExpression'&&n.operator==='typeof'&&n.argument.type==='Identifier'&&MISSING_HOST_GLOBALS.has(n.argument.name)&&ix.free(n.argument)&&!probeResultSafeAt(ix,n))throw Error('Node/浏览器全局缺失探测结果传入了未知代码，无法证明可折叠：'+n.argument.name);
+}
+// 混淆脚本会在 catch 回退里把缺失的浏览器全局直接赋给局部结果，例如
+// `try{value=decode()}catch(e){value=window}`。目标宿主确实没有 window，
+// 因此该读取在原脚本中必然抛 ReferenceError。这里把这一处裸读取改写成
+// 合成相同 ReferenceError 的表达式：成功路径完全不变，回退路径仍以相同的
+// 异常类型和消息终止，同时产物不再依赖未提供的宿主全局。
+export function lowerMissingGlobalCatchFallbacks(source){
+ let tree,ix;
+ try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
+ catch{return {source,transformations:[]};}
+ const replace=new Map();
+ for(const node of ix.nodes){
+  if(node.type!=='Identifier'||!MISSING_HOST_GLOBALS.has(node.name)||!ix.free(node))continue;
+  const assignment=ix.parents.get(node);
+  if(assignment?.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.right!==node||assignment.left.type!=='Identifier')continue;
+  let inCatch=false;
+  for(let parent=ix.parents.get(assignment);parent;parent=ix.parents.get(parent)){
+   if(parent.type==='CatchClause'){inCatch=true;break;}
+   if(functions.has(parent.type))break;
+  }
+  if(!inCatch)continue;
+  replace.set(node,`(()=>{throw new ReferenceError(${JSON.stringify(node.name+' is not defined')})})()`);
+ }
+ if(!replace.size)return {source,transformations:[]};
+ return {source:renderTree(source,tree,node=>replace.has(node)?{direct:true,value:replace.get(node)}:null),transformations:[{kind:'missing-global-catch-fallback',reads:replace.size,reason:'catch 回退读取目标宿主缺失的全局时，以相同 ReferenceError 保留异常语义'}]};
 }
 function fold(source,format,options,qxHint){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
