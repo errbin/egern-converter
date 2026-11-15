@@ -116,10 +116,10 @@ else decoy();
 '''
 
 
-def fold(source):
+def fold(source, format='surge'):
     result = subprocess.run(
         ['node', str(FOLD)],
-        input=source,
+        input=json.dumps({'source': source, 'format': format}),
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -152,6 +152,29 @@ class MultiPlatformEnvTests(unittest.TestCase):
 
     def test_closed_class_factory_folds_platform_and_node_branches(self):
         self.assert_folded(CLASS_FIXTURE)
+
+    def test_platform_probe_folds_to_the_declared_source_platform(self):
+        # QX 与通用 HTTP/通知默认值不同。平台探测必须选择源格式实际运行的分支，
+        # 不能为了生成方便统一折到 Surge；其它源平台仍按各自常量选择。
+        for format, platform in [('surge', 'Surge'), ('qx', 'Quantumult X')]:
+            with self.subTest(format=format):
+                data = fold(CLASS_FIXTURE, format)
+                self.assertNotIn('error', data)
+                self.assertGreater(data['folded'], 0)
+                folded = data['stages']['fold']['source']
+                self.assertIn(json.dumps(platform), folded)
+                self.assertNotIn('this.getEnv(', folded)
+
+    def test_platform_probe_still_rejects_a_format_without_a_matching_branch(self):
+        # 删掉 Quantumult X 分支后，qx 源没有可证明的真实平台分支；不能退回
+        # Surge 常量，否则会伪造原文从未声明过的请求/通知默认语义。
+        source = CLASS_FIXTURE.replace(
+            " : typeof $task !== 'undefined' ? 'Quantumult X' : 'Node.js';",
+            " : 'Node.js';")
+        data = fold(source, 'qx')
+        self.assertNotIn('error', data)
+        self.assertEqual(data['folded'], 0)
+        self.assertGreater(data['stages']['fold']['counts']['getEnv'], 0)
 
     def test_closed_instance_alias_and_call_receiver_fold(self):
         for replacement in [

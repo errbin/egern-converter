@@ -830,18 +830,19 @@ export function normalizePrototypeEnv(source){
 
 // 多平台 Env 的平台探测方法（getEnv/isNode/isSurge/...）在 Egern 产物里不能折成
 // "哪个旧平台都不是"：那样会落到 default 分支，存储读回 null 等静默错误。这里按
-// 结构识别"纯平台探测"的 Env，把它折到本项目能原生降级的那一支（Surge 风格的
-// $persistentStore/$notification/$httpClient），折叠后由常量 if/switch 裁剪删除
-// 不可达的 Node/其它平台分支。识别只看方法体结构，不依赖实现哈希，也不按作者或
-// 文件名放行；实例引用必须封闭（只能是 new 与方法调用）。
+// 结构识别"纯平台探测"的 Env，折到原文实际声明的那一支，再逐 API 原生降级。
+// QX 与通用 HTTP/通知的默认值不同，不能为了便于生成而统一改选 Surge；折叠后由
+// 常量 if/switch 裁剪删除不可达的 Node/其它平台分支。识别只看方法体结构，不依赖
+// 实现哈希，也不按作者或文件名放行；实例引用必须封闭（只能是 new 与方法调用）。
 const PLATFORM_NAMES=new Set(['Surge','Loon','Quantumult X','Stash','Shadowrocket','Node.js','Worker','Egern']);
-const FOLDED_PLATFORM='Surge';
+const PLATFORM_BY_FORMAT=Object.freeze({surge:'Surge',loon:'Loon',qx:'Quantumult X',stash:'Stash',shadowrocket:'Shadowrocket',egern:'Surge'});
+function foldedPlatform(format){return PLATFORM_BY_FORMAT[format]??'Surge';}
 const PLATFORM_ROOTS=new Set(['$environment','$task','$loon','$rocket','$prefs','$persistentStore','$notification','$httpClient','module','globalThis','global','window','process','require']);
 const PROBE_BINARY=new Set(['===','==','!==','!=']);
 // 平台探测体只能是 typeof、平台根对象成员和字符串字面量的组合。返回值必须包含
-// 目标平台 Surge，不能调用任何函数，也不能读取任意本地绑定。这样折叠只依赖探测
-// 表达式本身，不需要执行原文。
-function platformProbe(method,ix){
+// 与源格式一致的平台，不能调用任何函数，也不能读取任意本地绑定。这样折叠只依赖
+// 探测表达式本身，不需要执行原文，也不会把 QX 源码改选成另一平台的默认语义。
+function platformProbe(method,ix,platform){
  if(!method||method.kind!=='method'||method.value.params.length||method.value.async||method.value.generator)return false;
  const body=method.value.body?.body;
  if(body?.length!==1||body[0].type!=='ReturnStatement'||!body[0].argument)return false;
@@ -871,7 +872,7 @@ function platformProbe(method,ix){
    case 'Literal':
     if(typeof n.value==='string'){
      if(!PLATFORM_NAMES.has(n.value)&&n.value!=='undefined'){valid=false;return;}
-     if(n.value===FOLDED_PLATFORM)sawTarget=true;
+     if(n.value===platform)sawTarget=true;
     }else if(typeof n.value!=='boolean'&&typeof n.value!=='number'&&n.value!==null){valid=false;}
     return;
    case 'Identifier':
@@ -887,20 +888,20 @@ function platformProbe(method,ix){
 }
 // 部分 Env 把平台直接写死为常量，例如 getEnv(){return "Surge"}。这种情况下
 // 探测结果本身已经是目标平台，不依赖任何宿主能力；只接受无表达式模板或字符串
-// 字面量且必须等于折叠目标，避免把写死其它平台或动态拼接的脚本误折到 Surge。
-function constantPlatformProbe(method){
+// 字面量且必须等于源格式对应的平台，避免把动态拼接的脚本误折成常量。
+function constantPlatformProbe(method,platform){
  if(!method||method.kind!=='method'||method.value.params.length||method.value.async||method.value.generator)return false;
  const body=method.value.body?.body;
  if(body?.length!==1||body[0].type!=='ReturnStatement')return false;
  const expression=body[0].argument;
  const value=expression?.type==='Literal'&&typeof expression.value==='string'?expression.value
   :expression?.type==='TemplateLiteral'&&!expression.expressions.length&&expression.quasis.length===1?expression.quasis[0].value.cooked:null;
- return value===FOLDED_PLATFORM;
+ return value===platform;
 }
 // 识别"工厂返回封闭 class 实例"的多平台 Env：实例只能通过静态成员访问，不能整体
 // 传递、枚举或改绑；平台探测方法必须唯一且可静态验证；class 内不允许动态 this 成员。
 // 任一条件不成立即跳过整个候选，保持原文并让后续分析继续拒绝。
-function multiPlatformEnv(ix,source){
+function multiPlatformEnv(ix,source,platform='Surge'){
  const {nodes,parents,bindings,owners}=ix,candidates=[];
  const deadCache=new WeakMap();
  // 打包器偶尔把实例临时存进局部别名，仅用于在后续 `.call` 中保留接收者。
@@ -959,9 +960,10 @@ function multiPlatformEnv(ix,source){
    methodList.push(element);
   }
   if(!valid||!methodList.length)continue;
-  const probes=[...methods].filter(([,method])=>platformProbe(method,ix)||constantPlatformProbe(method));
+  const probes=[...methods].filter(([,method])=>platformProbe(method,ix,platform)||constantPlatformProbe(method,platform));
   if(probes.length!==1)continue;
   const [probeName,probeMethod]=probes[0];
+  const probePlatform=platform;
   const predicates=new Map();
   for(const [name,method] of methods){
    if(method===probeMethod)continue;
@@ -970,11 +972,11 @@ function multiPlatformEnv(ix,source){
    const expression=statements[0].argument;
    if(expression?.type!=='BinaryExpression'||!PROBE_BINARY.has(expression.operator))continue;
    for(const [literalSide,callSide] of [[expression.left,expression.right],[expression.right,expression.left]]){
-    const platform=literalSide?.type==='Literal'&&typeof literalSide.value==='string'?literalSide.value:null;
-    if(!platform||!PLATFORM_NAMES.has(platform))continue;
+    const literalPlatform=literalSide?.type==='Literal'&&typeof literalSide.value==='string'?literalSide.value:null;
+    if(!literalPlatform||!PLATFORM_NAMES.has(literalPlatform))continue;
     if(callSide?.type!=='CallExpression'||callSide.arguments.length||callSide.callee?.type!=='MemberExpression'||callSide.callee.object.type!=='ThisExpression'||property(callSide.callee)!==probeName)continue;
     const positive=expression.operator==='==='||expression.operator==='==';
-    predicates.set(name,positive?platform===FOLDED_PLATFORM:platform!==FOLDED_PLATFORM);
+    predicates.set(name,positive?literalPlatform===probePlatform:literalPlatform!==probePlatform);
    }
   }
   for(const method of methodList)for(const n of nodes){
@@ -1154,14 +1156,14 @@ function multiPlatformEnv(ix,source){
    const helper=helpers.get(bindings.get(n.callee));if(!helper)continue;
    if(!helperRoots(helper,n))conservativeHelperRoots(helper);
   }
-  candidates.push({factory,cls,methods,methodList,probeName,probeMethod,predicates,roots,instances});
+  candidates.push({factory,cls,methods,methodList,probeName,probeMethod,probePlatform,predicates,roots,instances});
  }
  return candidates;
 }
-export function foldMultiPlatformProbes(source){
+export function foldMultiPlatformProbes(source,format='surge'){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
  const {nodes,owners,parents}=ix,edits=[];
- for(const candidate of multiPlatformEnv(ix,source)){
+ for(const candidate of multiPlatformEnv(ix,source,foldedPlatform(format))){
   const local=[];
   let valid=true;
   for(const method of candidate.methodList){
@@ -1177,7 +1179,7 @@ export function foldMultiPlatformProbes(source){
     let owner=owners.get(n);
     while(owner?.type==='ArrowFunctionExpression')owner=owners.get(parents.get(owner));
     if(owner!==fn){valid=false;break;}
-    if(name===candidate.probeName)local.push({start:n.start,end:n.end,text:JSON.stringify(FOLDED_PLATFORM)});
+    if(name===candidate.probeName)local.push({start:n.start,end:n.end,text:JSON.stringify(candidate.probePlatform)});
     else local.push({start:n.start,end:n.end,text:String(candidate.predicates.get(name))});
    }
    if(!valid)break;
@@ -1196,11 +1198,11 @@ export function foldMultiPlatformProbes(source){
 // 折叠与常量裁剪之后，多平台 Env 里只剩 Node 用法的实例方法（如 initGotEnv）已经
 // 没有任何调用点。这里按结构识别的 Env 类删除这些不可达方法，避免残留 require 等
 // Node 宿主引用；constructor 恒保留，仍被任何成员访问引用的方法也保留。
-export function pruneUnusedEnvMethods(source){
+export function pruneUnusedEnvMethods(source,format='surge'){
  const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
  const {nodes,parents}=ix,edits=[];
  let removedCompletion=false;
- for(const candidate of multiPlatformEnv(ix,source)){
+ for(const candidate of multiPlatformEnv(ix,source,foldedPlatform(format))){
   const methods=candidate.methods;
   const reachable=new Set(['constructor']),queue=['constructor'];
   // toString/valueOf/toJSON 可能被隐式调用，不能按静态成员引用判定为死代码。

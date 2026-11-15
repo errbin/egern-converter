@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 import {normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../../tools/js-analysis/platform/environment.mjs';
 import {simplify} from '../../tools/js-analysis/transforms/simplify.mjs';
 
-const source=readFileSync(0,'utf8');
+const input=JSON.parse(readFileSync(0,'utf8')),source=input.source,format=input.format??'surge';
 const counts=text=>({
  require:(text.match(/\brequire\b/g)||[]).length,
  isNode:(text.match(/\bisNode\b/g)||[]).length,
@@ -12,8 +12,8 @@ const counts=text=>({
  done:(text.match(/\$done\b/g)||[]).length,
 });
 try{
- const normalized=normalizePrototypeEnv(source),folded=foldMultiPlatformProbes(normalized.source);
- const simplified=simplify(folded.source),pruned=pruneUnusedEnvMethods(simplified);
+ const normalized=normalizePrototypeEnv(source),folded=foldMultiPlatformProbes(normalized.source,format);
+ const simplified=simplify(folded.source),pruned=pruneUnusedEnvMethods(simplified,format);
  process.stdout.write(JSON.stringify({
   normalized:normalized.normalized,
   folded:folded.folded,
