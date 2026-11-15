@@ -2549,7 +2549,13 @@ function evaluate(n,env,ctx,depth=0){
    if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)throw Error('unreviewed member use');
    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||use?.type==='UnaryExpression'&&use.operator==='delete')throw Error('unreviewed member write');
   }
-  const entry=binding.init.properties.find(item=>item.type==='Property'&&key(item)===String(name));
+  const names=new Set();
+  for(const item of binding.init.properties){
+   const field=item.type==='Property'&&item.kind==='init'&&!item.computed?key(item):undefined;
+   if(field===undefined||field==='__proto__'||names.has(field))throw Error('unreviewed member object');
+   names.add(field);
+  }
+  const entry=binding.init.properties.find(item=>key(item)===String(name));
   if(entry?.value?.type!=='Literal')throw Error('unreviewed member value');
   return entry.value.value;
  }

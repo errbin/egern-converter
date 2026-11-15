@@ -160,6 +160,14 @@ class CachedShellFamilyTests(unittest.TestCase):
                                           "var offsets={'index':0x20,'base':0x10};unknown(offsets);"),
             'non_literal_value':valid.replace("var offsets={'index':0x20,'base':0x10};",
                                               "var other=0x20;var offsets={'index':other,'base':0x10};"),
+            'spread_member':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                          "var other={'index':0x30};var offsets={'index':0x20,...other,'base':0x10};"),
+            'computed_member':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                            "var key='index';var offsets={[key]:0x20,'base':0x10};"),
+            'getter_member':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                          "var offsets={get 'index'(){return 0x20},'base':0x10};"),
+            'duplicate_member':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                             "var offsets={'index':0x20,'index':0x30,'base':0x10};"),
         }
         for name,source in cases.items():
             with self.subTest(name=name):
