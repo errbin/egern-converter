@@ -787,6 +787,24 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   });
  }
  const shapeHostValues=new WeakSet();
+ // 宿主请求整体出现在逻辑链里时，只有最终仍只做真值判断或读取静态请求字段，
+ // 才不构成对象逃逸。`($request || {}).url` 与 `typeof $request !== 'undefined'
+ // && $request` 都只观察宿主对象身份；赋值、传参、动态字段和返回值继续拒绝。
+ const hostRequestProbeSafe=node=>{
+  let current=node,parent=parents.get(current);
+  while(parent?.type==='LogicalExpression'&&(parent.left===current||parent.right===current)){
+   current=parent;parent=parents.get(current);
+   while(parent?.type==='ChainExpression'&&parent.expression===current||parent?.type==='ParenthesizedExpression'&&parent.expression===current){current=parent;parent=parents.get(current);}
+  }
+  if(parent?.type==='MemberExpression'&&parent.object===current){
+   const name=property(parent);
+   return name!==undefined&&['url','method','headers','body'].includes(String(name));
+  }
+  if(parent?.type==='UnaryExpression'&&['!','typeof'].includes(parent.operator))return true;
+  if(['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(parent?.type)&&parent.test===current)return true;
+  if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator))return true;
+  return parent?.type==='ExpressionStatement'&&parent.expression===current;
+ };
  const hostResponseBindings=new WeakSet();
  const closedHostResponseSnapshotBindings=new WeakSet();
  let hostRequestSnapshot=null,hostRequestInitializers=[],hostResponseSnapshot=null,hostResponseInitializers=[];
@@ -4627,7 +4645,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     // 被替换为本地纯数据快照；仍残留宿主引用说明正文/头部读取未证明，必须拒绝。
     const emptyFallback=p?.type==='LogicalExpression'&&['||','??'].includes(p.operator)&&p.left===n&&
       p.right.type==='ObjectExpression'&&!p.right.properties.length;
-    if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n&&!emptyFallback)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
+    if(!shapeHostValues.has(n)&&!nullCheck&&!(p?.type==='MemberExpression'&&p.object===n)&&!(p?.type==='UnaryExpression'&&['typeof','!'].includes(p.operator))&&!(p?.type==='LogicalExpression'&&p.left===n&&!emptyFallback)&&!(['IfStatement','ConditionalExpression'].includes(p?.type)&&p.test===n)&&!(p?.type==='ExpressionStatement'&&p.expression===n)&&!(n.name==='$request'&&hostRequestProbeSafe(n)))fail(n,'请求 / 响应对象整体传递无法证明字段语义，须直接读取具体字段');
    }
    if(map[n.name])return map[n.name];
    // QX 脚本常用裸 $prefs 和成员真值探测来兼容多平台存储。目标宿主只暴露
