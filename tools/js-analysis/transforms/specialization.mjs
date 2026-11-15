@@ -1514,24 +1514,60 @@ export function lowerAsyncRegenerator(source){
  const {nodes,parents,bindings,owners,free}=ix;
  const edits=[],released=[];
  const wraps=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='wrap'&&n.arguments.length>=2&&functions.has(n.arguments[0]?.type));
- const resolveFunction=callee=>{
-  if(callee?.type!=='Identifier')return null;
-  const binding=bindings.get(callee);
-  if(!binding||binding.writes.length)return null;
-  const value=binding.fn??binding.init;
-  return functions.has(value?.type)?value:null;
+ // 解出本地函数值。除裸标识符外，闭合字面量表上的静态成员也属于同一
+ // 函数身份；表必须无成员写入，整体引用只能是静态成员读取。
+ const functionAt=(callee,seen=new Set(),environment=new Map())=>{
+  if(callee?.type==='Identifier'){
+   const binding=bindings.get(callee);
+   if(!binding||seen.has(binding))return null;
+   if(environment.has(binding))return functionAt(environment.get(binding),seen,environment);
+   if(binding.writes.length)return null;
+   seen.add(binding);
+   const value=binding.fn??binding.init;
+   return functions.has(value?.type)?value:null;
+  }
+  if(callee?.type==='MemberExpression'){
+   const name=property(callee);if(name===undefined)return null;
+   let object=callee.object;
+   if(object.type==='Identifier'){
+    const binding=bindings.get(object);
+    if(!binding||binding.writes.length||seen.has(binding))return null;
+    seen.add(binding);
+    for(const ref of binding.refs){
+     const member=parents.get(ref),use=parents.get(member);
+     if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)return null;
+     if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')return null;
+    }
+    object=binding.init;
+   }
+   if(object?.type!=='ObjectExpression')return null;
+   const entries=object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)===name);
+   return entries.length===1&&functions.has(entries[0].value.type)?entries[0].value:null;
+  }
+  return null;
  };
- const promiseLike=(n,seen=new Set())=>{
+ const promiseLike=(n,seen=new Set(),environment=new Map())=>{
   if(!n||seen.has(n))return false;seen=new Set(seen);seen.add(n);
+  if(n.type==='Identifier'&&environment.has(bindings.get(n)))return promiseLike(environment.get(bindings.get(n)),seen,environment);
   if(n.type==='NewExpression'&&free(n.callee,'Promise'))return true;
+  if(n.type==='ConditionalExpression')return promiseLike(n.consequent,seen,environment)&&promiseLike(n.alternate,seen,environment);
+  if(n.type==='LogicalExpression')return promiseLike(n.left,seen,environment)&&promiseLike(n.right,seen,environment);
   if(n.type==='CallExpression'){
    if(n.callee.type==='MemberExpression'&&free(n.callee.object,'$task')&&property(n.callee)==='fetch')return true;
    if(n.callee.type==='MemberExpression'&&free(n.callee.object,'Promise')&&['resolve','reject','all','allSettled','race','any'].includes(property(n.callee)))return true;
-   const fn=resolveFunction(n.callee);
+   const fn=functionAt(n.callee,new Set(),environment);
    if(fn?.async)return true;
-   if(fn?.body.type==='BlockStatement'&&fn.body.body.at(-1)?.type==='ReturnStatement'){
-    const returns=nodes.filter(r=>r.type==='ReturnStatement'&&owners.get(r)===fn);
-    return returns.length>0&&returns.every(r=>promiseLike(r.argument,seen));
+   if(fn){
+    const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+    if(statements.length===1&&statements[0].type==='ReturnStatement'&&statements[0].argument){
+     const local=new Map(environment);
+     fn.params.forEach((parameter,index)=>{
+      const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+      const argument=n.arguments[index]??(parameter.type==='AssignmentPattern'?parameter.right:undefined);
+      if(binding&&argument)local.set(binding,argument);
+     });
+     return promiseLike(statements[0].argument,seen,local);
+    }
    }
   }
   return false;
@@ -1557,8 +1593,8 @@ export function lowerAsyncRegenerator(source){
   const inner=call.arguments[0];
   if(inner.type!=='FunctionExpression'||inner.async||inner.generator||inner.id||inner.params.length!==1||inner.params[0].type!=='Identifier'||inner.body.type!=='BlockStatement'){reject('异步状态机正文形状未知');continue;}
   const exceptions=machine.exceptions??[];
-  if(exceptions.length!==1||exceptions.some(entry=>typeof entry.tryLoc!=='number'||typeof entry.catchLoc!=='number'||entry.tryLoc>=entry.catchLoc)){reject('异步状态机要求恰好一条有序 catch 边');continue;}
-  const exception=exceptions[0];
+  if(exceptions.length>1||exceptions.some(entry=>typeof entry.tryLoc!=='number'||typeof entry.catchLoc!=='number'||entry.tryLoc>=entry.catchLoc)){reject('异步状态机要求零条或一条有序 catch 边');continue;}
+  const exception=exceptions[0]??null;
   const innerNodes=nodes.filter(n=>n.start>=inner.start&&n.end<=inner.end);
   if(innerNodes.some(n=>n.type==='TryStatement'||n.type==='YieldExpression'||n.type==='AwaitExpression'||n.type==='ThisExpression'||n.type==='Super'||n.type==='MetaProperty'||n.type==='WithStatement')){reject('异步状态机正文含未支持的执行语义');continue;}
   if(innerNodes.some(n=>n.type==='Identifier'&&n.name==='arguments'&&free(n,'arguments'))){reject('异步状态机正文读取 arguments');continue;}
@@ -1573,8 +1609,15 @@ export function lowerAsyncRegenerator(source){
    if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&n.callee.object.type==='Identifier'&&bindings.get(n.callee.object)===contextBinding){
     const name=property(n.callee);
     if(!['stop','abrupt','catch'].includes(name)){invalid='异步状态机上下文调用未知：'+String(name);break;}
-    if(name==='abrupt'&&n.arguments[0]?.type==='Literal'&&n.arguments[0].value!=='return'){invalid='异步状态机仅支持 abrupt return';break;}
+    if(name==='abrupt'){
+     const type=n.arguments[0]?.type==='Literal'?n.arguments[0].value:'return';
+     if(type==='continue'||type==='break'){
+      const target=n.arguments[1];
+      if(target?.type!=='Literal'||!Number.isSafeInteger(target.value)){invalid='异步状态机 abrupt '+type+' 目标不可证明';break;}
+     }else if(type!=='return'){invalid='异步状态机仅支持 abrupt return/continue/break';break;}
+    }
     if(name==='catch'){
+     if(!exception){invalid='异步状态机缺少 catch 保存点';break;}
      const value=n.arguments[0];
      if(value?.type!=='Literal'||typeof value.value!=='number'||value.value!==exception.tryLoc){invalid='异步状态机 catch 保存点不可证明';break;}
     }
@@ -1593,6 +1636,15 @@ export function lowerAsyncRegenerator(source){
    const argument=n.argument;
    const parts=argument.type==='SequenceExpression'?argument.expressions:[argument];
    const tail=parts.at(-1);
+   // regenerator 的 abrupt continue/break 携带下一状态。扁平异步循环中该值
+   // 必须写成 next 再回到分派循环；只有独立调用且目标为安全整数时才允许。
+   if(argument.type==='CallExpression'&&argument.callee.type==='MemberExpression'&&bindings.get(argument.callee.object)===contextBinding&&property(argument.callee)==='abrupt'){
+    const type=argument.arguments[0]?.type==='Literal'?argument.arguments[0].value:'return';
+    if((type==='continue'||type==='break')&&argument.arguments[1]?.type==='Literal'&&Number.isSafeInteger(argument.arguments[1].value)){
+     returnEdits.push({start:n.start,end:n.end,replacement:context.name+'.next = '+argument.arguments[1].value+'; continue;'});
+     continue;
+    }
+   }
    // 终止返回只要求序列尾部是状态机的 stop/abrupt/catch；前缀保持原文执行，
    // 因此日志或完成副作用仍按原顺序发生，不能丢弃也不能重排。
    if(tail?.type==='CallExpression'&&tail.callee.type==='MemberExpression'&&bindings.get(tail.callee.object)===contextBinding&&['stop','abrupt','catch'].includes(property(tail.callee)))continue;
@@ -1606,10 +1658,10 @@ export function lowerAsyncRegenerator(source){
     if(part.type==='AssignmentExpression'&&part.operator==='='&&part.left.type==='MemberExpression'&&bindings.get(part.left.object)===contextBinding&&property(part.left)==='prev'&&part.right.type==='Literal'&&typeof part.right.value==='number'){
      prefix.push(source.slice(part.start,part.end)+';');continue;
     }
-    // 状态上下文之外的普通赋值和日志观察按原顺序保留；任何读取或写入状态
-    // 槽的前缀都拒绝，避免降低后的 next/sent 控制流被原文改写。
-    if(part.type==='AssignmentExpression'&&part.operator==='='&&!mentionsContext(part)){prefix.push(source.slice(part.start,part.end)+';');continue;}
-    if(logObservation(part)){prefix.push(source.slice(part.start,part.end)+';');continue;}
+    // 状态上下文之外的普通表达式按原顺序保留。它们在原生成器中于挂起前
+    // 同步求值，扁平异步循环中的位置也相同；只有读写状态槽的表达式会改变
+    // next/sent 控制流，必须继续拒绝。
+    if(!mentionsContext(part)&&!['AwaitExpression','YieldExpression'].includes(part.type)){prefix.push(source.slice(part.start,part.end)+';');continue;}
     returnError='异步挂起返回含未知前置表达式：第 '+(source.slice(0,part.start).split('\n').length)+' 行';break;
    }
    if(returnError)break;
@@ -1695,7 +1747,9 @@ export function lowerAsyncRegenerator(source){
   const contextName=inner.params[0].name;
   const errorName=freshErrorName(ix);
   const switchText=applyLocalEdits(source.slice(dispatch.start,dispatch.end),returnEdits.map(edit=>({...edit,start:edit.start-dispatch.start,end:edit.end-dispatch.start})));
-  const loopText='for(;;){try{'+switchText+'}catch('+errorName+'){if('+contextName+'.prev >= '+exception.tryLoc+' && '+contextName+'.prev < '+exception.catchLoc+'){'+contextName+'.t0 = '+errorName+';'+contextName+'.next = '+exception.catchLoc+';continue;}throw '+errorName+';}}';
+  const loopText=exception
+   ?'for(;;){try{'+switchText+'}catch('+errorName+'){if('+contextName+'.prev >= '+exception.tryLoc+' && '+contextName+'.prev < '+exception.catchLoc+'){'+contextName+'.t0 = '+errorName+';'+contextName+'.next = '+exception.catchLoc+';continue;}throw '+errorName+';}}'
+   :'for(;;){'+switchText+'}';
   const contextText='var '+contextName+' = {prev: 0, next: 0, sent: void 0, t0: void 0, stop() { return {done: true}; }, abrupt(type, arg) { return {done: true, type: type, arg: arg}; }, catch() { return this.t0; }};';
   const innerStart=inner.body.start+1,innerEnd=inner.body.end-1;
   const bodyEdits=[{start:loop.start-innerStart,end:loop.end-innerStart,replacement:loopText}];

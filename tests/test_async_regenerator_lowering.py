@@ -55,6 +55,10 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
         self.assertFalse(lowered['released'][0]['released'], lowered)
         self.assertIn(reason, lowered['released'][0]['reason'], lowered)
 
+    def assert_not_lowered(self, source):
+        lowered = lower(source)
+        self.assertEqual(lowered['transformations'], [], lowered)
+
     def test_proved_async_machine_lowers_and_preserves_completion(self):
         lowered = lower(SOURCE)
         self.assertEqual(len(lowered['transformations']), 1, lowered)
@@ -69,12 +73,13 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
     def test_async_prefix_effects_terminal_tail_and_saved_error_observation(self):
         prefix = SOURCE.replace(
             '(ctx.prev=0,ctx.next=3,low())',
-            "(console.log('start'),marker='go',ctx.prev=0,ctx.next=3,low())",
+            "(console.log('start'),marker='go',unknown(),ctx.prev=0,ctx.next=3,low())",
         )
         lowered = lower(prefix)
         self.assertEqual(len(lowered['transformations']), 1, lowered)
         self.assertIn("console.log('start');", lowered['source'])
         self.assertIn("marker='go';", lowered['source'])
+        self.assertIn('unknown();', lowered['source'])
         self.assertIn('ctx.next = 3;', lowered['source'])
         self.assertIn('ctx.sent = await', lowered['source'])
 
@@ -101,10 +106,10 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
     def test_async_prefix_context_writes_unknown_calls_and_cross_case_t0_are_rejected(self):
         for source, reason in [
             (SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
-                            "(console.log('start'),unknown(),ctx.prev=0,ctx.next=3,low())"),
+                            "(ctx.sent='bad',ctx.prev=0,ctx.next=3,low())"),
              '异步挂起返回含未知前置表达式'),
             (SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
-                            "(ctx.sent='bad',ctx.prev=0,ctx.next=3,low())"),
+                            "(console.log(ctx.next),ctx.prev=0,ctx.next=3,low())"),
              '异步挂起返回含未知前置表达式'),
             (SOURCE.replace("case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});",
                             "case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});"
@@ -113,6 +118,77 @@ class AsyncRegeneratorLoweringTests(unittest.TestCase):
         ]:
             with self.subTest(source=source):
                 self.assert_not_released(source, reason)
+
+    def test_zero_or_one_ordered_catch_edge_is_supported(self):
+        without_catch = SOURCE.replace(',machine,null,[[0,16]]', ',machine,null').replace(
+            " case 16:ctx.t0=ctx.catch(0);$done({body:'caught'});ctx.next=19;break;", '')
+        lowered = lower(without_catch)
+        self.assertEqual(len(lowered['transformations']), 1, lowered)
+        self.assertNotIn('catch(regeneratorError)', lowered['source'])
+
+        counterexamples = {
+            'two catch edges': SOURCE.replace('[[0,16]]', '[[0,16],[17,19]]'),
+            'catch call without a table edge': SOURCE.replace('[[0,16]]', '[]'),
+        }
+        for name, source in counterexamples.items():
+            with self.subTest(name=name):
+                self.assert_not_lowered(source)
+
+    def test_static_abrupt_continue_and_break_targets_are_supported(self):
+        base = SOURCE.replace(
+            "case 3:if(ctx.sent==='ok'){ctx.next=9;break;}return ctx.abrupt('return',$done({body:'bad'}));",
+            "case 3:return ctx.abrupt('TARGET',9);",
+        )
+        for target in ('continue', 'break'):
+            source = base.replace('TARGET', target)
+            with self.subTest(target=target):
+                lowered = lower(source)
+                self.assertEqual(len(lowered['transformations']), 1, lowered)
+                self.assertIn('ctx.next = 9; continue;', lowered['source'])
+        counterexamples = {
+            'dynamic target': base.replace('TARGET', 'continue').replace(
+                "abrupt('continue',9)", "abrupt('continue',ctx.sent)"),
+            'missing target': base.replace('TARGET', 'continue').replace(
+                "abrupt('continue',9)", "abrupt('continue')"),
+            'non-integer target': base.replace('TARGET', 'break').replace(
+                "abrupt('break',9)", "abrupt('break',1.5)"),
+        }
+        for name, source in counterexamples.items():
+            with self.subTest(name=name):
+                self.assert_not_lowered(source)
+
+    def test_closed_function_and_object_method_promise_forwarding(self):
+        forwarding = {
+            'function parameter': (
+                "function later(value){return Promise.resolve(value)}"
+                "function forward(fn,value){return fn(value)}"
+                "function low(){return forward(later,'ok')}"),
+            'function return': (
+                "function identity(value){return value}"
+                "function low(){return identity(Promise.resolve('ok'))}"),
+            'object method': (
+                "const ops={later:function(value){return Promise.resolve(value)}};"
+                "function low(){return ops.later('ok')}"),
+        }
+        for name, replacement in forwarding.items():
+            with self.subTest(name=name):
+                lowered = lower(SOURCE.replace("function low(){return Promise.resolve('ok')}", replacement))
+                self.assertEqual(len(lowered['transformations']), 1, lowered)
+
+        counterexamples = {
+            'unknown function': "function low(){return unknown('ok')}",
+            'dynamic member': (
+                "const ops={later:function(value){return Promise.resolve(value)}};"
+                "const key='later';function low(){return ops[key]('ok')}"),
+            'mutated table field': (
+                "const ops={later:function(value){return Promise.resolve(value)}};"
+                "ops.later=unknown;function low(){return ops.later('ok')}"),
+        }
+        for name, replacement in counterexamples.items():
+            with self.subTest(name=name):
+                self.assert_not_released(
+                    SOURCE.replace("function low(){return Promise.resolve('ok')}", replacement),
+                    '异步挂起返回不是本地可证明的 Promise 调用')
 
     def test_non_promise_suspension_is_not_released(self):
         self.assert_not_released(SOURCE.replace('(ctx.prev=0,ctx.next=3,low())',
