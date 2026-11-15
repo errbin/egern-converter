@@ -2772,6 +2772,53 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      }
      return calls?.length?{fn,position,calls}:null;
     };
+    // 不透明记录只表示字段集合未知，不表示对象身份可以逃逸。静态对象字面量
+    // 和 JSON.parse 等运行期解析结果都会产生新的闭合对象；自由全局、未知
+    // 函数调用、响应对象成员等仍必须拒绝。参数若没有可闭合调用点，只能是
+    // 合成包装器自身的输入，字段读写仍由派发适配器的静态检查约束。
+    const opaqueActual=node=>{
+     if(!node)return true;
+     if(node.type==='Literal'&&typeof node.value==='string'||node.type==='TemplateLiteral')return true;
+     if(node.type==='Identifier'){
+      if(free(node,'$request'))return true;
+      const recordBinding=bindings.get(node);if(!recordBinding)return false;
+      if(recordBinding.init)return opaqueActual(recordBinding.init);
+      if(recordBinding.writes.length)return recordBinding.writes.every(write=>write.type==='AssignmentExpression'&&write.operator==='='&&opaqueActual(write.right));
+      const site=parameterCallSites(recordBinding);
+      if(site)return site.calls.every(entry=>{
+       let actual=entry.actual,formal=site.fn.params[site.position];
+       if(!actual||free(actual,'undefined'))actual=formal?.type==='AssignmentPattern'?formal.right:null;
+       return !actual||opaqueActual(actual);
+      });
+      // 没有可闭合调用点的参数只在所属函数的使用面仍然闭合时才允许。
+      // 否则该参数可能是外部注入的任意值，不能因为字段集合未知就放行。
+      const owner=parameterFunctions.get(recordBinding)?.[0]?.fn;
+      return !!owner&&functionUseSurfaceClosed(owner,true);
+     }
+     if(node.type==='ObjectExpression')return true;
+     if(node.type==='CallExpression'){
+      if(node.callee.type==='MemberExpression'&&free(node.callee.object,'JSON')&&property(node.callee)==='parse')return true;
+      if(node.callee.type!=='Identifier')return false;
+      const resolved=target(node.callee);
+      if(!resolved||resolved.async||resolved.generator)return false;
+      const returns=[];
+      (function walk(part){
+       if(!part||part!==resolved&&functions.has(part.type))return;
+       if(part.type==='ReturnStatement'){returns.push(part);return;}
+       for(const key of Object.keys(part)){
+        const value=part[key];
+        if(Array.isArray(value))for(const child of value)if(child&&typeof child.type==='string')walk(child);
+        else if(value&&typeof value.type==='string')walk(value);
+       }
+      })(resolved.body);
+      return returns.length===1&&opaqueActual(returns[0].argument);
+     }
+     if(node.type==='ConditionalExpression')return opaqueActual(node.consequent)&&opaqueActual(node.alternate);
+     if(node.type==='LogicalExpression')return opaqueActual(node.left)&&opaqueActual(node.right);
+     if(node.type==='SequenceExpression')return opaqueActual(node.expressions.at(-1));
+     if(node.type==='AssignmentExpression')return node.operator==='='&&opaqueActual(node.right);
+     return false;
+    };
     // 记录字段集合优先静态枚举。实参本身可以是不透明的运行期请求值，但只有
     // 参数绑定未复制、未逃逸、只访问白名单字段且只有一个派发点时才会走到这里。
     // 参数入口的一次自我快照（如 t={...defaults,...t}）仍要求旧字段集合由
@@ -2785,6 +2832,32 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
         node.consequent.properties[0].value.type!=='Identifier'||bindings.get(node.consequent.properties[0].value)!==bindings.get(node.alternate))return null;
      return node.alternate;
     };
+    // 请求参数可以在入口按运行期类型重绑为新的对象快照。重绑只允许出现
+    // 白名单静态键、自身展开和无副作用的空展开；字段值仍随原代码求值，
+    // 但对象身份不会经动态键或未知 spread 逃逸。
+    const noOpSpread=argument=>free(argument,'undefined')||
+      argument?.type==='UnaryExpression'&&argument.operator==='void'&&argument.argument.type==='Literal'||
+      argument?.type==='Literal'&&argument.value==null;
+    const safeRebindRecord=node=>{
+     if(node?.type!=='ObjectExpression')return false;
+     for(const entry of node.properties){
+      if(entry.type==='SpreadElement'){
+       const argument=entry.argument;
+       if(noOpSpread(argument))continue;
+       if(argument.type==='Identifier'&&sameBinding(argument)){if(!selfFields)return false;continue;}
+       if(argument.type==='Identifier'&&recordFields(argument,new Set(),selfFields))continue;
+       if(argument.type==='ObjectExpression'&&safeRebindRecord(argument))continue;
+       return false;
+      }
+      if(entry.type!=='Property'||entry.kind!=='init'||entry.method||key(entry)===undefined||!fields.includes(String(key(entry))))return false;
+     }
+     return true;
+    };
+    const safeRebind=write=>write?.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&sameBinding(write.left)&&safeRebindRecord(write.right);
+    // 入口把字符串实参归一成 {url} 的单次自快照仍是闭合重绑：条件表达式
+    // 只读 typeof 自身，另一分支就是参数本身，没有动态键或身份逃逸。
+    const safeSelfRebind=write=>write?.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&sameBinding(write.left)&&!!selfStringRecord(write.right);
+    const safeRebindWrite=write=>safeRebind(write)||safeSelfRebind(write);
     const recordFields=(node,seen=new Set(),selfFields=null,boundary=null)=>{
      if(free(node,'$request'))return new Set(['url','method','headers','body','bodyBytes']);
      if(node?.type==='Literal'&&typeof node.value==='string'||node?.type==='TemplateLiteral')return new Set(['url']);
@@ -2849,6 +2922,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      for(const entry of node.properties){
       if(entry.type==='SpreadElement'){
        const argument=entry.argument;
+       if(noOpSpread(argument))continue;
        if(argument.type==='Identifier'&&sameBinding(argument)){
         if(!selfFields)return null;
         for(const name of selfFields)result.add(name);
@@ -2884,6 +2958,35 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
        return dispatchesThrough(dispatch,inner,next);
       });
      };
+     // 请求记录交给闭合的日志观察函数时只读取参数；只要该函数的实参
+     // 只流向 console/JSON.stringify/同类观察函数，就不构成身份逃逸。
+     const observationFunction=(fn,seen=new Set())=>{
+      if(!fn||seen.has(fn))return false;
+      const next=new Set(seen);next.add(fn);
+      return fn.params.every(parameter=>{
+       const id=parameter.type==='AssignmentPattern'?parameter.left:parameter;
+       const binding=id.type==='Identifier'?bindings.get(id):null;
+       if(!binding)return false;
+       return binding.refs.every(ref=>{
+        const parent=parents.get(ref),use=parents.get(parent);
+        if(parent?.type==='AssignmentExpression'&&parent.left===ref)return false;
+        if(parent?.type==='UpdateExpression'||parent?.type==='UnaryExpression'&&parent.operator==='delete')return false;
+        if(parent?.type==='MemberExpression'&&parent.object===ref){
+         if(use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===parent)return false;
+         return true;
+        }
+        if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){
+         if(parent.callee.type==='MemberExpression'&&free(parent.callee.object,'console'))return true;
+         if(parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify')return true;
+         if(free(parent.callee,'$log'))return true;
+         const inner=target(parent.callee);
+         return !!inner&&observationFunction(inner,next);
+        }
+        if(['BinaryExpression','LogicalExpression','UnaryExpression','ConditionalExpression','IfStatement','SwitchStatement','TemplateLiteral'].includes(parent?.type))return true;
+        return false;
+       });
+      });
+     };
      const ok=sourceBinding.refs.every(ref=>{
       if(ref===actual)return true;
       const member=parents.get(ref),use=parents.get(member);
@@ -2897,6 +3000,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
        if(member.callee.type==='MemberExpression'&&free(member.callee.object,'JSON')&&property(member.callee)==='stringify')return true;
        if(consoleObservation(member))return true;
        if(free(member.callee,'$log'))return true;
+       const observer=target(member.callee);
+       if(observer&&observationFunction(observer))return true;
        if(dispatchesThrough(member,ref))return true;
       }
       return false;
@@ -2960,6 +3065,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      const result=fieldValueAbsent(write.right,seen);
      return result;
     };
+    let parameterOpaque=false;
     const parameterRecords=()=>{
      if(!parameter)return null;
      const site=parameterCallSites(binding);
@@ -2978,20 +3084,27 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       // 完整使用面仍是闭合静态调用面时，才能把该实参路径视为不可达。
       return replyCallers(fn).length===0&&functionUseSurfaceClosed(fn,false);
      };
+     let opaque=true;
      const records=site.calls.map(entry=>{
       let actual=entry.actual,formal=site.fn.params[site.position];
       if(!actual||free(actual,'undefined')||actual.type==='UnaryExpression'&&actual.operator==='void'&&actual.argument.type==='Literal')actual=formal?.type==='AssignmentPattern'?formal.right:null;
       if(actual&&deadActual(actual))return undefined;
-      if(actual&&!safeRecordSource(actual,entry.call))return null;
+      if(actual&&!safeRecordSource(actual,entry.call)){opaque=false;return null;}
       const record=actual?recordFields(actual,new Set(),null,entry.call):null;
+      if(actual&&!record&&!opaqueActual(actual))opaque=false;
       return record;
      });
+     parameterOpaque=opaque;
      const live=records.filter(record=>record!==undefined);
      return live.length?live:null;
     };
     const sourceRecords=parameter?parameterRecords():null;
     if(parameter&&!sourceRecords)return false;
     const selfFields=sourceRecords?.every(Boolean)?new Set(sourceRecords.flatMap(record=>[...record])):null;
+    // 调用点可能是 JSON.parse 等运行期配置。字段集合因此未知，但只要参数
+    // 绑定本身仍只做白名单静态字段读写并在唯一派发前完成，就可以在发送时
+    // 读取运行期记录；未知的是字段是否存在，不是对象身份或字段名。
+    const opaqueRecords=!!sourceRecords&&sourceRecords.some(record=>!record)&&parameterOpaque;
     const baseFields=parameter?selfFields:binding.init&&recordFields(binding.init);
     let finalFields=null;
     if(!parameter){
@@ -3001,12 +3114,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      finalFields=recordFields(binding.init,new Set(),null,request);
      if(!finalFields)return false;
     }else{
-     if(binding.writes.length>1)return false;
      if(binding.writes.length){
-      const write=binding.writes[0];
-      if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='Identifier'||!sameBinding(write.left))return false;
-      finalFields=recordFields(write.right,new Set(),selfFields);
-      if(!finalFields)return false;
+      if(binding.writes.some(write=>!safeRebindWrite(write)))return false;
+      const records=binding.writes.map(write=>recordFields(write.right,new Set(),selfFields));
+      finalFields=records.every(Boolean)?new Set(records.flatMap(record=>[...record])):null;
      }
     }
     const dispatchOf=ref=>{
@@ -3032,6 +3143,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     // 只有两两互斥时才允许多个派发点；顺序执行的两个接收者仍然拒绝。
     const exclusive=(a,b)=>{
      for(let ancestor=parents.get(a);ancestor;ancestor=parents.get(ancestor)){
+      if(ancestor.type==='SwitchStatement'){
+       const caseUnder=node=>{let child=node;while(child&&parents.get(child)!==ancestor)child=parents.get(child);return child?.type==='SwitchCase'?child:null;};
+       const left=caseUnder(a),right=caseUnder(b);
+       if(!left||!right||left===right)continue;
+       const cases=ancestor.cases,leftIndex=cases.indexOf(left),rightIndex=cases.indexOf(right);
+       if(leftIndex<0||rightIndex<0)continue;
+       const earlier=Math.min(leftIndex,rightIndex),later=Math.max(leftIndex,rightIndex);
+       const abrupt=entry=>{const last=entry.consequent.at(-1);return last&&['BreakStatement','ReturnStatement','ThrowStatement','ContinueStatement'].includes(last.type);};
+       if(cases.slice(earlier,later).every(abrupt))return true;
+       continue;
+      }
       if(ancestor.type!=='IfStatement'&&ancestor.type!=='ConditionalExpression')continue;
       const consequent=ancestor.consequent,alternate=ancestor.alternate;if(!consequent||!alternate)continue;
       const side=(node,part)=>part.start<=node.start&&node.end<=part.end;
@@ -3044,7 +3166,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(dispatches.length>1&&!dispatches.every((a,i)=>dispatches.every((b,j)=>i===j||exclusive(a,b))))return false;
     const dispatch=dispatches[0],dispatchSet=new Set(dispatches);
     const firstDispatch=dispatches.reduce((a,b)=>a.start<=b.start?a:b);
-    if(parameter&&binding.writes.length&&binding.writes[0].end>=firstDispatch.start)return false;
+    if(parameter&&binding.writes.some(write=>write.end>=firstDispatch.start))return false;
+    if(parameter&&binding.writes.length>1&&!binding.writes.every((a,i)=>binding.writes.every((b,j)=>i===j||exclusive(a,b))))return false;
     // 请求对象仍可能被派发后才运行的定时器或回调捕获。这些捕获不能改写已发送
     // 的内容，但也不得修改记录或创建可再次派发的别名。
     const dispatchOwner=owners.get(dispatch),deferredFns=new Set();
@@ -3108,22 +3231,33 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       if(mutatesRequest(ref)||deferredEscape(ref))return false;
       continue;
      }
-     if(parameter&&binding.writes.length&&ref.start>=binding.writes[0].right.start&&ref.end<=binding.writes[0].right.end){
-      let child=ref,parent=parents.get(child);
-      while(parent&&child!==binding.writes[0].right){
-       if(['CallExpression','NewExpression','ReturnStatement'].includes(parent.type))break;
-       child=parent;parent=parents.get(child);
+     const rewrite=parameter&&binding.writes.find(write=>ref.start>=write.right.start&&ref.end<=write.right.end);
+     if(rewrite&&(safeRebind(rewrite)||selfStringRecord(rewrite.right))){
+      if(safeRebind(rewrite)){
+       if(p?.type==='SpreadElement'&&p.argument===ref&&q===rewrite.right)continue;
+       if(p?.type==='Property'&&p.value===ref&&q===rewrite.right&&key(p)==='url')continue;
+      }else{
+       let child=ref,parent=parents.get(child);
+       while(parent&&child!==rewrite.right){
+        if(['CallExpression','NewExpression','ReturnStatement'].includes(parent.type))break;
+        child=parent;parent=parents.get(child);
+       }
+       if(child===rewrite.right||parent===rewrite.right)continue;
       }
-      if(child===binding.writes[0].right||parent===binding.writes[0].right)continue;
      }
      if(p?.type==='AssignmentExpression'&&p.left===ref){
-      if(!parameter||binding.writes.length!==1||binding.writes[0]!==p)return false;
+      if(!parameter||!safeRebindWrite(p))return false;
       continue;
      }
      if(p?.type==='Property'&&p.value===ref&&parents.get(p)===input&&key(p)==='url'&&bindings.get(selfURLSpread(input))===binding)continue;
      if(p?.type==='SpreadElement'&&p.argument===ref&&q===input&&selfURLSpread(input)===ref)continue;
      if(p?.type!=='MemberExpression'||p.object!==ref||property(p)===undefined)return false;
      const field=String(property(p));
+     // 平台包装器会按 `constructor` 区分字符串与对象请求，再分别生成闭合
+     // 快照。该读取只作为 switch 判别式，且 case 仅比较内建构造器，不会
+     // 把请求记录本身交给外部代码。
+     if(field==='constructor'&&q?.type==='SwitchStatement'&&q.discriminant===p&&
+        q.cases.every(entry=>!entry.test||entry.test.type==='Identifier'&&['Object','String','Number','Boolean','Array','Function'].includes(entry.test.name)))continue;
      // 参数记录的字段集合来自所有闭合调用点。读取一个在所有记录中都不存在的
      // 字段等价于 undefined；只允许这种静态缺席读取，不能把任意未知字段
      // 视为可转发。原型链上的名字仍按未知字段拒绝。
@@ -3215,7 +3349,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      }
      return false;
     };
-    const urlDefinite=(finalFields??(parameter?selfFields:null))?.has('url')||!parameter&&sourceRecords?.every(record=>record.has('url'))||assignedBefore('url');
+    const urlDefinite=(finalFields??(parameter?selfFields:null))?.has('url')||opaqueRecords||!parameter&&sourceRecords?.every(record=>record.has('url'))||assignedBefore('url');
     if(!urlDefinite)return false;
     return true;
    };
