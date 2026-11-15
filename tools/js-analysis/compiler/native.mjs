@@ -955,9 +955,27 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(!binding||binding.writes.length)return false;
   const keys=factory.properties.map(p=>p.type==='Property'&&p.kind==='init'?key(p):undefined);
   if(keys.some(k=>k===undefined||k==='__proto__')||new Set(keys).size!==keys.length)return false;
+  // 实例的裸值读取只有在可证明不会写入对象、也不会交给可能改写它的代码时
+  // 才保持闭合。真值/typeof 观察只读取当前值；直接返回给 Array#forEach 的
+  // 回调返回值会被标准方法丢弃，同样不会暴露实例。其它返回、传参或运算都
+  // 可能把实例交给未知消费者，继续拒绝。
+  const readOnlyInstanceEscape=ref=>{
+   let value=ref;
+   while(parents.get(value)?.type==='SequenceExpression'&&parents.get(value).expressions.at(-1)===value)value=parents.get(value);
+   const use=parents.get(value);
+   if(use?.type==='UnaryExpression'&&['!','typeof','void'].includes(use.operator))return true;
+   if(['IfStatement','WhileStatement','DoWhileStatement','ForStatement'].includes(use?.type)&&use.test===value)return true;
+   if(use?.type==='ConditionalExpression'&&use.test===value)return true;
+   const fn=use?.type==='ReturnStatement'&&use.argument===value?owners.get(use)
+    :use?.type==='ArrowFunctionExpression'&&use.body===value?use:null;
+   if(!fn)return false;
+   const call=parents.get(fn);
+   return !!fn&&functions.has(fn.type)&&call?.type==='CallExpression'&&call.callee.type==='MemberExpression'&&
+    property(call.callee)==='forEach'&&call.callee.object.type==='ArrayExpression'&&call.arguments.includes(fn);
+  };
   return binding.refs.every(ref=>{
    const member=parents.get(ref);
-   if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)return false;
+   if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)return readOnlyInstanceEscape(ref);
    let outer=member;
    while(parents.get(outer)?.type==='MemberExpression'&&parents.get(outer).object===outer)outer=parents.get(outer);
    const use=parents.get(outer);
