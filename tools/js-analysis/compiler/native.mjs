@@ -3161,6 +3161,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(q?.type==='UpdateExpression')return false;
      if(q?.type==='UnaryExpression'&&q.operator==='delete'&&q.argument===p){if(field==='url'||!(q.end<firstDispatch.start))return false;continue;}
      if(q?.type==='CallExpression'&&q.arguments.includes(p)){
+      // QX 的请求记录在发送前常把静态选项合并进 `req.opts`。该对象现在会
+      // 参与实时选项投影，因此动态键、未知来源、未知字段和派发后的写入都
+      // 必须在缺席字段的宽松分支之前拒绝，不能把 opts 当成可忽略的新字段。
+      if(field==='opts'&&qx&&free(q.callee.object,'Object')&&property(q.callee)==='assign'&&q.arguments[0]===p){
+       const valid=q.end<firstDispatch.start&&q.arguments.slice(1).every(argument=>{
+        const object=resolve(argument);
+        return object?.type==='ObjectExpression'&&object.properties.every(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.computed&&['redirection','skip-cert-verify','auto-cookie','policy','hints'].includes(String(key(entry))));
+       });
+       if(!valid)return false;
+       continue;
+      }
       if(field==='headers'&&free(q.callee.object,'Object')&&property(q.callee)==='assign'){if(!(q.end<firstDispatch.start))return false;continue;}
       // `req.opts=Object.assign({},req.opts,...)` 只把旧选项复制进新对象，
       // 不会改写原记录；以 opts 本身为目标或复制后再逃逸仍由后续检查拒绝。
@@ -3226,11 +3237,11 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     const methodValue=method?.expression?render(method.expression):`${request}?.method`;
     const callee=method?.value?render(method.value):dynamicMethod?`((${selector}) => {${selector}=String(${selector} ?? 'get').toLowerCase();if (!['get','post','put','delete','head','options','patch'].includes(${selector})) throw new TypeError('Unsupported HTTP method');return ${context}.http[${selector}];})(${methodValue}).bind(${context}.http)`:`${context}.http.${(method||'GET').toLowerCase()}`;
     const url=`typeof ${request} === 'string' ? ${request} : ${request}.url`;
-    const headers=`${request}?.headers ?? ${request}?.header`,body=`${request}?.bodyBytes ?? ${request}?.body`,policy=`${request}?.policy ?? ${request}?.node`;
+    const headers=`${request}?.headers ?? ${request}?.header`,body=`${request}?.bodyBytes ?? ${request}?.body`,policy=`${request}?.opts?.policy ?? ${request}?.policy ?? ${request}?.node`,redirect=`${request}?.opts?.["redirection"] ?? ${request}?.["auto-redirect"]`,credentials=`${request}?.opts?.["auto-cookie"] ?? ${request}?.["auto-cookie"]`,insecure=`${request}?.opts?.["skip-cert-verify"] ?? ${request}?.insecure`;
     // QX 未设置 timeout 时由平台使用缺省 5000ms；省略字段与写出缺省值等价。
     // 显式值（包括运行期确定的非 undefined 值）仍按毫秒原样转发。
     const options=qx
-     ?`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), ...(${request}?.timeout === undefined ? {} : {timeout: ${request}.timeout}), ...((${policy}) === undefined ? {} : {policy: ${policy}}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] ? 'include' : 'omit', insecureTls: ${request}?.insecure === true}`
+     ?`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), ...(${request}?.timeout === undefined ? {} : {timeout: ${request}.timeout}), ...((${policy}) === undefined ? {} : {policy: ${policy}}), redirect: (${redirect}) === undefined || (${redirect}) ? 'follow' : 'manual', credentials: (${credentials}) ? 'include' : 'omit', insecureTls: (${insecure}) === true}`
      :`{...((${headers}) === undefined ? {} : {headers: ${headers}}), ...((${body}) === undefined ? {} : {body: ${body}}), timeout: ${request}?.timeout === undefined ? 5000 : ${request}.timeout * ${format==='loon'?1:1000}, ...((${policy}) === undefined ? {} : {policy: ${policy}}), ...(${request}?.["policy-descriptor"] === undefined ? {} : {policyDescriptor: ${request}["policy-descriptor"]}), redirect: ${request}?.["auto-redirect"] === undefined || ${request}?.["auto-redirect"] ? 'follow' : 'manual', credentials: ${request}?.["auto-cookie"] === false ? 'omit' : 'include', ...(${request}?.insecure === undefined ? {} : {insecureTls: ${request}.insecure})}`;
     const call=`${callee}(${url}, ${options})`,guard=`if (${request} && typeof ${request} === 'object' && (${request}["binary-mode"] === true || ${request}["full-header-mode"] === true)) throw new Error('Dynamic binary-mode/full-header-mode requires a static HTTP request record');`,code=`((${request}) => {${guard}return ${call};})(${render(input)})`;
     return {code,url,options,callee,dynamic:dynamicMethod,binary:false,full:false,runtimeRequest:{name:request,expression:input,binaryGuard:true}};
