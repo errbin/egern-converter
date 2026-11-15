@@ -12,6 +12,43 @@ class GlobalThisMembershipProbeTests(unittest.TestCase):
         output=convert_script(source,'Fixture',URL,'')
         self.assertIn('return{body:"egern"}',output.replace(' ',''))
 
+    def test_explicit_egern_marker_wins_over_the_source_format(self):
+        # `name in globalThis` 查询的是产物实际宿主能力；作者显式提供 Egern
+        # 分支时应选择该分支，不能按源格式强选 Surge/QX 等旧平台分支。
+        source=("const has=n=>n in globalThis;"
+                "const platform=has('$task')?'qx':has('$loon')?'loon':has('$rocket')?'rocket':"
+                "has('Egern')?'egern':has('$environment')?'surge-family':'other';"
+                "$done({body:platform});")
+        for source_format in ['surge', 'qx', 'loon', 'shadowrocket', 'stash']:
+            with self.subTest(source_format=source_format):
+                output=convert_script(source,'Fixture',URL,'',source_format=source_format)
+                self.assertIn('return{body:"egern"}',output.replace(' ',''))
+
+    def test_optional_environment_version_probe_follows_the_declared_source_platform(self):
+        # 成员判定之外，新版模板还会用 globalThis.$environment 的版本标志。
+        # 它必须和裸 $environment 一样按源格式折叠，不能落入 Node 分支。
+        source=("const has=n=>n in globalThis;"
+                "const platform=has('$task')?'qx':has('$loon')?'loon':has('$rocket')?'rocket':"
+                "Boolean(globalThis.$environment?.['surge-version'])?'surge':"
+                "Boolean(globalThis.$environment?.['stash-version'])?'stash':"
+                "Boolean(globalThis.process?.versions?.node)?'node':'other';"
+                "$done({body:platform});")
+        for source_format, expected in [('surge', 'surge'), ('stash', 'stash'), ('qx', 'other'),
+                                        ('loon', 'other'), ('shadowrocket', 'other')]:
+            with self.subTest(source_format=source_format):
+                output=convert_script(source,'Fixture',URL,'',source_format=source_format)
+                self.assertIn('return{body:"'+expected+'"}',output.replace(' ',''))
+
+    def test_environment_version_probe_stays_rejected_when_the_host_may_be_mutated(self):
+        for change in [
+            "globalThis.$environment=1;",
+            "globalThis['$environment']=1;",
+        ]:
+            source=("const has=n=>n in globalThis;const value=Boolean(globalThis.$environment?.['surge-version']);"
+                    +change+"$done({body:has('$task')?'qx':String(value)});")
+            with self.subTest(change=change),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='surge')
+
     def test_local_prototype_write_does_not_invalidate_host_marker(self):
         source=("function Local(){}Local.prototype.value=1;"
                 "const has=n=>n in globalThis;const platform=has('Egern')?'egern':'other';"

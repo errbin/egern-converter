@@ -71,6 +71,20 @@ class ClosedQxStorageFacadeTests(unittest.TestCase):
         result = compare(source, output, 'qx', URL, fixture)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_optional_storage_selector_keeps_fallback_facade_shape(self):
+        # Surge 源里 $prefs 缺席时 `$prefs?.x ?? $persistentStore.y` 必须
+        # 保留为可识别的存储门面选择器，不能把左值折成 undefined 后丢失门面。
+        source = ("const store={get:this.$prefs?.valueForKey ?? $persistentStore.read,"
+                  "set:(k,v)=>(this.$prefs?.setValueForKey ?? $persistentStore.write)(v,k)};"
+                  "store.set('x','ok');$done({body:store.get('x')});")
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertNotIn('store.set', output)
+        self.assertNotIn('$persistentStore', output)
+        fixture = {'name': 'surge storage facade fallback', 'request': {'url': URL},
+                   'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
     def test_qx_store_facade_rejects_alias_dynamic_member_and_bad_arity(self):
         prefix = ("const store={get:this.$prefs?.valueForKey ?? $persistentStore.read,"
                   "set:(k,v)=>(this.$prefs?.setValueForKey ?? $persistentStore.write)(v,k)};")

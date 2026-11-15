@@ -435,6 +435,43 @@ $done({body:JSON.stringify([text,pattern.source,String(big),result()===undefined
         source = 'const f=async()=>({value:1});f().then(v=>{const x=null;x?.noop().next();$done({body:String(v.value)});});'
         self.assertEqual(self.execute(source, ast=True)['result']['body'], '1')
 
+    def test_optional_call_short_circuit_skips_argument_evaluation(self):
+        # 可选调用在 callee 为空时必须整体短路，不能只把 callee 折成
+        # undefined 后继续求值实参。
+        source = 'let calls=0;const fn=void 0;function side(){calls++;return 1}fn?.(side());$done({body:String(calls)});'
+        self.assertEqual(self.execute(source, ast=True)['result']['body'], '0')
+
+    def test_absent_platform_member_call_short_circuits_before_http_analysis(self):
+        # 同时出现 $httpClient 时源格式按 Loon/Surge 处理，$task 在目标宿主
+        # 缺席；`$task?.fetch(side())` 必须跳过实参并避免伪造 HTTP 派发。
+        source = ('const hasHttp=$httpClient!==undefined;let calls=0;'
+                  'function side(){calls++;return {url:"https://example.test/"}}'
+                  '$task?.fetch(side());$done({body:String(calls)});')
+        output = compile_source(source, source_format='loon')
+        self.assertNotIn('$task', output)
+        self.assertEqual(self.execute(source, ast=True)['result']['body'], '0')
+
+    def test_optional_http_chain_inside_promise_helper_uses_structured_dispatch(self):
+        # 辅助函数可能同时写出可选链形式的两种 HTTP 接收者；结构流程必须
+        # 看穿 ChainExpression，不能把合法派发当普通表达式拒绝。
+        source = ('function request(op){const handle=r=>$done({body:String(r&&r.body)});'
+                  'this.$httpClient?.[op.method||"get"](op,(e,resp,body)=>handle({error:e,...resp,body}));'
+                  'this.$task?.fetch({url:op,...op}).then(handle,handle);}'
+                  'request({url:"https://example.test/",method:"get"});')
+        output = compile_source(source, source_format='loon')
+        compact = output.replace(' ', '')
+        self.assertNotIn('$httpClient', output)
+        self.assertNotIn('$task', output)
+        self.assertNotIn('(void0)(', compact)
+
+    def test_optional_chain_on_runtime_unknown_receiver_is_not_folded(self):
+        # 运行期才可能初始化的接收者仍是未知值，不能把 `obj?.value` 直接
+        # 折成 undefined，否则会掩盖真实分支差异。
+        source = ('let obj;if($request.url==="https://example.test/x")obj={value:1};'
+                  'const x=obj?.value;$done({body:String(x)});')
+        output = compile_source(source, source_format='surge')
+        self.assertIn('obj?.value', output)
+
     def test_typed_byte_conversion_evaluates_business_expression_once(self):
         source = 'let count=0;const buffer=new Uint8Array([9,65,66,8]);function value(){count++;return new DataView(buffer.buffer,1,2)}const result=value();$done({bodyBytes:result,headers:{Count:String(count)}});'
         result = self.execute(source, ast=True)['result']

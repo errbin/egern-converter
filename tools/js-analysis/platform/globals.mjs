@@ -420,7 +420,10 @@ function fold(source,format,options,qxHint){
  // snapshot. Fold only closed membership probes; never fabricate a complete
  // global object or discard an escaped/mutated array.
  const globalMembership=new WeakMap(),keySnapshots=new WeakSet();
- const markers=new Map(['$task','$loon','$rocket','$environment'].map(name=>[name,false]));markers.set('Egern',true);
+ // `globalThis` 成员探针询问的是产物实际宿主能力，而不是作者声明的源格式。
+ // 产物固定运行在 Egern，因此只把 Egern 标记为存在；若脚本显式支持 Egern，
+ // 应走作者给出的目标分支，不能强选 Surge/QX 分支后再猜测其旧 API 语义。
+ const markers=new Map(['$task','$loon','$rocket','$environment','Egern'].map(name=>[name,name==='Egern']));
  // 目标宿主确定没有的 Node/浏览器全局。只有直接读取 `globalThis` 上这些
  // 静态成员时才折叠；动态成员、裸值和任何可能改写成员关系的写入仍拒绝。
  const absentMembers=new Set(['process','require','module','global','window']);
@@ -572,6 +575,38 @@ function fold(source,format,options,qxHint){
   if(globalMembership.has(n))return globalMembership.get(n);
   if(keySnapshots.has(n)){const snapshot=[];records.add(snapshot);return snapshot;}
   if(n.type==='Literal')return n.value;
+ // 可选链必须按整体短路语义求值：`base?.method(args)` 在 base 缺席时
+ // 不会执行 args，也不能只把 callee 折成 undefined 后继续调用。否则会把
+ // 不可达的请求/通知参数重新带入原生分析，甚至生成 `(void 0)(...)`。
+ if(n.type==='ChainExpression'){
+  const shortCircuits=node=>{
+   if(!node)return false;
+   if(node.type==='MemberExpression'){
+    if(node.optional){const object=value(node.object,new Set(seen));if(object===undefined||object===null)return true;}
+    return shortCircuits(node.object);
+   }
+   if(node.type==='CallExpression'){
+    if(node.optional){const callee=value(node.callee,new Set(seen));if(callee===undefined||callee===null)return true;}
+    return shortCircuits(node.callee);
+   }
+   return false;
+  };
+  // `a?.x ?? fallback` 的左值折叠会抹掉存储门面等后续结构识别所需的
+  // 选择器形状；保留原文同样能由 ??. 的短路语义处理，不牺牲正确性。
+  const coalesced=ix.parents.get(n)?.type==='LogicalExpression'&&ix.parents.get(n).operator==='??'&&ix.parents.get(n).left===n;
+  if(!coalesced&&shortCircuits(n.expression))return undefined;
+  return value(n.expression,new Set(seen));
+ }
+ // 新版多平台模板会用 `globalThis.$environment?.["surge-version"]` 判定
+ // Surge/Stash。它与裸 `$environment` 是同一宿主事实，也必须按源格式折叠。
+ if(n.type==='MemberExpression'&&ix.free(n.object,'globalThis')&&property(n)==='$environment'){
+  if(!['surge','stash'].includes(format))return undefined;
+  const environment=Object.create(null);
+  environment['surge-version']=format==='surge'?PRESENT_VERSION:undefined;
+  environment['stash-version']=format==='stash'?PRESENT_VERSION:undefined;
+  records.add(environment);
+  return environment;
+ }
   if(n.type==='MemberExpression'&&ix.free(n.object,'$task')&&property(n)==='fetch'&&types.$task==='object')return PRESENT_VERSION;
   if(n.type==='Identifier'&&ix.free(n)){
    if(Object.hasOwn(types,n.name)&&types[n.name]==='undefined')return undefined;
@@ -595,7 +630,14 @@ function fold(source,format,options,qxHint){
    if(name==='stash-version')return format==='stash'?PRESENT_VERSION:undefined;
   }
   if(n.type==='MemberExpression'&&!n.computed&&ix.free(n.object,'globalThis')&&absentMembers.has(property(n))&&probeBuiltinsStable&&absentMemberProbeResult(n))return undefined;
-  if(n.type==='MemberExpression'){const object=value(n.object,new Set(seen));if(object&&records.has(object)&&Object.hasOwn(object,property(n)))return object[property(n)];}
+ if(n.type==='MemberExpression'){const object=value(n.object,new Set(seen));if(object&&records.has(object)&&Object.hasOwn(object,property(n)))return object[property(n)];}
+ // 平台探测常用 `Boolean(hostMarker)` 把存在哨兵转成分支条件。只折叠单参数
+ // 的内建 Boolean；参数未知时仍保持未知，不能猜测宿主能力。
+ if(n.type==='CallExpression'&&!n.optional&&n.arguments.length===1&&n.callee.type==='Identifier'&&ix.free(n.callee,'Boolean')){
+  const v=value(n.arguments[0],new Set(seen));
+  if(v===PRESENT_VERSION)return true;
+  if(v!==UNKNOWN&&!records.has(v))return !!v;
+ }
   if(n.type==='Identifier'){
    if(ix.free(n,'undefined'))return undefined;
    if(parameters.has(ix.bindings.get(n)))return parameters.get(ix.bindings.get(n));
@@ -830,6 +872,9 @@ function fold(source,format,options,qxHint){
    const v=value(n);
    if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)||typeof v==='number'&&Number.isFinite(v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};
   }
+ // ChainExpression 的整体替换优先于子节点，确保短路链不会只替换 callee
+ // 而保留本应跳过的调用与实参求值。
+ if(n.type==='ChainExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)||typeof v==='number'&&Number.isFinite(v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
   if(n.type==='MemberExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string'].includes(typeof v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
   if(n.type==='BinaryExpression'){const v=value(n);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&(v===undefined||v===null||['boolean','string','number'].includes(typeof v)))return {direct:true,value:v===undefined?'(void 0)':JSON.stringify(v)};}
   if(n.type==='LogicalExpression'){
