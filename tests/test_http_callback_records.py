@@ -100,3 +100,25 @@ $done({body:JSON.stringify(r)});
             with self.subTest(usage=usage), self.assertRaises(ConversionError):
                 convert_script('$httpClient.get("https://api.test/",(e,r,b)=>{' + usage + ';$done({});});',
                                'Fixture', URL, '', source_format='loon')
+
+    def test_truthiness_observation_materializes_a_closed_response_snapshot(self):
+        source = '''$httpClient.get('https://api.test/',(error,response,body)=>{
+if(error){$done({body:'error'});return;}
+$done({body: response ? body + ':' + response.status : 'missing'});
+});'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        result = compare(source, output, 'loon', URL, {
+            'name': 'response truthiness snapshot', 'request': {'url': URL},
+            'http': [{'url': 'https://api.test/', 'body': 'payload', 'status': 202}],
+            'expected': {'result': {'body': 'payload:202'}}})
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_truthiness_does_not_permit_response_escape_or_dynamic_fields(self):
+        usages = [
+            'if(response){foreign(response)}',
+            'if(response){$done({body:response[$argument]})}',
+        ]
+        for usage in usages:
+            source = '$httpClient.get("https://api.test/",(e,response,b)=>{' + usage + ';$done({});});'
+            with self.subTest(usage=usage), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='loon')

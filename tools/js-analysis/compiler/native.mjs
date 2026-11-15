@@ -4373,7 +4373,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
       }
      }
      else if(parent?.type==='CallExpression'&&parent.arguments.includes(ref)){const safeStringify=parent.callee.type==='MemberExpression'&&free(parent.callee.object,'JSON')&&property(parent.callee)==='stringify';if(!target(parent.callee)&&!closedCallbackParameter(parent.callee)&&!safeStringify&&!isPromiseResolver(parent.callee))fail(ref,'HTTP 回调响应对象传入了未知函数：'+source.slice(parent.start,parent.end).slice(0,160));snapshot=true;}
-     else if(closedWholeResponseUse(ref))snapshot=true;}
+     else if(closedWholeResponseUse(ref)||responseReadObserved(ref))snapshot=true;}
     httpReplies.set(binding,{uses:new Set(),body:null,bytes:null,full:h.full,snapshot});
    }
   }
