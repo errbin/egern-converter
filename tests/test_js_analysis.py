@@ -346,3 +346,28 @@ console.log(JSON.stringify({ok:true}));
         result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
                               cwd=Path(__file__).resolve().parents[1],timeout=5)
         self.assertEqual(json.loads(result.stdout),{'ok':True})
+
+    def test_probe_work_limit_retries_with_scoped_symbol_lookup(self):
+        # 500 个同名局部变量会把全局名称解析拖过 200 万次操作上限；作用域
+        # 收缩后同一预算内应完成，且常规脚本不触发这条重试路径。
+        probe="""
+import assert from 'node:assert/strict';
+import {probes} from './tools/js-analysis/analysis/probes.mjs';
+const body=Array.from({length:500},(_,index)=>`function f${index}(){var value=missing${index}();return value.a.b.c.d;}`).join('\\n');
+const shadowed=`const shadow=JSON.parse($argument);
+function shadowed(){const shadow=1;return shadow.leaked.path;}
+function scoped(){const inner=JSON.parse($argument);return inner.local.path;}`;
+const report=probes(body+'\\n'+shadowed+'\\nconst marker="probe-scope-fallback";\\n$done({});');
+assert.ok(!report.probe_skipped,JSON.stringify(report.limits));
+assert.ok(report.strings.includes('probe-scope-fallback'));
+assert.ok(report.limits.includes('按作用域收缩后完成静态分析'));
+assert.ok(report.paths.some(path=>path.join('.')==='local.path'),JSON.stringify(report.paths.slice(0,20)));
+assert.ok(!report.paths.some(path=>path.join('.')==='leaked.path'),JSON.stringify(report.paths.slice(0,20)));
+const direct=probes('const marker="plain-probe";$done({body:marker});');
+assert.ok(!direct.probe_skipped);
+assert.ok(!direct.limits.includes('按作用域收缩后完成静态分析'));
+console.log(JSON.stringify({ok:true}));
+"""
+        result=subprocess.run(['node','--input-type=module','-e',probe],text=True,capture_output=True,check=True,
+                              cwd=Path(__file__).resolve().parents[1],timeout=20)
+        self.assertEqual(json.loads(result.stdout),{'ok':True})
