@@ -155,3 +155,10 @@ crypto provider 回退链；项目没有 Egern crypto 全局或模块加载的�
 - 维持拒绝：`NoAds`、`ximalaya`、`NeteaseMusicVipCrack`、
   `TilingSales_getNav`。
 - 最终 gained 6、lost 0；普查从 279/327、93/109 提升到 285/327、95/109。
+
+## 正式交付文档
+
+- `docs/rejection-register.md`：剩余 14 个失败 URL 的既定拒绝清单，逐项记录
+  缺失能力/证明、已尝试内容、重开路线和权威依据。
+- `docs/regenerator-commit-regression-audit.md`：`727a81f` 相对 `324222f`
+  的全量 327 组合逐 key 回归核对，以及 `38bad28` 的恢复完整性审计。
