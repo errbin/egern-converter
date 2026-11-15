@@ -35,6 +35,78 @@ const options=build({url:"https://a.test","auto-dismiss":true,sound:true});
         self.assertEqual(result['status'],'passed',result)
         self.assertIn('duration:',output)
 
+    def test_branch_written_fields_merge_into_runtime_notification_projection(self):
+        source = '''function send(subtitle,message,openUrl,mediaUrl,copyText,disappearS){
+ let options={};
+ const _u=Boolean(openUrl),_v=Boolean(mediaUrl),_w=Boolean(copyText),_x=disappearS>0;
+ if(typeof $notification!=='undefined'){
+  _u&&(options.url=openUrl,options.action="open-url");
+  _w&&(options.text=copyText,options.action="clipboard");
+  _x&&(options["auto-dismiss"]=disappearS);
+  _v&&(options["media-url"]=mediaUrl);
+  $notification.post("t",subtitle,message,options);
+ }else if(typeof $notify!=='undefined'){
+  _u&&(options["open-url"]=openUrl);
+  _v&&(options["media-url"]=mediaUrl);
+  $notify("t",subtitle,message,options);
+ }
+}
+send('s','m','https://a.test','https://img.test',undefined,0);
+send('c','b',undefined,undefined,'copy',3);
+$done({});'''
+        first={'title':'t','subtitle':'s','body':'m','action':{'type':'openUrl','url':'https://a.test'},
+               'attachment':{'url':'https://img.test'}}
+        clipboard={'title':'t','subtitle':'c','body':'b','action':{'type':'clipboard','text':'copy'},'duration':3}
+        plain={'title':'t','subtitle':'c','body':'b'}
+        for source_format,second in [('surge',clipboard),('loon',clipboard),('qx',plain)]:
+            with self.subTest(source_format=source_format):
+                output=convert_script(source,'Fixture',URL,'',source_format=source_format)
+                self.assertIn('.notify',output)
+                result=compare(source,output,source_format,URL,{
+                    'name':'branch notification options','request':{'url':URL},
+                    'expected':{'events':{'notifications':[first,second]}}})
+                self.assertEqual(result['status'],'passed',result)
+
+    def test_branch_notification_rejects_dynamic_spread_assign_and_alias_escape(self):
+        prefix='''function send(openUrl,key){let options={};
+'''
+        suffix='''$notification.post("t","s","b",options);}$done({});'''
+        cases={
+            'dynamic key':prefix+'options[key]=openUrl;'+suffix,
+            'initial spread':('function send(openUrl,base){let options={...base};options.url=openUrl;'
+                              '$notification.post("t","s","b",options);}$done({});'),
+            'unknown assign':('function send(openUrl){let options={};options.url=openUrl;'
+                              'Object.assign(options,unknown());'
+                              '$notification.post("t","s","b",options);}$done({});'),
+            'alias escape':('function send(openUrl){let options={};options.url=openUrl;'
+                            'const alias=options;unknown(alias);'
+                            '$notification.post("t","s","b",options);}$done({});'),
+            'write after call':('function send(openUrl){let options={};options.url=openUrl;'
+                                '$notification.post("t","s","b",options);options.text="late";}$done({});'),
+        }
+        for name,source in cases.items():
+            with self.subTest(name=name),self.assertRaises(ConversionError):
+                convert_script(source,'Fixture',URL,'',source_format='surge')
+
+    def test_closed_empty_and_initialized_options_keep_notification_identity(self):
+        template='''let empty={};
+let linked={url:"https://a.test"};
+{calls};
+$done({});'''
+        fixture={'name':'closed notification options','request':{'url':URL},'expected':{'events':{'notifications':[
+            {'title':'t','subtitle':'','body':''},
+            {'title':'t','subtitle':'','body':'','action':{'type':'openUrl','url':'https://a.test'}},
+        ]}}}
+        for source_format,calls in [('surge','$notification.post("t","","",empty);$notification.post("t","","",linked)'),
+                                    ('loon','$notification.post("t","","",empty);$notification.post("t","","",linked)'),
+                                    ('qx','$notify("t","","",empty);$notify("t","","",linked)')]:
+            with self.subTest(source_format=source_format):
+                program=template.replace('{calls}',calls)
+                output=convert_script(program,'Fixture',URL,'',source_format=source_format)
+                result=compare(program,output,source_format,URL,fixture)
+                self.assertEqual(result['status'],'passed',result)
+                self.assertIn('.notify',output)
+
     def test_notify_value_escape_still_rejects(self):
         for source in ['const notify=$notify;notify("t","","");$done({});',
                        'unknown($notify);$done({});']:

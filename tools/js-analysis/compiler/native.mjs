@@ -2421,6 +2421,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const plain=value=>!value||free(value,'undefined')||value.type==='UnaryExpression'&&value.operator==='void'&&value.argument.type==='Literal'||values.string(value)||value.type==='ObjectExpression'&&value.properties.every(p=>p.type==='Property'&&p.kind==='init'&&key(p)!==undefined&&!['__proto__','toJSON',field].includes(key(p))&&p.value.type==='Literal');
   return fb.refs.every(ref=>{const call=parents.get(ref);if(call?.type!=='CallExpression'||call.callee!==ref||call.arguments.some(a=>a.type==='SpreadElement'))return false;let actual=call.arguments[position];if((!actual||free(actual,'undefined'))&&fn.params[position].type==='AssignmentPattern')actual=fn.params[position].right;return plain(actual);});
  }
+ // 通知字段只在这份清单内装配；两个投影分支共用同一契约，避免静态
+ // 字段证明与原生字段映射各自漂移。
+ const NOTIFICATION_OPTION_FIELDS=['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'];
  function notification(n){
   const a=n.arguments;if(a.length<1||a.length>4)fail(n,'通知参数数量无法转换');
   let returned=a[3]?.type==='CallExpression'?notificationReturnedFields(a[3]):null;
@@ -2450,11 +2453,26 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    else {
     const mutable=returned??notificationFields(a[3],n)??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
     if(mutable?.stringUrl)out.push(`...(typeof ${argument(3)} === 'string' ? {action: {type: 'openUrl', url: ${argument(3)}}} : {})`);
-    const f=mutable?.fields??object(a[3],'通知参数'),allowed=['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'];
+    const f=mutable?.fields??object(a[3],'通知参数'),allowed=NOTIFICATION_OPTION_FIELDS;
     const value=k=>captured?`${argument(3)}${mutable?.nullable?'?.':''}[${JSON.stringify(k)}]`:render(f.get(k));
     const add=(k,text)=>out.push(`...(${mutable?.nullable?`${argument(3)} != null && `:''}${mutable?.optional.has(k)?`Object.hasOwn(${argument(3)}, ${JSON.stringify(k)}) && `:''}${value(k)} !== undefined ? {${text}} : {})`);
     for(const k of f.keys())if(!allowed.includes(k))fail(a[3],'未适配通知字段：'+k);
-    if(mutable?.returnedRecord){
+    // 可变对象的字段值按运行时读取，但多个 URL 字段若来自不同值仍会产生
+    // 平台相关的操作歧义；该冲突与执行条件无关，必须在装配前拒绝。
+    if(mutable&&!mutable.returnedRecord){
+     const urls=['url','openUrl','open-url'].filter(k=>f.has(k));
+     if(urls.length>1){
+      const first=resolve(f.get(urls[0]));
+      if(!urls.every(k=>{
+       const value=resolve(f.get(k));
+       if(value===first)return true;
+       if(first?.type==='Literal'&&value?.type==='Literal')return typeof first.value===typeof value.value&&first.value===value.value;
+       const a=first?.type==='Identifier'?bindings.get(first):null,b=value?.type==='Identifier'?bindings.get(value):null;
+       return !!a&&a===b&&!a.writes.length;
+      }))fail(a[3],'通知 URL 字段冲突');
+     }
+    }
+    if(mutable){
      const optionsName=fresh('notificationSourceOptions'),resultName=fresh('notificationNativeOptions'),urlName=fresh('notificationSourceUrl'),mediaUrlName=fresh('notificationMediaUrl'),base64Name=fresh('notificationMediaBase64'),mimeName=fresh('notificationMediaMime'),dismissName=fresh('notificationAutoDismiss');
      const statements=[`const ${resultName} = {};`,`const ${urlName} = ${optionsName}?.url ?? ${optionsName}?.openUrl ?? ${optionsName}?.["open-url"];`,`if (${optionsName}?.action === "clipboard") { if (${optionsName}?.text !== undefined) ${resultName}.action = {type: "clipboard", text: ${optionsName}.text}; } else if (${urlName} !== undefined) ${resultName}.action = {type: "openUrl", url: ${urlName}};`,`const ${mediaUrlName} = ${optionsName}?.["media-url"] ?? ${optionsName}?.mediaUrl;`,`if (${mediaUrlName} !== undefined) ${resultName}.attachment = {url: ${mediaUrlName}}; else { const ${base64Name} = ${optionsName}?.["media-base64"]; if (${base64Name} !== undefined) { const ${mimeName} = ${optionsName}?.["media-base64-mime"]; if (${mimeName} === undefined) throw new Error("Base64 notification attachment requires MIME type"); ${resultName}.attachment = {base64: ${base64Name}, mimeType: ${mimeName}}; } }`,`const ${dismissName} = ${optionsName}?.["auto-dismiss"];`,`if (${dismissName} !== undefined) { if (${dismissName} === true) ${resultName}.duration = 10; else if (${dismissName} !== false) { if (typeof ${dismissName} !== "number" || !Number.isFinite(${dismissName}) || ${dismissName} < 0) throw new TypeError("Notification auto-dismiss must be boolean or non-negative seconds"); ${resultName}.duration = ${dismissName}; } }`,`if (${optionsName}?.sound !== undefined) { if (typeof ${optionsName}.sound !== "boolean") throw new TypeError("Notification sound must be boolean"); ${resultName}.sound = ${optionsName}.sound; }`,`return ${resultName};`];
      out.push(`...(((${optionsName}) => {${statements.join(' ')}})(${argument(3)}))`);
@@ -2601,7 +2619,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    required.push(own);
   }
-  if([...fields.keys()].some(k=>!['url','openUrl','open-url','action','text','update-pasteboard','mediaUrl','media-url','media-base64','media-base64-mime','auto-dismiss','sound'].includes(k)))return null;
+  if([...fields.keys()].some(k=>!NOTIFICATION_OPTION_FIELDS.includes(k)))return null;
   return {fields,optional:new Set([...fields.keys()].filter(k=>required.some(s=>!s.has(k)))),nullable:true,stringUrl,returnedRecord:true};
  }
  function notificationFields(ref,call){
@@ -2622,12 +2640,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    }
    return null; // No aliases, deletes, accessors, dynamic keys or unknown calls.
   }
-  if(!writes.length)return null;
+  // 平台折叠可能把全部分支字段写消成无写入；只要初始对象和全部引用都
+  // 已闭合，空字段集合同样可进入运行时投影，不能退回通用逃逸检查。
   const fields=new Map();
   for(const p of initial.properties){if(p.type!=='Property'||p.kind!=='init'||key(p)===undefined||key(p)==='__proto__')return null;fields.set(key(p),p.value);}
   const optional=new Set();
   for(const member of writes){const k=property(member);if(k==='__proto__')return null;if(!fields.has(k))optional.add(k);fields.set(k,parents.get(member).right);}
-  if([...fields.keys()].some(k=>!['url','openUrl','open-url','mediaUrl','media-url','auto-dismiss'].includes(k)))return null;
+  if([...fields.keys()].some(k=>!NOTIFICATION_OPTION_FIELDS.includes(k)))return null;
   return {fields,optional};
  }
  function http(input,method,qx){
