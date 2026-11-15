@@ -802,7 +802,12 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   if(parent?.type==='UnaryExpression'&&['!','typeof'].includes(parent.operator))return true;
   if(['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(parent?.type)&&parent.test===current)return true;
-  if(parent?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator))return true;
+  if(parent?.type==='BinaryExpression'&&['===','!=='].includes(parent.operator))return true;
+  if(parent?.type==='BinaryExpression'&&['==','!='].includes(parent.operator)){
+   const other=parent.left===current?parent.right:parent.left;
+   return other?.type==='Literal'&&other.value===null||free(other,'undefined')||
+    other?.type==='UnaryExpression'&&other.operator==='void'&&other.argument.type==='Literal';
+  }
   return parent?.type==='ExpressionStatement'&&parent.expression===current;
  };
  const hostResponseBindings=new WeakSet();

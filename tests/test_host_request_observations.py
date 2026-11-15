@@ -34,6 +34,9 @@ class HostRequestObservationTests(unittest.TestCase):
             'const saved=$argument&&$request;$done({body:saved.url})',
             'const url=($request||{})[$argument];$done({body:url})',
             'unknown($request||{});$done({})',
+            "unknown($request+'');$done({})",
+            'unknown(String($request));$done({})',
+            "unknown($request=='text');$done({})",
         ]:
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Fixture', URL, '', source_format='surge')
