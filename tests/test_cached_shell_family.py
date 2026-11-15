@@ -99,6 +99,74 @@ class CachedShellFamilyTests(unittest.TestCase):
                 self.assertNotIn('dec2(',data['source'])
                 self.assertNotIn('d5(',data['source'])
 
+    def test_constant_arithmetic_decoder_offsets_fold_and_unproven_offsets_remain_unfolded(self):
+        valid=fixture().replace('d=d-0x10','d=d-(0x20-0x10)')
+        data=fold(valid)
+        self.assertNotIn('error',data)
+        self.assertEqual(data['transformations'],1)
+        self.assertIn('$done({body:"100"+"100"});',data['source'])
+        for name,changed in {
+            'dynamic_offset':fixture().replace('d=d-0x10','d=d-index'),
+            'non_integer_offset':fixture().replace('d=d-0x10','d=d-(0x20/0x3)'),
+        }.items():
+            with self.subTest(name=name):
+                data=fold(changed)
+                self.assertNotIn('error',data)
+                self.assertEqual(data['transformations'],0)
+                self.assertIn('function dec(a,b)',data['source'])
+
+    def test_constant_arithmetic_shell_state_folds_and_unproven_indices_are_rejected(self):
+        valid=(fixture()
+               .replace("this['state']=[0x1,0x0,0x0]","this['state']=[0x2-0x1,0x3-0x3,0x0*0x9]")
+               .replace("--this['state'][0x1]","--this['state'][0x2-0x1]")
+               .replace("--this['state'][0x0]","--this['state'][0x4-0x4]")
+               .replace('for(var i=0x0','for(var i=0x1-0x1')
+               .replace("this['state'][0x0]","this['state'][0x7-0x7]"))
+        data=fold(valid)
+        self.assertNotIn('error',data)
+        self.assertEqual(data['transformations'],1)
+        self.assertIn('$done({body:"100"+"100"});',data['source'])
+        cases={
+            'wrong_state_value':(valid.replace("this['state']=[0x2-0x1","this['state']=[0x2"),
+                                 '缓存式自防御壳构造器结构不匹配'),
+            'dynamic_state_index':(valid.replace("--this['state'][0x2-0x1]","--this['state'][i]"),
+                                   '缓存式自防御壳使用了未审查的自由全局：i'),
+            'wrong_recursive_counter':(valid.replace('for(var i=0x1-0x1','for(var i=0x2-0x1'),
+                                      '缓存式自防御壳的失败路径方法不匹配'),
+        }
+        for name,(source,reason) in cases.items():
+            with self.subTest(name=name):
+                data=fold(source)
+                self.assertIn('error',data)
+                self.assertIn(reason,data['error'])
+
+    def test_rotation_checksum_constant_member_lookup_folds_and_unsafe_objects_are_rejected(self):
+        base=fixture()
+        prefix="(function(a,b){var aM=dec,c=a();"
+        declaration="(function(a,b){var offsets={'index':0x20,'base':0x10};var aM=dec,c=a();"
+        valid=(base.replace(prefix,declaration)
+                   .replace('parseInt(aM(0x10))','parseInt(aM(offsets.index-offsets.base))'))
+        data=fold(valid)
+        self.assertNotIn('error',data)
+        self.assertEqual(data['transformations'],1)
+        self.assertIn('$done({body:"100"+"100"});',data['source'])
+        cases={
+            'member_write':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                         "var offsets={'index':0x20,'base':0x10};offsets.index=0x20;"),
+            'dynamic_member':(valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                            "var offsets={'index':0x20,'base':0x10};var key='index';")
+                              .replace('offsets.index-offsets.base','offsets[key]-offsets.base')),
+            'object_escape':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                          "var offsets={'index':0x20,'base':0x10};unknown(offsets);"),
+            'non_literal_value':valid.replace("var offsets={'index':0x20,'base':0x10};",
+                                              "var other=0x20;var offsets={'index':other,'base':0x10};"),
+        }
+        for name,source in cases.items():
+            with self.subTest(name=name):
+                data=fold(source)
+                self.assertIn('error',data)
+                self.assertIn('轮转校验在一轮内没有匹配',data['error'])
+
     def test_semantic_or_cardinality_changes_are_rejected(self):
         cases={
             'regex_changed':(dict(mode='regex'),'正则被改动'),

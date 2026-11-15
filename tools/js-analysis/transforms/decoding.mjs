@@ -1088,7 +1088,11 @@ function cachedDecoderShape(fn,ix){
  const first=inner.body?.body?.[0]?.expression;
  if(first?.type!=='AssignmentExpression'||first.operator!=='=')return false;
  if(first.left.type!=='Identifier'||first.right?.type!=='BinaryExpression'||first.right.operator!=='-')return false;
- if(first.right.right.type!=='Literal'||!Number.isInteger(first.right.right.value))return false;
+ // 偏移既可能是字面量，也可能是大小写混淆器生成的闭合常量算术；仍要求
+ // 结果是非负整数，任何标识符、调用或越界运算都会在这里被拒绝。
+ let offset;
+ try{offset=number(first.right.right);}catch{return false;}
+ if(!Number.isInteger(offset))return false;
  // 内层第二步必须是本地表的成员读取，保证后续 evaluate 的表来源唯一
  const second=inner.body.body[1];
  return second?.type==='VariableDeclaration'&&second.declarations.length===1;
@@ -1116,7 +1120,8 @@ function rawAccessorShape(fn,ix){
  if(offset.type!=='ExpressionStatement'||offset.expression.type!=='AssignmentExpression'||offset.expression.operator!=='=')return false;
  const right=offset.expression.right;
  if(offset.expression.left.type!=='Identifier'||offset.expression.left.name!==inner.params[0].name||right.type!=='BinaryExpression'||right.operator!=='-')return false;
- if(right.left.type!=='Identifier'||right.left.name!==inner.params[0].name||right.right.type!=='Literal'||!Number.isInteger(right.right.value))return false;
+ if(right.left.type!=='Identifier'||right.left.name!==inner.params[0].name)return false;
+ try{if(!Number.isInteger(number(right.right)))return false;}catch{return false;}
  if(!param||read.type!=='VariableDeclaration'||read.declarations.length!==1)return false;
  const value=read.declarations[0],member=value.init;
  if(value.id.type!=='Identifier'||member?.type!=='MemberExpression'||!member.computed)return false;
@@ -1629,6 +1634,16 @@ const insideNode=(node,range)=>!!node&&!!range&&node.start>=range.start&&node.en
 const sameNodeBinding=(ix,left,right)=>left?.type==='Identifier'&&right?.type==='Identifier'&&ix.bindings.get(left)&&ix.bindings.get(left)===ix.bindings.get(right);
 const memberKey=node=>node?.type==='MemberExpression'?property(node):undefined;
 const thisKey=(node,key)=>node?.type==='MemberExpression'&&node.object.type==='ThisExpression'&&memberKey(node)===key;
+// 自防御壳会用常数算术表示状态下标（如 this[state][0x1+0x2-0x3]）。
+// 仅对计算属性做有界整数求值；字符串键仍按原样返回。
+function constantMemberIndex(node){
+ const raw=memberKey(node);
+ if(raw!==undefined)return raw;
+ if(node?.type==='MemberExpression'&&node.computed){
+  try{return number(node.property);}catch{return undefined;}
+ }
+ return undefined;
+}
 const bindingIs=(ix,node,binding)=>node?.type==='Identifier'&&!!binding&&ix.bindings.get(node)===binding;
 function inlineHelperContract(node,helperName){
  const scoped=index(node),ids=new Map();let next=0;
@@ -1786,7 +1801,10 @@ function shellConstructorRoles(fn,ix){
   keys.add(keyName);
   const right=assignment.right;
   if(right.type==='Identifier'&&ix.bindings.get(right)===param)roles.externalKey=keyName;
-  else if(right.type==='ArrayExpression'&&right.elements.length===3&&right.elements.every((item,index)=>item?.type==='Literal'&&item.value===[1,0,0][index]))roles.stateKey=keyName;
+  else if(right.type==='ArrayExpression'&&right.elements.length===3&&right.elements.every((item,index)=>{
+   // 混淆器会把状态数组也写成常量算术；只接受可静态求值的整数。
+   try{return item?.type==='Literal'&&item.value===[1,0,0][index]||(item?.type==='BinaryExpression'||item?.type==='UnaryExpression')&&number(item)===[1,0,0][index];}catch{return false;}
+  }))roles.stateKey=keyName;
   else if(literalSample(right)){roles.sampleKey=keyName;roles.sample=right;}
   else if(right.type==='Literal'&&typeof right.value==='string'){
    if(roles.regexAKey===undefined){roles.regexAKey=keyName;roles.regexAValue=right.value;}
@@ -1817,7 +1835,7 @@ function checkerMethod(fn,roles,ix){
  if(test?.type!=='CallExpression'||test.arguments.length!==1||test.callee.type!=='MemberExpression'||memberKey(test.callee)!=='test'||!sameNodeBinding(ix,test.callee.object,regexDeclaration.id))return null;
  const tested=test.arguments[0];
  if(tested?.type!=='CallExpression'||tested.arguments.length||tested.callee.type!=='MemberExpression'||memberKey(tested.callee)!=='toString'||!thisKey(tested.callee.object,roles.sampleKey))return null;
- const decrement=(node,index)=>node?.type==='UpdateExpression'&&node.operator==='--'&&node.prefix&&node.argument.type==='MemberExpression'&&thisKey(node.argument.object,roles.stateKey)&&memberKey(node.argument)===index;
+ const decrement=(node,index)=>node?.type==='UpdateExpression'&&node.operator==='--'&&node.prefix&&node.argument.type==='MemberExpression'&&thisKey(node.argument.object,roles.stateKey)&&constantMemberIndex(node.argument)===index;
  if(!decrement(selected.consequent,1)||!decrement(selected.alternate,0))return null;
  const next=returned.argument;
  if(next?.type!=='CallExpression'||next.arguments.length!==1||next.callee.type!=='MemberExpression'||next.callee.object.type!=='ThisExpression'||typeof memberKey(next.callee)!=='string'||!sameNodeBinding(ix,next.arguments[0],resultDeclaration.id))return null;
@@ -1843,7 +1861,8 @@ function recursiveMethod(fn,roles,ix){
  const [loop,returned]=body,param=ix.bindings.get(fn.params[0]);
  if(loop.type!=='ForStatement'||loop.init?.type!=='VariableDeclaration'||loop.init.declarations.length!==2||!loop.test||!loop.update||loop.body.type!=='BlockStatement'||loop.body.body.length!==1)return null;
  const [counter,length]=loop.init.declarations;
- if(counter.id.type!=='Identifier'||counter.init?.type!=='Literal'||counter.init.value!==0||length.id.type!=='Identifier')return null;
+ if(counter.id.type!=='Identifier'||!counter.init||length.id.type!=='Identifier')return null;
+ try{if(number(counter.init)!==0)return null;}catch{return null;}
  const lengthRead=length.init;
  if(lengthRead?.type!=='MemberExpression'||memberKey(lengthRead)!=='length'||!thisKey(lengthRead.object,roles.stateKey))return null;
  if(loop.test.type!=='BinaryExpression'||loop.test.operator!=='<'||!sameNodeBinding(ix,loop.test.left,counter.id)||!sameNodeBinding(ix,loop.test.right,length.id))return null;
@@ -1860,7 +1879,7 @@ function recursiveMethod(fn,roles,ix){
  const next=returned.type==='ReturnStatement'?returned.argument:null;
  if(next?.type!=='CallExpression'||next.arguments.length!==1||next.callee.type!=='Identifier'||ix.bindings.get(next.callee)!==param)return null;
  const value=next.arguments[0];
- if(value?.type!=='MemberExpression'||memberKey(value)!==0||!thisKey(value.object,roles.stateKey))return null;
+ if(value?.type!=='MemberExpression'||constantMemberIndex(value)!==0||!thisKey(value.object,roles.stateKey))return null;
  return true;
 }
 function shellSites(decoder,ix){
@@ -2516,6 +2535,23 @@ function evaluate(n,env,ctx,depth=0){
   const a=evaluate(n.left,env,ctx,depth+1),b=evaluate(n.right,env,ctx,depth+1);
   const ops={'+':()=>a+b,'-':()=>a-b,'*':()=>a*b,'/':()=>a/b,'%':()=>a%b,'>>':()=>a>>b,'>>>':()=>a>>>b,'<<':()=>a<<b,'|':()=>a|b,'&':()=>a&b,'^':()=>a^b,'===':()=>a===b,'==':()=>a==b,'!==':()=>a!==b,'!=':()=>a!=b,'<':()=>a<b,'>':()=>a>b};
   if(ops[n.operator])return ops[n.operator]();
+ }
+ if(n.type==='MemberExpression'){
+  // 轮转校验和里的包装器常用本地常量对象保存偏移，例如
+  // q(wrapper(x - offsets.key), ...)。只接受无写入的本地对象字面量，
+  // 且属性值必须是字面量；对象逃逸、成员写入、动态键或外部对象都拒绝。
+  const name=property(n);
+  if(name===undefined||n.object.type!=='Identifier')throw Error('unreviewed member');
+  const binding=ix.bindings.get(n.object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')throw Error('unreviewed member object');
+  for(const ref of binding.refs){
+   const member=ix.parents.get(ref),use=ix.parents.get(member);
+   if(member?.type!=='MemberExpression'||member.object!==ref||property(member)===undefined)throw Error('unreviewed member use');
+   if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'&&use.argument===member||use?.type==='UnaryExpression'&&use.operator==='delete')throw Error('unreviewed member write');
+  }
+  const entry=binding.init.properties.find(item=>item.type==='Property'&&key(item)===String(name));
+  if(entry?.value?.type!=='Literal')throw Error('unreviewed member value');
+  return entry.value.value;
  }
  if(n.type==='CallExpression'){
   if(n.callee.type==='Identifier'&&ix.free(n.callee,'parseInt'))return Number.parseInt(evaluate(n.arguments[0],env,ctx,depth+1),n.arguments[1]?evaluate(n.arguments[1],env,ctx,depth+1):undefined);
