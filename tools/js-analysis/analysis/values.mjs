@@ -985,12 +985,85 @@ export function regeneratorStateMachine(ix,source){
    }
    return true;
   };
+  // 外部 next/throw/return 只有当接收者可能来自 wrap 时才会驱动本文件的
+  // 状态机。运行时自身的 isGeneratorFunction 等辅助器也会持有并推进其它
+  // 生成器；把这类无关驱动的接收者绑定误判成逃逸会否决整份机器证明。
+  const generatorFunction=node=>functions.has(node?.type)&&!!node.generator;
+  const parameterOwners=new Map();
+  for(const fn of nodes)if(functions.has(fn?.type))fn.params.forEach((parameter,position)=>{
+   if(parameter.type==='Identifier')parameterOwners.set(bindings.get(parameter),{fn,position});
+  });
+  const functionBinding=fn=>{
+   const id=fn.id??(parents.get(fn)?.type==='VariableDeclarator'&&parents.get(fn).init===fn?parents.get(fn).id:null);
+   return id?.type==='Identifier'?bindings.get(id):null;
+  };
+  const functionReturn=(node,seen)=>{
+   const binding=node?.type==='Identifier'?bindings.get(node):null;
+   const value=binding?.fn??binding?.init;
+   if(generatorFunction(value))return true;
+   if(!functions.has(value?.type)||value.async||value.generator)return false;
+   const returns=nodes.filter(n=>n.type==='ReturnStatement'&&owners.get(n)===value);
+   return returns.some(n=>n.argument&&wrapSource(n.argument,seen));
+  };
+  const wrapSource=(node,seen=new Set())=>{
+   if(!node)return false;
+   // 返回链回到已访问节点时只能证明“可能仍有未知出口”，不能当作已经
+   // 证明无关；递归自调用和互调用都按可能产出 wrap 处理。
+   if(seen.has(node))return true;
+   seen=new Set(seen);seen.add(node);
+   if(node.type==='Identifier'){
+    const binding=bindings.get(node);
+    if(!binding)return false;
+    if(seen.has(binding))return true;
+    seen.add(binding);
+    if(wrapSource(binding.init,seen)||binding.writes.some(write=>write.type==='AssignmentExpression'&&wrapSource(write.right,seen)))return true;
+    // 参数本身没有初始化器；只有枚举出该函数的全部直接调用，并且每个
+    // 对应实参都确定不是 wrap 来源时，才能把参数驱动判为无关。函数身份
+    // 一旦逃逸、改绑或出现展开实参，调用集合就不再静态封闭，按有关处理。
+    const owner=parameterOwners.get(binding);
+    if(!owner)return false;
+    const called=functionBinding(owner.fn);
+    if(!called||called.writes.length)return true;
+    for(const ref of called.refs){
+     const call=parents.get(ref);
+     if(call?.type!=='CallExpression'||call.callee!==ref||call.optional)return true;
+     if(call.arguments.some(argument=>argument.type==='SpreadElement'))return true;
+     const argument=call.arguments[owner.position];
+     if(wrapSource(argument,seen))return true;
+    }
+    return false;
+   }
+   if(node.type==='CallExpression'){
+    if(node.callee.type==='MemberExpression'&&property(node.callee)==='wrap')return true;
+    if(generatorFunction(node.callee))return true;
+    if(node.callee.type==='Identifier'){
+     const binding=bindings.get(node.callee),value=binding?.fn??binding?.init;
+     if(generatorFunction(value))return true;
+     if(functions.has(value?.type))return functionReturn(node.callee,seen);
+    }
+    return false;
+   }
+   if(node.type==='ConditionalExpression')return wrapSource(node.consequent,seen)||wrapSource(node.alternate,seen);
+   if(node.type==='LogicalExpression')return wrapSource(node.left,seen)||wrapSource(node.right,seen);
+   if(node.type==='AssignmentExpression')return wrapSource(node.right,seen);
+   return false;
+  };
+  const drivesWrap=call=>{
+   const object=unwrap(call.callee.object);
+   if(object.type!=='Identifier')return true;
+   const binding=bindings.get(object);
+   if(!binding)return true;
+   return wrapSource(object);
+  };
   for(const call of external){
+   if(!drivesWrap(call))continue;
    const object=unwrap(call.callee.object);
    if(object.type==='Identifier'){
     const binding=bindings.get(object);
     const protocol=!!binding&&iteratorProtocolBinding(binding);
-    const escaped=!binding||!protocol&&(binding.writes.length||binding.refs.some(ref=>{
+    // 参数对应调用点可能把 wrap 结果从封闭机器外送进来；即使参数在函数体
+    // 内只以 next 出现，它也不再是“本文件 wrap 结果的局部驱动绑定”。
+    const escaped=!binding||parameterOwners.has(binding)||!protocol&&(binding.writes.length||binding.refs.some(ref=>{
      const parent=parents.get(ref);
      if(parent?.type==='MemberExpression'&&parent.object===ref)return !['next','throw','return'].includes(property(parent));
      if(parent?.type==='ConditionalExpression'||parent?.type==='LogicalExpression'||parent?.type==='IfStatement')return false;
@@ -1328,8 +1401,8 @@ export function regeneratorStateMachine(ix,source){
   const nonHandlerMinimalGaps=uniqueMinimalGaps.filter(gap=>!uniqueHandlerMinimalGaps.has(gap));
   const uniqueGaps=[...new Set([...gaps,...runtimeInfo.gaps])];
   const uniqueReachabilityGaps=[...new Set(reachabilityGaps)];
-  // 完成回调只有在状态图无环时才能保证单个静态完成点至多执行一次。
-  // 终止节点不参与环检测；未可达状态已由 gaps 拒绝。
+  // 环本身不证明完成点会重复执行：单个完成点至多执行一次，多个完成点
+  // 再由完成消费方检查终止尾和跨状态可达性。这里仍记录环状态供该检查使用。
   const terminalIds=new Set(terminals.map(terminal=>terminal.id));
   let cyclic=false;const active=new Set(),finished=new Set();
   const visitState=id=>{

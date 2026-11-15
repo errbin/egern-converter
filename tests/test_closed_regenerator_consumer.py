@@ -111,7 +111,9 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assert_rejected(body)
 
-    def test_cyclic_entry_subgraph_is_rejected(self):
+    def test_proved_cycles_with_one_completion_are_accepted(self):
+        # 完成调用只出现一次且每个可达入口终会终止时，状态图存在回边并不
+        # 意味着重复完成。反例仍由多完成、死状态完成和非终止尾测试覆盖。
         cases = {
             'back edge after completion': (
                 "case 0:$done({body:'ok'});ctx.next=2;break;"
@@ -122,7 +124,11 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
         }
         for name, body in cases.items():
             with self.subTest(name=name):
-                self.assert_rejected(body)
+                proof = consume(source_with(body))
+                self.assertTrue(proof['accepted'], proof)
+                self.assertTrue(proof['proved'], proof)
+                self.assertFalse(proof['acyclic'], proof)
+                self.assertEqual(proof['completions'], 1, proof)
 
     def test_multiple_completions_in_one_case_are_rejected(self):
         cases = {

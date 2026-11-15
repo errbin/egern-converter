@@ -75,12 +75,39 @@ class RegeneratorStateMachineTests(unittest.TestCase):
         source = source_with('case 0:return ctx.stop();', helper + '\nconst drive=outer();drive.next();')
         self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
 
-    def test_symbol_iterator_driver_escape_is_rejected(self):
+    def test_unrelated_iterator_escape_does_not_veto_machine(self):
+        # 只有从本文件 wrap 得到的驱动对象才可能推进当前状态机；普通迭代器
+        # 即使流经未知代码，也不能据此否决无关的同步状态图。
         helper = ('function iterate(items){'
                   'var it="undefined"!=typeof Symbol&&items[Symbol.iterator]||items["@@iterator"];'
                   'unknown(it);return {n(){return it.next()}};}')
         source = source_with('case 0:return ctx.stop();', helper + '\nconst drive=outer();drive.next();')
-        self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
+        self.assertTrue(prove(source)['proved'])
+
+    def test_parameter_driver_receiving_wrapped_value_is_rejected(self):
+        cases = {
+            'direct argument': 'function drive(g){g.next();}drive(outer());',
+            'conditional argument': 'function drive(g){g.next();}drive(true?outer():null);',
+        }
+        for name, tail in cases.items():
+            with self.subTest(name=name):
+                source = source_with('case 0:return ctx.stop();', tail)
+                self.assert_rejected_shape(source, 'generator 对象逃逸或被外部驱动')
+
+    def test_parameter_driver_with_closed_unrelated_arguments_is_allowed(self):
+        tail = 'function drive(g){g.next();}drive({next(){}});const outerDrive=outer();outerDrive.next();'
+        self.assertTrue(prove(source_with('case 0:return ctx.stop();', tail))['proved'])
+
+    def test_recursive_return_chains_cannot_prove_a_driver_unrelated(self):
+        cases = {
+            'self return': 'function drive(g){g.next();}function loop(){return loop();}drive(loop());',
+            'mutual return': ('function drive(g){g.next();}function a(){return b();}'
+                              'function b(){return a();}drive(a());'),
+        }
+        for name, tail in cases.items():
+            with self.subTest(name=name):
+                self.assert_rejected_shape(source_with('case 0:return ctx.stop();', tail),
+                                           'generator 对象逃逸或被外部驱动')
 
     def test_reassigned_save_slot_is_rejected(self):
         body = ("case 0:var saved=function(){$done({body:'first'});};"

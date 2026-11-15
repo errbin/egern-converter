@@ -410,17 +410,16 @@ function regeneratorConditionallyExclusive(a,b,ix){
  }
  return false;
 }
-// 完成回调的 `.wrap` 消费方证明：状态图运行时完整、入口子图无环；唯一阻塞
-// 只能是死状态/死终止点。每个可达完成调用必须位于状态分派 case 内且不在
-// 循环中。多个完成点时，每个必须由独立的 return/abrupt return 终止，或
-// 完成之后只剩状态控制且沿显式边无法到达另一个完成状态；这保证同一路径
-// 至多执行一个完成调用。
+// 完成回调的 `.wrap` 消费方证明：状态图运行时完整；唯一阻塞只能是死状态/
+// 死终止点。每个可达完成调用必须位于状态分派 case 内且不在循环中。单个
+// 完成点至多执行一次；多个完成点时，每个必须由独立的 return/abrupt return
+// 终止，或完成之后只剩状态控制且沿显式边无法到达另一个完成状态。
 export function closedRegeneratorConsumer(ix,source,call,fn,isCompletion){
  const reject=()=>null;
  if(call?.type!=='CallExpression'||call.callee.type!=='MemberExpression'||property(call.callee)!=='wrap'||call.arguments[0]!==fn)return reject('shape');
  let proof;
  try{proof=regeneratorStateMachine(ix,source);}catch{return reject('proof');}
- const machine=proof.machines.find(item=>item.wrapStart===call.start&&item.acyclic&&(item.proved||item.deadReachabilityProved));
+ const machine=proof.machines.find(item=>item.wrapStart===call.start&&(item.proved||item.deadReachabilityProved));
  if(!machine)return reject('machine '+proof.machines.map(item=>item.wrapStart+':'+item.proved+':'+item.deadReachabilityProved+':'+item.acyclic));
  const completions=ix.nodes.filter(node=>node.start>=fn.start&&node.end<=fn.end&&isCompletion(node));
  if(!completions.length)return reject('no-completions');
