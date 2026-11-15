@@ -66,9 +66,17 @@ class WindowFallbackFoldingTests(unittest.TestCase):
             "const location=window.location;$done({body:location.href});",
             "const w=typeof window!=='undefined'||window;$done({body:w.name});",
             "const w=probe?window:null;$done({body:w.name});",
+            "window.crypto;$done({body:'ok'});",
+            "const w=(0,window);$done({body:String(w)});",
         ]:
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 self.convert(source)
+
+    def test_missing_global_write_is_not_rewritten_as_a_read(self):
+        with self.assertRaises(ConversionError):
+            self.convert("window=1;$done({body:'ok'});")
+        self.check("$done({body:typeof window});",'undefined')
+        self.check("const window={value:'local'};$done({body:window.value});",'local')
 
     def test_missing_global_catch_assignment_preserves_reference_error(self):
         source=("let value='ok';try{value=JSON.parse($argument).value}"
