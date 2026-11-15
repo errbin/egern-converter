@@ -10,6 +10,31 @@ const PRESENT_GLOBALS=new Map();
 // 只有明确位于 catch 回退赋值右侧时，才按这一既定语义改写为抛错表达式。
 const MISSING_HOST_GLOBALS=new Set(['window','global','module','exports','process','require','importModule','document','$drive']);
 const safeProbeCallees=new Set(['Boolean','String','Number','parseInt','parseFloat','isNaN','isFinite']);
+// 返回探测调用已证明同步执行到的源码末端。只有位于直接调用 callee 位置的
+// 函数表达式（IIFE）才把执行点扩展到该调用末尾；普通回调的执行时机未知。
+function immediateCallEnd(ix,call){
+ let current=call;
+ for(;;){
+  const parent=ix.parents.get(current);
+  if(!parent)return current.end;
+  if(functions.has(parent.type)){
+   const invocation=ix.parents.get(parent);
+   return invocation?.type==='CallExpression'&&invocation.callee===parent&&!invocation.optional?invocation.end:null;
+  }
+  if(parent.type==='Program')return current.end;
+  current=parent;
+ }
+}
+// 调用之后才创建的函数表达式/箭头函数/对象方法不可能先于已证明的同步执行点
+// 运行。函数声明会被提升，普通回调也允许延迟调用，因此两者都不能据此忽略。
+function writeCannotRunBefore(ix,call,write){
+ const end=immediateCallEnd(ix,call);
+ if(end===null||write.start<=end)return false;
+ let owner=ix.parents.get(write);
+ while(owner&&!functions.has(owner.type)&&owner.type!=='Program')owner=ix.parents.get(owner);
+ if(!owner||owner.type==='Program')return true;
+ return owner.type!=='FunctionDeclaration'&&owner.start>end;
+}
 // 探测结果只能流入可证明不改变语义的消费点：条件、比较、布尔/字符串
 // 转换、已知完成调用，或经单次绑定继续流向前述位置。传入未知函数、
 // 直接逃逸或动态写入时返回 false。
@@ -23,14 +48,36 @@ export function probeResultSafeAt(ix,start){
   if(call.type!=='CallExpression'||call.arguments.length===0||call.callee.type!=='MemberExpression')return false;
   const object=call.callee.object;
   let literal=object,binding=null;
-  const tableBindings=new Set();
+  const tableBindings=new Set(),chainRefs=new Set([object]);
   for(let depth=0;literal?.type==='Identifier'&&depth<4;depth++){
    binding=ix.bindings.get(literal);
-   if(!binding||binding.writes.some(write=>!provablyDead(ix,write,deadCache)))return false;
+   if(!binding||binding.writes.some(write=>!provablyDead(ix,write,deadCache)&&!writeCannotRunBefore(ix,call,write)))return false;
    tableBindings.add(binding);
    literal=binding.init;
   }
   if(literal?.type!=='ObjectExpression')return false;
+  // 表在探测调用前整体传给未知代码时，无法排除对方改写即将调用的字段。
+  // 只允许链式别名初始化、静态成员读取/写入和非逃逸的标量观察继续。
+  for(const tableBinding of tableBindings)for(const ref of tableBinding.refs){
+   if(chainRefs.has(ref))continue;
+   const parent=ix.parents.get(ref);
+   if(parent?.type==='AssignmentExpression'&&parent.left===ref||parent?.type==='UpdateExpression'&&parent.argument===ref)continue;
+   if(parent?.type==='MemberExpression'&&parent.object===ref){
+    const use=ix.parents.get(parent),name=property(parent);
+    const write=use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete';
+    if(write&&name===undefined)return false;
+    continue;
+   }
+   if(parent?.type==='VariableDeclarator'&&parent.init===ref){
+    const alias=ix.bindings.get(parent.id);
+    if(alias&&tableBindings.has(alias)){chainRefs.add(ref);continue;}
+   }
+   if(parent?.type==='UnaryExpression'&&['!','typeof','void'].includes(parent.operator)||
+      parent?.type==='BinaryExpression'||parent?.type==='LogicalExpression'||
+      ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(parent?.type)&&parent.test===ref||
+      parent?.type==='SequenceExpression'&&parent.expressions.at(-1)!==ref)continue;
+   return false;
+  }
   const entries=literal.properties.filter(p=>p.type==='Property'&&p.kind==='init');
   if(entries.length!==literal.properties.length)return false;
   const writes=binding?ix.nodes.filter(n=>n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='Identifier'&&tableBindings.has(ix.bindings.get(n.left.object))):[];
@@ -118,24 +165,28 @@ export function foldClosedLiteralMethodCalls(source){
  let tree,ix;
  try{tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true});ix=index(tree);}
  catch{return source;}
- const {nodes,parents,bindings}=ix,UNKNOWN=Symbol('unknown'),infos=new Map(),edits=[];
+ const {nodes,parents,bindings}=ix,UNKNOWN=Symbol('unknown'),infos=new Map(),callInfos=new WeakMap(),edits=[];
+ let activeCall=null;
  const declarators=new Map();
  for(const n of nodes)if(n.type==='VariableDeclarator'){
   const b=bindings.get(n.id);if(b){if(!declarators.has(b))declarators.set(b,[]);declarators.get(b).push(n);}
  }
  const staticKey=member=>property(member);
  function infoFor(binding){
-  if(infos.has(binding))return infos.get(binding);
+  const cache=activeCall?(callInfos.get(activeCall)??new Map()):infos;
+  if(activeCall&&!callInfos.has(activeCall))callInfos.set(activeCall,cache);
+  if(cache.has(binding))return cache.get(binding);
   const declarations=declarators.get(binding)??[];
   const init=declarations.length===1&&declarations[0].init;
-  if(!binding||binding.writes.length||declarations.length!==1||init?.type!=='ObjectExpression'){
-   infos.set(binding,null);return null;
+  const ignoredWrites=new Set(activeCall?binding?.writes.filter(write=>writeCannotRunBefore(ix,activeCall,write))??[]:[]);
+  if(!binding||binding.writes.some(write=>!ignoredWrites.has(write))||declarations.length!==1||init?.type!=='ObjectExpression'){
+   cache.set(binding,null);return null;
   }
   const fields=new Map();
   for(const p of init.properties){
    const name=p.type==='Property'?key(p):undefined;
    if(p.type!=='Property'||p.kind!=='init'||name===undefined||name==='__proto__'||fields.has(name)){
-    infos.set(binding,null);return null;
+    cache.set(binding,null);return null;
    }
    fields.set(name,p.value);
   }
@@ -156,14 +207,14 @@ export function foldClosedLiteralMethodCalls(source){
     member?.type==='UnaryExpression'&&['!','typeof','void'].includes(member.operator)||
     member?.type==='BinaryExpression'||member?.type==='LogicalExpression'||
     ['IfStatement','WhileStatement','DoWhileStatement','ConditionalExpression'].includes(member?.type)&&member.test===ref;
-   if(!pureObservation){infos.set(binding,null);return null;}
+   if(!pureObservation){cache.set(binding,null);return null;}
    if(member.type==='CallExpression'&&member.callee.type==='Identifier')continue;
    if(use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete')written.add(staticKey(member));
   }
   // 调用点必须位于唯一初始化声明之后；否则折叠会吞掉 TDZ 或 undefined
   // 读取异常。嵌套函数仍按源码顺序保守处理，不做跨调用图推断。
   const info={fields,written,end:declarations[0].end};
-  infos.set(binding,info);return info;
+  cache.set(binding,info);return info;
  }
  function fieldValue(binding,name,seen=new Set()){
   const info=infoFor(binding);if(!info||!info.fields.has(name)||info.written.has(name))return UNKNOWN;
@@ -229,22 +280,25 @@ export function foldClosedLiteralMethodCalls(source){
   if(call.type!=='CallExpression'||call.optional||call.callee.type!=='MemberExpression'||call.arguments.some(a=>a.type==='SpreadElement'))continue;
   const object=call.callee.object,name=staticKey(call.callee);
   if(object.type!=='Identifier'||name===undefined)continue;
-  const binding=bindings.get(object),info=infoFor(binding),method=info?.fields.get(name);
-  if(!info||call.start<info.end||info.written.has(name)||!functions.has(method?.type)||method.async||method.generator||method.body.type==='BlockStatement'&&method.body.body.length!==1)continue;
-  if(method.params.some(p=>p.type!=='Identifier'||bindings.get(p)?.writes.length)||call.arguments.length!==method.params.length)continue;
-  if(index(method).nodes.some(n=>n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n)))continue;
-  const expression=method.body.type==='BlockStatement'?method.body.body[0]?.type==='ReturnStatement'?method.body.body[0].argument:null:method.body;
-  if(!expression)continue;
-  const env=new Map();
-  let valid=true;
-  for(let i=0;i<method.params.length;i++){
-   const value=constantValue(call.arguments[i],binding,new Map(),new Set());
-   if(value===UNKNOWN){valid=false;break;}
-   env.set(bindings.get(method.params[i]),value);
-  }
-  if(!valid)continue;
-  const value=constantValue(expression,binding,env,new Set()),replacement=literal(value);
-  if(replacement!==null)edits.push({start:call.start,end:call.end,replacement});
+  activeCall=call;
+  try{
+   const binding=bindings.get(object),info=infoFor(binding),method=info?.fields.get(name);
+   if(!info||call.start<info.end||info.written.has(name)||!functions.has(method?.type)||method.async||method.generator||method.body.type==='BlockStatement'&&method.body.body.length!==1)continue;
+   if(method.params.some(p=>p.type!=='Identifier'||bindings.get(p)?.writes.length)||call.arguments.length!==method.params.length)continue;
+   if(index(method).nodes.some(n=>n.type==='ThisExpression'||n.type==='Identifier'&&n.name==='arguments'&&!bindings.has(n)))continue;
+   const expression=method.body.type==='BlockStatement'?method.body.body[0]?.type==='ReturnStatement'?method.body.body[0].argument:null:method.body;
+   if(!expression)continue;
+   const env=new Map();
+   let valid=true;
+   for(let i=0;i<method.params.length;i++){
+    const value=constantValue(call.arguments[i],binding,new Map(),new Set());
+    if(value===UNKNOWN){valid=false;break;}
+    env.set(bindings.get(method.params[i]),value);
+   }
+   if(!valid)continue;
+   const value=constantValue(expression,binding,env,new Set()),replacement=literal(value);
+   if(replacement!==null)edits.push({start:call.start,end:call.end,replacement});
+  }finally{activeCall=null;}
  }
  if(!edits.length)return source;
  let output=source;

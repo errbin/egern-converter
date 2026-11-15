@@ -84,6 +84,39 @@ class NodeBrowserDeadBranchTests(unittest.TestCase):
         )
         self.check(source, 'egern')
 
+    def test_probe_ignores_table_rebind_in_a_later_function_expression(self):
+        source = (
+            "let ops={neq:function(a,b){return a!==b}};"
+            "const chosen=(function(){return ops.neq(typeof window,'undefined')})();"
+            "const later=function(){ops={neq:function(){return true}}};"
+            "if(chosen)$done({body:'browser'});else $done({body:'other'});"
+        )
+        self.check(source, 'other')
+
+    def test_probe_keeps_later_hoisted_or_deferred_table_rebinds(self):
+        base = (
+            "let ops={neq:function(a,b){return a!==b}};"
+            "const chosen=(function(){return ops.neq(typeof window,'undefined')})();"
+            "REBIND"
+            "if(chosen)$done({body:'browser'});else $done({body:'other'});"
+        )
+        counterexamples = {
+            'hoisted declaration': base.replace(
+                'REBIND', "function later(){ops={neq:function(){return true}}}"),
+            'deferred probe callback': (
+                "let ops={neq:function(a,b){return a!==b}};"
+                "const probe=function(){return ops.neq(typeof window,'undefined')};"
+                "unknown(probe);ops={neq:function(){return true}};$done({body:'other'});"),
+            'escaped table before probe': (
+                "let ops={neq:function(a,b){return a!==b}};"
+                "unknown(ops);"
+                "const chosen=(function(){return ops.neq(typeof window,'undefined')})();"
+                "if(chosen)$done({body:'browser'});else $done({body:'other'});"),
+        }
+        for name, source in counterexamples.items():
+            with self.subTest(name=name), self.assertRaises(ConversionError):
+                self.convert(source)
+
     def test_typeof_probe_in_open_conditional_call_still_rejects(self):
         source = (
             "const probe=typeof window;"
