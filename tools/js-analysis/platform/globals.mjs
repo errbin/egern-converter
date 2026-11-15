@@ -1,5 +1,6 @@
 import {parse} from '../core/syntax.mjs';
 import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
+import {provablyDead,constantProbeValue,constantProbeCall,CONSTANT_UNKNOWN} from '../analysis/values.mjs';
 
 // Fold proven source-platform probes, preserving unknown device/version data.
 const UNKNOWN=Symbol('not statically known');
@@ -14,6 +15,7 @@ const safeProbeCallees=new Set(['Boolean','String','Number','parseInt','parseFlo
 // 直接逃逸或动态写入时返回 false。
 export function probeResultSafeAt(ix,start){
  const seen=new Set();
+ const deadCache=new WeakMap();
  // 混淆脚本常把平台探测作为局部比较对象方法的实参。只有对象本身封闭、
  // 每个方法只由参数/字面量组成且没有外部写入，并且调用结果只决定条件时，
  // 才能证明探测值只参与条件比较，没有进入业务数据。
@@ -24,7 +26,7 @@ export function probeResultSafeAt(ix,start){
   const tableBindings=new Set();
   for(let depth=0;literal?.type==='Identifier'&&depth<4;depth++){
    binding=ix.bindings.get(literal);
-   if(!binding||binding.writes.length)return false;
+   if(!binding||binding.writes.some(write=>!provablyDead(ix,write,deadCache)))return false;
    tableBindings.add(binding);
    literal=binding.init;
   }
@@ -569,6 +571,18 @@ function fold(source,format,options,qxHint){
    }
   }
   if(n.type==='CallExpression'&&!n.optional&&(n.callee.type==='Identifier'||functions.has(n.callee.type)||n.callee.type==='MemberExpression')&&n.arguments.every(a=>a.type!=='SpreadElement'&&value(a,new Set(seen))!==UNKNOWN)){
+   if(n.callee.type==='MemberExpression'){
+    const actual=n.arguments.map(argument=>{
+     const known=value(argument,new Set(seen));
+     if(known!==UNKNOWN)return known;
+     const helper=constantProbeValue(ix,argument);
+     return helper===CONSTANT_UNKNOWN?UNKNOWN:helper;
+    });
+    if(actual.every(value=>value!==UNKNOWN)){
+     const scalar=constantProbeCall(ix,n,actual);
+     if(scalar!==CONSTANT_UNKNOWN&&(scalar===undefined||scalar===null||['boolean','string','number'].includes(typeof scalar)))return scalar;
+    }
+   }
    const direct=functions.has(n.callee.type),b=n.callee.type==='Identifier'?ix.bindings.get(n.callee):null;
    const fn=direct?n.callee:b?b.init:value(n.callee,new Set(seen));
    const methodCall=n.callee.type==='MemberExpression'&&functions.has(fn?.type);

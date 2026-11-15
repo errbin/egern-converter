@@ -1363,36 +1363,60 @@ const closedTableCache=new WeakMap(),closedFieldCache=new WeakMap(),closedLitera
 // 逃逸点，以便用同一张表的常量键判断分支；逃逸点若实际可达，证明会在
 // 外层否决，因此这个临时假设最终必须被逐项解除。
 const provisionalEscapeBindings=new Set();
+// 已证不可达的整表改绑可被后续纯谓词求值复用；缓存只按 AST 节点记录
+// 布尔结论，不跨语法树共享。
+const knownDeadWrites=new WeakSet(),deadWriteCache=new WeakMap(),activeDeadWriteProbes=new WeakSet();
 // 闭合字面量表的稳定性按“被写键”隔离：写入其它键不会改变当前读取键由
 // 初始化器决定的值。动态键写入无法确定目标键，仍否决整份证明；整体别名
 // 或绑定改绑同样否决，除非每个整体逃逸点都能证明位于不可达分支。
 // 整体逃逸容忍只服务“键隔离可变表”：没有任何键写入的纯不可变表维持既有
 // 保守边界（任何整体逃逸即 unknown），避免把新证明扩张到无关解码表。
+// 候选改绑位于谓词所选分支内。JavaScript 必然先求值条件再执行改绑，因此
+// 证明该写入不可达时可以暂时忽略它；该状态只服务 provablyDead 的条件求值。
+let branchPredicateProof=null;
+// 对象字面量不是函数，也不能作为构造函数。若整表只以调用/构造的 callee
+// 出现，求值必然抛出 TypeError，既不会写入表字段，也不会把表交给其它代码。
+function nonMutatingTableEscape(ix,ref){
+ const parent=ix.parents.get(ref);
+ return parent?.type==='CallExpression'&&parent.callee===ref||
+  parent?.type==='NewExpression'&&parent.callee===ref||
+  parent?.type==='TaggedTemplateExpression'&&parent.tag===ref;
+}
 function tableState(ix,binding){
  if(closedTableCache.has(binding))return closedTableCache.get(binding);
- const state={closed:!binding.writes.length,written:new Set(),escapes:[]};
- if(state.closed)for(const ref of binding.refs){
+ const state={closed:true,written:new Set(),writes:new Map(),escapes:[]};
+ for(const ref of binding.refs){
   const member=ix.parents.get(ref);
-  if(member?.type!=='MemberExpression'||member.object!==ref){state.escapes.push(ref);continue;}
+  const direct=member?.type==='AssignmentExpression'&&member.left===ref||member?.type==='UpdateExpression'&&member.argument===ref||member?.type==='UnaryExpression'&&member.operator==='delete'&&member.argument===ref;
+  if(direct)continue;
+  if(member?.type!=='MemberExpression'||member.object!==ref){if(!nonMutatingTableEscape(ix,ref))state.escapes.push(ref);continue;}
   const use=ix.parents.get(member);
   const write=use?.type==='AssignmentExpression'&&use.left===member||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete';
   if(!write)continue;
   const field=property(member);
   if(field===undefined){state.closed=false;break;}
   state.written.add(String(field));
+  if(!state.writes.has(String(field)))state.writes.set(String(field),[]);
+  state.writes.get(String(field)).push(use);
  }
  closedTableCache.set(binding,state);
  return state;
 }
-function closedTable(ix,binding,field){
+function closedTable(ix,binding,field,object){
  const state=tableState(ix,binding);
  if(!state.closed)return false;
- if(field===undefined)return state.written.size===0;
- if(state.written.has(String(field)))return false;
+ const ignored=branchPredicateProof?.ignoredWrites;
+ const liveBindingWrite=write=>!ignored?.has(write)&&!knownDeadWrites.has(write)&&!(branchPredicateProof?.proveDeadWrites&&isDeadWrite(ix,write));
+ if(binding.writes.some(liveBindingWrite))return false;
+ const liveWritten=new Set([...state.written].filter(name=>(state.writes.get(name)??[]).some(liveBindingWrite)));
+ if(field===undefined)return liveWritten.size===0;
+ if(liveWritten.has(String(field)))return false;
  if(!state.escapes.length)return true;
- if(!state.written.size)return false;
+ if(!liveWritten.size)return false;
  if(provisionalEscapeBindings.has(binding))return true;
- const cacheable=!provisionalEscapeBindings.size;
+ // 临时谓词证明允许忽略特定写入；该结论不能写入按绑定共享的字段缓存，
+ // 否则同一字段在正常常量求值中会错误沿用临时假设。
+ const cacheable=!provisionalEscapeBindings.size&&!branchPredicateProof;
  if(cacheable&&closedFieldCache.has(binding)&&closedFieldCache.get(binding).has(String(field)))return closedFieldCache.get(binding).get(String(field));
  provisionalEscapeBindings.add(binding);
  let closed=true;
@@ -1400,6 +1424,22 @@ function closedTable(ix,binding,field){
  finally{provisionalEscapeBindings.delete(binding);}
  if(cacheable){if(!closedFieldCache.has(binding))closedFieldCache.set(binding,new Map());closedFieldCache.get(binding).set(String(field),closed);}
  return closed;
+}
+function isDeadWrite(ix,write){
+ // 谓词读取同一可变绑定时会再次检查该写点。环上的判定只能保守回到“仍
+ // 可达”，否则会把自身条件当成已证死代码并无限递归。
+ if(activeDeadWriteProbes.has(write))return false;
+ // 只有外层证明已经忽略其它候选写入时，结论才依赖临时假设；仅忽略当前
+ // 候选本身的证明是全局成立的（写入不能反过来影响自己的支配条件）。
+ const provisional=!!branchPredicateProof?.ignoredWrites?.size;
+ if(!provisional&&knownDeadWrites.has(write))return true;
+ if(!provisional&&deadWriteCache.has(write))return deadWriteCache.get(write);
+ let dead=false;
+ activeDeadWriteProbes.add(write);
+ try{dead=provablyDead(ix,write);}
+ finally{activeDeadWriteProbes.delete(write);}
+ if(!provisional){deadWriteCache.set(write,dead);if(dead)knownDeadWrites.add(write);}
+ return dead;
 }
 function closedLiteral(object){
  if(closedLiteralCache.has(object))return closedLiteralCache.get(object);
@@ -1432,7 +1472,9 @@ export function constantValue(ix,node,environment=new Map(),seen=new Set(),depth
   const binding=ix.bindings.get(node);
   if(environment.has(binding))return environment.get(binding);
   if(node.name==='undefined'&&ix.free(node))return undefined;
-  if(!binding||binding.writes.length||!binding.init)return CONSTANT_UNKNOWN;
+  const ignored=branchPredicateProof?.ignoredWrites;
+  const liveWrite=write=>!ignored?.has(write)&&!knownDeadWrites.has(write)&&!(branchPredicateProof?.proveDeadWrites&&isDeadWrite(ix,write));
+  if(!binding||binding.writes.some(liveWrite)||!binding.init)return CONSTANT_UNKNOWN;
   const declarator=ix.parents.get(binding.init),statement=ix.parents.get(declarator);
   if(statement?.type!=='VariableDeclaration'||!initializedAfter(ix,statement,node)){
    // 对象/函数初始化前读取会直接抛出；只要后续成员读取真正完成，值必然来自
@@ -1454,7 +1496,7 @@ export function constantValue(ix,node,environment=new Map(),seen=new Set(),depth
   if(typeof name!=='string'&&typeof name!=='number')return CONSTANT_UNKNOWN;
   const object=constantValue(ix,node.object,environment,seen,depth+1);
   if(!object?.object)return CONSTANT_UNKNOWN;
-  if(object.binding&&!closedTable(ix,object.binding,name))return CONSTANT_UNKNOWN;
+  if(object.binding&&!closedTable(ix,object.binding,name,object.object))return CONSTANT_UNKNOWN;
   if(!closedLiteral(object.object)||name==='__proto__')return CONSTANT_UNKNOWN;
   const entries=object.object.properties.filter(entry=>entry.type==='Property'&&entry.kind==='init'&&!entry.method&&key(entry)!==undefined&&String(key(entry))===String(name));
   if(entries.length!==1)return CONSTANT_UNKNOWN;
@@ -1534,25 +1576,65 @@ export function constantTruth(ix,node,environment,seen){
  return instanceValueTruth(constantValue(ix,node,environment,seen));
 }
 
+// 平台探针只会消费纯标量。这里按谓词模式读取初始化器函数字段，并要求整表
+// 改绑已证不可达；其它对象值仍返回 unknown，不能借探针折叠把对象逃逸出去。
+export function constantProbeValue(ix,node){
+ const previous=branchPredicateProof;
+ branchPredicateProof={ignoredWrites:previous?.ignoredWrites??new Set(),proveDeadWrites:true};
+ try{return constantValue(ix,node);}
+ finally{branchPredicateProof=previous;}
+}
+
+// 平台层已求出实参标量时，闭合函数调用直接使用这些值，避免把平台宿主
+// 探测重新当成未知全局求值。实参只要有一个非标量就保持 unknown。
+export function constantProbeCall(ix,call,values){
+ if(call?.type!=='CallExpression'||call.optional||call.arguments.some(argument=>argument.type==='SpreadElement'))return CONSTANT_UNKNOWN;
+ if(values.length!==call.arguments.length||values.some(value=>value!==undefined&&value!==null&&!['boolean','string','number'].includes(typeof value)))return CONSTANT_UNKNOWN;
+ const previous=branchPredicateProof;
+ branchPredicateProof={ignoredWrites:previous?.ignoredWrites??new Set(),proveDeadWrites:true};
+ try{
+  const callee=constantValue(ix,call.callee);
+  if(!callee?.fn)return CONSTANT_UNKNOWN;
+  const fn=callee.fn;
+  if(fn.async||fn.generator||fn.params.some(parameter=>parameter.type!=='Identifier')||fn.params.length!==values.length)return CONSTANT_UNKNOWN;
+  const local=new Map();
+  fn.params.forEach((parameter,index)=>local.set(ix.bindings.get(parameter),values[index]));
+  const statements=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
+  if(statements.length!==1||statements[0].type!=='ReturnStatement'||!statements[0].argument)return CONSTANT_UNKNOWN;
+  return constantValue(ix,statements[0].argument,local,new Set([fn]));
+ }finally{branchPredicateProof=previous;}
+}
+
 // 沿父链检查该节点是否只位于已证明不可达的分支：if/条件表达式的未选分支、
 // 逻辑短路后不会求值的右侧。未知条件一律视为可达。
 export function provablyDead(ix,node,cache){
- if(cache?.has(node))return cache.get(node);
+ // 外层临时证明可能忽略其它候选写入；在该上下文中得到的结论只服务本次
+ // 求值，不能写入局部缓存或跨调用复用。
+ const provisional=!!branchPredicateProof?.ignoredWrites?.size;
+ if(!provisional&&cache?.has(node))return cache.get(node);
+ const previousProof=branchPredicateProof;
+ const candidate=node.type==='AssignmentExpression'||node.type==='UpdateExpression'||node.type==='UnaryExpression'&&node.operator==='delete';
+ if(candidate)branchPredicateProof={ignoredWrites:new Set([...(previousProof?.ignoredWrites??[]),node])};
  let dead=false;
- for(let child=node,parent=ix.parents.get(child);parent;child=parent,parent=ix.parents.get(parent)){
-  if(parent.type==='IfStatement'){
-   const truth=constantTruth(ix,parent.test);
-   if(child===parent.consequent&&truth===false){dead=true;break;}
-   if(child===parent.alternate&&truth===true){dead=true;break;}
-  }else if(parent.type==='ConditionalExpression'){
-   const truth=constantTruth(ix,parent.test);
-   if(child===parent.consequent&&truth===false){dead=true;break;}
-   if(child===parent.alternate&&truth===true){dead=true;break;}
-  }else if(parent.type==='LogicalExpression'&&child===parent.right){
-   const left=constantTruth(ix,parent.left);
-   if(parent.operator==='&&'&&left===false||parent.operator==='||'&&left===true){dead=true;break;}
+ try{
+  for(let child=node,parent=ix.parents.get(child);parent;child=parent,parent=ix.parents.get(parent)){
+   if(parent.type==='IfStatement'){
+    const truth=constantTruth(ix,parent.test);
+    if(child===parent.consequent&&truth===false){dead=true;break;}
+    if(child===parent.alternate&&truth===true){dead=true;break;}
+   }else if(parent.type==='ConditionalExpression'){
+    const truth=constantTruth(ix,parent.test);
+    if(child===parent.consequent&&truth===false){dead=true;break;}
+    if(child===parent.alternate&&truth===true){dead=true;break;}
+   }else if(parent.type==='LogicalExpression'&&child===parent.right){
+    const left=constantTruth(ix,parent.left);
+    if(parent.operator==='&&'&&left===false||parent.operator==='||'&&left===true){dead=true;break;}
+   }
   }
+ }finally{
+  branchPredicateProof=previousProof;
  }
- cache?.set(node,dead);
+ if(dead&&candidate&&!provisional)knownDeadWrites.add(node);
+ if(!provisional)cache?.set(node,dead);
  return dead;
 }
