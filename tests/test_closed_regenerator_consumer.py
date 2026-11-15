@@ -111,6 +111,36 @@ class ClosedRegeneratorConsumerTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assert_rejected(body)
 
+    def test_nonterminal_completion_state_control_survives_conversion(self):
+        body = ("case 0:if(ctx.sent){ctx.next=2;break;}ctx.next=4;break;"
+                "case 2:$done({body:'a'});ctx.next=6;break;"
+                "case 4:$done({body:'b'});ctx.next=6;break;"
+                "case 6:return ctx.stop();")
+        proof = consume(source_with(body))
+        self.assertTrue(proof['accepted'], proof)
+        source = source_with(body)
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        fixture = {'name': 'nonterminal completion control', 'request': {'url': URL},
+                   'expected': {'result': {'body': 'b'}}}
+        result = compare(source, output, 'surge', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
+    def test_nonterminal_completion_rejects_side_effects_and_dynamic_next(self):
+        base = ("case 0:if(ctx.sent){ctx.next=2;break;}ctx.next=4;break;"
+                "case 2:$done({body:'a'});ctx.next=6;break;"
+                "case 4:$done({body:'b'});ctx.next=6;break;"
+                "case 6:return ctx.stop();")
+        for name, body in {
+            'side effect after completion': base.replace(
+                "case 2:$done({body:'a'});ctx.next=6;",
+                "case 2:$done({body:'a'});unknown();ctx.next=6;"),
+            'dynamic state after completion': base.replace(
+                "case 2:$done({body:'a'});ctx.next=6;",
+                "case 2:$done({body:'a'});ctx.next=dynamic;"),
+        }.items():
+            with self.subTest(name=name), self.assertRaises(ConversionError):
+                convert_script(source_with(body), 'Fixture', URL, '', source_format='surge')
+
     def test_proved_cycles_with_one_completion_are_accepted(self):
         # 完成调用只出现一次且每个可达入口终会终止时，状态图存在回边并不
         # 意味着重复完成。反例仍由多完成、死状态完成和非终止尾测试覆盖。

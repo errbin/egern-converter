@@ -69,6 +69,33 @@ export function simplify(source){
    }
    return false;
   };
+  // `$done` 后的普通观察语句可视为不可达，但状态机常在完成调用后写回
+  // 分派变量。若该写入仍被外层 switch/循环控制读取，删除它会让产物失去
+  // 唯一终止边；这类控制写入必须保留，交给原生完成投影处理。
+  const controlWriteAfterCompletion=(statement,block)=>{
+   if(!statement)return false;
+   const affected=new Set();
+   for(const node of ix.nodes){
+    if(node.start<statement.start||node.end>statement.end)continue;
+    let target=null;
+    if(node.type==='AssignmentExpression')target=node.left;
+    else if(node.type==='UpdateExpression')target=node.argument;
+    else if(node.type==='UnaryExpression'&&node.operator==='delete')target=node.argument;
+    if(!target)continue;
+    while(target?.type==='MemberExpression')target=target.object;
+    const binding=target?.type==='Identifier'?ix.bindings.get(target):null;
+    if(binding)affected.add(binding);
+   }
+   if(!affected.size)return false;
+   for(let parent=ix.parents.get(block);parent;parent=ix.parents.get(parent)){
+    const controls=parent.type==='SwitchStatement'?[parent.discriminant]:
+     ['ForStatement','WhileStatement','DoWhileStatement'].includes(parent.type)?[parent.test,parent.update]:[];
+    for(const binding of affected)for(const ref of binding.refs)
+     if(controls.some(control=>control&&ref.start>=control.start&&ref.end<=control.end))return true;
+   }
+   return false;
+  };
+
   const patternNames=n=>!n?[]:n.type==='Identifier'?[n.name]:n.type==='RestElement'?patternNames(n.argument):n.type==='AssignmentPattern'?patternNames(n.left):n.type==='ArrayPattern'?n.elements.flatMap(patternNames):n.type==='ObjectPattern'?n.properties.flatMap(p=>patternNames(p.type==='RestElement'?p.argument:p.value)):[];
   for(const n of ix.nodes)if(['Program','BlockStatement'].includes(n.type)){
    let stopped=false,returned=false;
@@ -82,7 +109,7 @@ export function simplify(source){
      }
      else if(s.type==='ClassDeclaration')replace.set(s,'let '+s.id.name+';');
      else{const vars=varsInside(s,ix.owners.get(s));if(vars.some(d=>d.declarations.some(x=>x.id.type!=='Identifier')))continue;if(vars.length)replace.set(s,vars.map(d=>'var '+d.declarations.map(x=>source.slice(x.id.start,x.id.end)).join(', ')+';').join('\n'));else removed.add(s);}
-    }else if(stopped&&['ExpressionStatement','EmptyStatement'].includes(s.type))removed.add(s);
+    }else if(stopped&&['ExpressionStatement','EmptyStatement'].includes(s.type)&&!controlWriteAfterCompletion(s,n))removed.add(s);
     if(abrupt(s))returned=true;
     if(s.type==='ExpressionStatement'&&s.expression.type==='CallExpression'&&ix.free(s.expression.callee,'$done'))stopped=true;
    }
