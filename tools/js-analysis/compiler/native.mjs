@@ -1541,7 +1541,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    let sequence=p;
    while(sequence?.type==='SequenceExpression')sequence=parents.get(sequence);
    const discardedSequence=p?.type==='SequenceExpression'&&sequence?.type==='ExpressionStatement';
-   if(!discardedSequence&&!['ExpressionStatement','ReturnStatement','ArrowFunctionExpression'].includes(p?.type)&&!(p?.type==='AwaitExpression'&&['ExpressionStatement','ReturnStatement'].includes(parents.get(p)?.type))&&!(p?.type==='MemberExpression'&&['then','catch'].includes(property(p)))&&!(p?.type==='CallExpression'&&free(p.callee,'setTimeout')&&p.arguments[0]===n&&terminal(p))&&!terminalConditional(n))fail(n,'完成操作嵌入表达式，无法证明返回值传播');
+   // `return (赋值, $done(payload))` 是混淆器常见的完成形态：只有完成调用
+   // 位于每一层逗号序列末尾并最终作为返回值时，它的 payload 才等于整个
+   // return 的值；任何中间层不是末项都会丢掉完成结果，仍按失败关闭。
+   let child=n,tail=p,returnedSequence=false;
+   while(tail?.type==='SequenceExpression'&&tail.expressions.at(-1)===child){child=tail;tail=parents.get(tail);}
+   if((tail?.type==='ReturnStatement'&&tail.argument===child||tail?.type==='ArrowFunctionExpression'&&tail.body===child)&&p?.type==='SequenceExpression')returnedSequence=true;
+   if(!discardedSequence&&!returnedSequence&&!['ExpressionStatement','ReturnStatement','ArrowFunctionExpression'].includes(p?.type)&&!(p?.type==='AwaitExpression'&&['ExpressionStatement','ReturnStatement'].includes(parents.get(p)?.type))&&!(p?.type==='MemberExpression'&&['then','catch'].includes(property(p)))&&!(p?.type==='CallExpression'&&free(p.callee,'setTimeout')&&p.arguments[0]===n&&terminal(p))&&!terminalConditional(n))fail(n,'完成操作嵌入表达式，无法证明返回值传播');
   }
   if(isAPI(n,'$task','fetch')){
    const p=parents.get(n),gp=parents.get(p);

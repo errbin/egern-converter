@@ -83,6 +83,46 @@ class NativeImplicitAndDiscardBoundaryTests(unittest.TestCase):
                     self.assertRaisesRegex(ConversionError, '逗号序列前项含完成操作'):
                 self.convert(source)
 
+    def test_returned_sequence_tail_completion_propagates_the_payload(self):
+        # 完成调用位于每一层逗号序列末尾并作为返回值时，payload 就是整个
+        # return 的值，可直接改写为 return payload。
+        cases={
+            'direct':'function a(){}function f(){return (a(),$done({body:"ok"}))}f();',
+            'nested':'function a(){}function b(){}function f(){return ((a(),b()),$done({body:"ok"}))}f();',
+            'arrow':'function a(){}const f=()=>(a(),$done({body:"ok"}));f();',
+        }
+        for name,source in cases.items():
+            with self.subTest(name=name):
+                output=self.check(source,{'name':f'returned sequence {name}',
+                                          'expected':{'result':{'body':'ok'}}})
+                self.assertNotIn('completion =',output)
+        direct=self.convert(cases['direct'])
+        self.assertIn('return(a(),{body:"ok"})',direct)
+        nested=self.convert(cases['nested'])
+        self.assertIn('return((a(),b()),{body:"ok"})',nested)
+        arrow=self.convert(cases['arrow'])
+        self.assertIn('return a(),{body:"ok"};',arrow)
+
+    def test_non_tail_or_escaping_returned_sequences_do_not_take_the_shortcut(self):
+        # 完成调用不是序列末项时，payload 不是返回值；必须走既有完成提升路径，
+        # 不能把后续的 0 或 1 当成 $done 的载荷。
+        cases={
+            'completion_not_tail':'function f(){return ($done({body:"ok"}),0)}f();',
+            'nested_completion_not_tail':'function f(){return (($done({body:"ok"}),0),1)}f();',
+        }
+        for name,source in cases.items():
+            with self.subTest(name=name):
+                output=self.check(source,{'name':name,
+                                          'expected':{'result':{'body':'ok'}}})
+                self.assertIn('completion =',output)
+                self.assertIn('return completion.value',output)
+        for source in [
+            'function a(){}function f(){return (a(),$done({body:"ok"}))}const list=[f];unknown(list[0]);',
+            'function a(){}Promise.resolve().then(function(){return (a(),$done({body:"ok"}))});$done({body:"first"});',
+        ]:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                self.convert(source)
+
     def test_conditional_implicit_global_direct_call_is_rejected(self):
         # 条件初始化的隐式全局直接作为调用目标时，函数身份和完成契约均未知。
         source = 'if($argument)conditionalCallable=()=>1;conditionalCallable();$done({});'
