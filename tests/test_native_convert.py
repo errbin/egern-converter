@@ -101,6 +101,16 @@ console.log(JSON.stringify({ok: true}));
         self.assertEqual(result['status'], 'header_method_error', result)
         self.assertEqual(result['original_error'], result['converted_error'])
 
+    def test_plain_collection_error_is_not_mistaken_for_header_method(self):
+        # 普通数组/参数上的 forEach 报错与宿主 Headers 无关，不能仅凭方法名
+        # 就把两边同错判成 Headers 兼容性失败。
+        from tools.egern_hub.verify import compare
+        source = 'function removeGoods(app){app.forEach(item=>{item.goods=[];});}removeGoods({});$done({});'
+        fixture = {'name': 'plain collection error', 'request': {'url': 'https://example.test/'}}
+        result = compare(source, source, 'surge', 'https://example.test/source.js', fixture)
+        self.assertEqual(result['status'], 'original_error', result)
+        self.assertEqual(result['original_error'], result['converted_error'])
+
     def test_awaited_completion_expression_runs_once(self):
         from tools.egern_hub.verify import compare
         source='let calls=0;function value(){calls++;return Promise.resolve(calls)}(async()=>{$done(await value().then(async n=>({status:201,headers:{"X-Calls":String(n)},body:String(n)})))})();'

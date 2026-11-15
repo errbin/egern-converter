@@ -20,6 +20,25 @@ from .device_parameters import device_cases
 
 ROOT = Path(__file__).resolve().parents[2]
 HEADER_METHOD_ERROR = re.compile(r'(?:entries|getAll|keys|values|forEach|has)[^\n]{0,120}?is not a function')
+_HEADER_METHOD_CACHE = {}
+
+
+def calls_unverified_header_method(source):
+    """复用编译器的 Headers 污点检查，避免把普通集合方法误判为宿主缺失。"""
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    if digest in _HEADER_METHOD_CACHE:
+        return _HEADER_METHOD_CACHE[digest]
+    runner = ROOT / 'tools/js-analysis/check.mjs'
+    try:
+        result = subprocess.run(['node', str(runner), '--header-calls'], input=source, capture_output=True, text=True, timeout=5)
+        verdict = result.returncode != 0
+    except (OSError, subprocess.TimeoutExpired):
+        # 检查本身不可用时保持原有保守判定，不能把可能存在的宿主调用当成安全。
+        verdict = True
+    if len(_HEADER_METHOD_CACHE) >= 64:
+        _HEADER_METHOD_CACHE.clear()
+    _HEADER_METHOD_CACHE[digest] = verdict
+    return verdict
 
 
 def compression_vectors(fixture):
@@ -146,7 +165,8 @@ def compare(source, converted, platform, url, fixture, *, native_evaluation=()):
     # 两边以同一 TypeError 失败并不等于等价：真机 Headers 缺失这些方法时，
     # 原始脚本与产物会同步报错，反而会掩盖不兼容实现。必须显式判为失败。
     if (original.get('error') and native.get('error') and original.get('error')==native.get('error')
-            and HEADER_METHOD_ERROR.search(original['error'])):
+            and HEADER_METHOD_ERROR.search(original['error'])
+            and calls_unverified_header_method(converted)):
         result.update(status='header_method_error', reason='原脚本和转换产物都调用了真机 Headers 不存在的方法')
     return result
 
