@@ -461,6 +461,571 @@ export function lowerLiteralStringTables(source){
  return {source:render(nodes[0]),transformations};
 }
 
+const V5_VERSION='jsjiami.com.v5';
+const V5_DECODER='3e7d0e95ea2e7bf2e68875d48ed809f704cd83b31a15ee8030bac99e453aa6f9';
+const V5_UNKNOWN=Symbol('v5 unknown');
+const V5_GLOBAL_RECEIVERS=new Set(['window','global','globalThis','self']);
+const V5_ENV_PROBES=new Set(['window','global','globalThis','self','process','require','module']);
+const V5_SHELL_ALLOWED=new Set(['window','global','globalThis','self','process','require','module','encode_version','RegExp','Array','String','Number','Boolean','Math','arguments','undefined','NaN','Infinity','atob','decodeURIComponent']);
+const V5_SHELL_MARKERS=['版本号，js会定期弹窗，还请支持我们的工作','删除版本号，js会定期弹窗'];
+const V5_HOST_CALLS=new Set(['$notification','$httpClient','$task','$persistentStore','$prefs','$environment','$argument','$network','$utils','$script','$drive','fetch','setTimeout','setInterval','XMLHttpRequest','localStorage','sessionStorage','eval','Function']);
+const V5_CONSOLE_PATHS=new Set(['console']);
+function v5Fail(why){throw Error('jsjiami v5 静态解析：'+why);}
+const v5Inside=(node,range)=>!!node&&!!range&&node.start>=range.start&&node.end<=range.end;
+const v5Same=(ix,left,right)=>left?.type==='Identifier'&&right?.type==='Identifier'&&!!ix.bindings.get(left)&&ix.bindings.get(left)===ix.bindings.get(right);
+const v5Number=node=>node?.type==='Literal'&&typeof node.value==='number'&&Number.isFinite(node.value)?node.value:null;
+const v5String=node=>node?.type==='Literal'&&typeof node.value==='string'?node.value:null;
+function v5MemberKey(node){const value=property(node);return value===undefined?undefined:String(value);}
+function v5Literal(node,value){return !!node&&node.type==='Literal'&&node.value===value;}
+function v5Contains(root,predicate){
+ let found=false;
+ (function walk(node){
+  if(!node||typeof node!=='object'||found)return;
+  if(Array.isArray(node)){node.forEach(walk);return;}
+  if(predicate(node)){found=true;return;}
+  for(const value of Object.values(node))if(value&&typeof value==='object')walk(value);
+ })(root);
+ return found;
+}
+function v5ContainsString(root,value){return v5Contains(root,node=>v5Literal(node,value));}
+function v5StaticArray(node,ix){
+ if(node?.type!=='ArrayExpression'||node.elements.some(element=>!element||element.type!=='Literal'))return null;
+ return node.elements.map(element=>element.value);
+}
+function v5LocalBindings(range,ix){
+ const local=new Set();
+ for(const node of ix.nodes){
+  if(!v5Inside(node,range))continue;
+  if(functions.has(node.type)&&node.params)for(const param of node.params)if(param.type==='Identifier')local.add(ix.bindings.get(param));
+  if(node.type==='VariableDeclarator'&&node.id.type==='Identifier')local.add(ix.bindings.get(node.id));
+  if(node.type==='FunctionDeclaration'&&node.id)local.add(ix.bindings.get(node.id));
+  if(node.type==='CatchClause'&&node.param?.type==='Identifier')local.add(ix.bindings.get(node.param));
+ }
+ return local;
+}
+function v5ObjectProperty(object,ix,name){
+ if(object?.type==='Identifier'){
+  const binding=ix.bindings.get(object);
+  if(!binding||binding.writes.length||binding.init?.type!=='ObjectExpression')return null;
+  for(const entry of binding.init.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method)continue;
+   if(key(entry)===name)return entry.value;
+  }
+  return null;
+ }
+ if(object?.type==='ObjectExpression'){
+  for(const entry of object.properties){
+   if(entry.type!=='Property'||entry.kind!=='init'||entry.method)continue;
+   if(key(entry)===name)return entry.value;
+  }
+ }
+ return null;
+}
+function v5Eval(node,context,seen=new Set()){
+ const {ix}=context;
+ if(!node)return V5_UNKNOWN;
+ if(seen.has(node))return V5_UNKNOWN;
+ seen=new Set(seen);seen.add(node);
+ if(node.type==='Literal')return node.regex?V5_UNKNOWN:node.value;
+ if(node.type==='Identifier'){
+  if(node.name==='undefined')return undefined;
+  if(node.name==='NaN')return NaN;
+  if(node.name==='Infinity')return Infinity;
+  const binding=ix.bindings.get(node);
+  if(binding){
+   if(context.env?.has(binding))return context.env.get(binding);
+   if(binding.init&&binding.init!==node)return v5Eval(binding.init,context,seen);
+   let latest=null;
+   for(const candidate of ix.nodes)if(candidate.type==='AssignmentExpression'&&candidate.operator==='='&&candidate.left.type==='Identifier'&&ix.bindings.get(candidate.left)===binding&&candidate.end<=node.start&&(!latest||candidate.start>latest.start))latest=candidate;
+   if(latest)return v5Eval(latest.right,{...context,env:context.env},seen);
+   return V5_UNKNOWN;
+  }
+  return V5_UNKNOWN;
+ }
+ if(node.type==='ThisExpression')return V5_UNKNOWN;
+ if(node.type==='ArrayExpression'){
+  const values=[];
+  for(const element of node.elements){const value=element?v5Eval(element,context,seen):undefined;if(value===V5_UNKNOWN)return V5_UNKNOWN;values.push(value);}
+  return values;
+ }
+ if(node.type==='ObjectExpression')return {kind:'object',node};
+ if(node.type==='FunctionExpression'||node.type==='ArrowFunctionExpression')return {kind:'function',node};
+ if(node.type==='MemberExpression'){
+  const object=v5Eval(node.object,context,seen),name=v5MemberKey(node);
+  if(name===undefined)return V5_UNKNOWN;
+  if(object?.kind==='object'){const value=v5ObjectProperty(node.object,ix,name);if(!value)return undefined;return functions.has(value.type)?{kind:'function',node:value}:v5Eval(value,context,seen);}
+  if(typeof object==='string'&&name==='length')return object.length;
+  if(Array.isArray(object)&&name==='length')return object.length;
+  if(Array.isArray(object)&&/^(0|[1-9]\d*)$/.test(name))return object[Number(name)];
+  return V5_UNKNOWN;
+ }
+ if(node.type==='UnaryExpression'){
+  if(node.operator==='typeof'){
+   const value=v5Eval(node.argument,context,seen);
+   if(value===V5_UNKNOWN)return V5_UNKNOWN;
+   return typeof value;
+  }
+  const value=v5Eval(node.argument,context,seen);if(value===V5_UNKNOWN)return V5_UNKNOWN;
+  if(node.operator==='!')return !value;
+  if(node.operator==='-')return -value;
+  if(node.operator==='+')return +value;
+  if(node.operator==='void')return undefined;
+  return V5_UNKNOWN;
+ }
+ if(node.type==='BinaryExpression'){
+  const left=v5Eval(node.left,context,seen),right=v5Eval(node.right,context,seen);
+  if(left===V5_UNKNOWN||right===V5_UNKNOWN)return V5_UNKNOWN;
+  switch(node.operator){
+   case '===':return left===right;
+   case '!==':return left!==right;
+   case '==':return left==right;
+   case '!=':return left!=right;
+   case '+':return left+right;
+   case '-':return left-right;
+   case '*':return left*right;
+   case '/':return left/right;
+   case '%':return left%right;
+   case '<':return left<right;
+   case '<=':return left<=right;
+   case '>':return left>right;
+   case '>=':return left>=right;
+   default:return V5_UNKNOWN;
+  }
+ }
+ if(node.type==='LogicalExpression'){
+  const left=v5Eval(node.left,context,seen);
+  if(left===V5_UNKNOWN)return V5_UNKNOWN;
+  if(node.operator==='&&')return left?v5Eval(node.right,context,seen):left;
+  if(node.operator==='||')return left?left:v5Eval(node.right,context,seen);
+  if(node.operator==='??')return left==null?v5Eval(node.right,context,seen):left;
+  return V5_UNKNOWN;
+ }
+ if(node.type==='ConditionalExpression'){
+  const test=v5Eval(node.test,context,seen);
+  if(test===V5_UNKNOWN)return V5_UNKNOWN;
+  return v5Eval(test?node.consequent:node.alternate,context,seen);
+ }
+ if(node.type==='SequenceExpression'){
+  let value=undefined;
+  for(const expression of node.expressions){value=v5Eval(expression,context,seen);if(value===V5_UNKNOWN)return V5_UNKNOWN;}
+  return value;
+ }
+ if(node.type==='CallExpression'){
+  const callee=node.callee;
+  if(callee.type==='MemberExpression'&&v5MemberKey(callee)==='split'){
+   const receiver=v5Eval(callee.object,context,seen),separator=node.arguments.length===1?v5Eval(node.arguments[0],context,seen):undefined;
+   if(typeof receiver==='string'&&(separator===undefined||typeof separator==='string'))return receiver.split(separator);
+   return V5_UNKNOWN;
+  }
+  const fn=v5Eval(callee,context,seen);
+  if(fn?.kind!=='function'||node.arguments.some(argument=>argument.type==='SpreadElement'))return V5_UNKNOWN;
+  const target=fn.node;
+  if(target.body.type!=='BlockStatement'){const env=new Map(context.env??[]);target.params.forEach((param,index)=>{if(param.type==='Identifier')env.set(ix.bindings.get(param),v5Eval(node.arguments[index],context,seen));});return v5Eval(target.body,{...context,env},seen);}
+  const env=new Map(context.env??[]);
+  target.params.forEach((param,index)=>{if(param.type==='Identifier')env.set(ix.bindings.get(param),v5Eval(node.arguments[index],context,seen));});
+  for(const statement of target.body.body){
+   if(statement.type==='VariableDeclaration'){
+    for(const declarator of statement.declarations){
+     if(declarator.id.type!=='Identifier'||!declarator.init)continue;
+     const value=v5Eval(declarator.init,{...context,env},seen);if(value!==V5_UNKNOWN)env.set(ix.bindings.get(declarator.id),value);
+    }
+    continue;
+   }
+   if(statement.type==='ReturnStatement')return statement.argument?v5Eval(statement.argument,{...context,env},seen):undefined;
+   if(statement.type==='ExpressionStatement'&&statement.expression.type==='AssignmentExpression'&&statement.expression.left.type==='Identifier'){
+    const value=v5Eval(statement.expression.right,{...context,env},seen);if(value!==V5_UNKNOWN)env.set(ix.bindings.get(statement.expression.left),value);
+    continue;
+   }
+   return V5_UNKNOWN;
+  }
+  return undefined;
+ }
+ return V5_UNKNOWN;
+}
+function v5Dead(node,range,context){
+ let current=node,parent=context.ix.parents.get(current);
+ while(current&&current!==range){
+  if(parent?.type==='IfStatement'&&(parent.consequent===current||parent.alternate===current)){
+   const test=v5Eval(parent.test,context);
+   if(parent.consequent===current&&test===false)return true;
+   if(parent.alternate===current&&test===true)return true;
+  }
+  if(parent?.type==='ConditionalExpression'&&(parent.consequent===current||parent.alternate===current)){
+   const test=v5Eval(parent.test,context);
+   if(parent.consequent===current&&test===false)return true;
+   if(parent.alternate===current&&test===true)return true;
+  }
+  if(parent?.type==='LogicalExpression'&&parent.right===current){
+   const left=v5Eval(parent.left,context);
+   if(parent.operator==='&&'&&left===false)return true;
+   if(parent.operator==='||'&&left===true)return true;
+   if(parent.operator==='??'&&left!=null)return true;
+  }
+  current=parent;parent=context.ix.parents.get(current);
+ }
+ return false;
+}
+function v5ContainsTaint(node,tainted,ix,seen=new Set()){
+ if(!node||typeof node!=='object'||seen.has(node))return false;
+ seen=new Set(seen);seen.add(node);
+ if(node.type==='ThisExpression')return true;
+ if(node.type==='Identifier'){
+  const binding=ix.bindings.get(node);
+  if(binding)return tainted.has(binding);
+  return V5_ENV_PROBES.has(node.name);
+ }
+ for(const [name,value] of Object.entries(node)){
+  if(['start','end','type'].includes(name)||!value||typeof value!=='object')continue;
+  if(Array.isArray(value)){if(value.some(item=>v5ContainsTaint(item,tainted,ix,seen)))return true;}
+  else if(v5ContainsTaint(value,tainted,ix,seen))return true;
+ }
+ return false;
+}
+function v5RootPath(node,ix){
+ const path=[];
+ let current=node;
+ while(current?.type==='MemberExpression'){
+  const name=v5MemberKey(current);if(name===undefined)return null;
+  path.unshift(name);current=current.object;
+ }
+ return {root:current,path};
+}
+function v5TaintedBindings(range,ix,context){
+ const tainted=new Set();
+ if(range.params?.length){const binding=ix.bindings.get(range.params[0]);if(binding)tainted.add(binding);}
+ for(let pass=0;pass<8;pass++){
+  let changed=false;
+  for(const node of ix.nodes){
+   if(!v5Inside(node,range)||v5Dead(node,range,context))continue;
+   if(node.type==='VariableDeclarator'&&node.id.type==='Identifier'&&node.init){
+    if(v5ContainsTaint(node.init,tainted,ix)&&!tainted.has(ix.bindings.get(node.id))){tainted.add(ix.bindings.get(node.id));changed=true;}
+   }
+   if(node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'){
+    if(v5ContainsTaint(node.right,tainted,ix)&&!tainted.has(ix.bindings.get(node.left))){tainted.add(ix.bindings.get(node.left));changed=true;}
+   }
+  }
+  if(!changed)break;
+ }
+ return tainted;
+}
+function v5ProveNoBusinessWrites(range,ix,context){
+ const local=v5LocalBindings(range,ix),tainted=v5TaintedBindings(range,ix,context);
+ for(const node of ix.nodes){
+  if(!v5Inside(node,range)||v5Dead(node,range,context))continue;
+  let target=null;
+  if(node.type==='AssignmentExpression')target=node.left;
+  else if(node.type==='UpdateExpression')target=node.argument;
+  else if(node.type==='UnaryExpression'&&node.operator==='delete')target=node.argument;
+  if(!target)continue;
+  if(target.type==='Identifier'){
+   const binding=ix.bindings.get(target);
+   if(!binding||!local.has(binding))v5Fail('自检 IIFE 写入了外部或自由绑定');
+   continue;
+  }
+  if(target.type!=='MemberExpression')v5Fail('自检 IIFE 写入了未知目标');
+  const rootPath=v5RootPath(target,ix);
+  if(!rootPath)v5Fail('自检 IIFE 使用了动态写入键');
+  const {root,path}=rootPath;
+  if(root.type==='ThisExpression'){
+   if(!V5_CONSOLE_PATHS.has(path[0]))v5Fail('自检 IIFE 写入了全局非 console 字段');
+   continue;
+  }
+  if(root.type!=='Identifier')v5Fail('自检 IIFE 写入了未知接收者');
+  const binding=ix.bindings.get(root);
+  if(binding&&tainted.has(binding)){
+   if(!V5_CONSOLE_PATHS.has(path[0]))v5Fail('自检 IIFE 写入了全局非 console 字段');
+   continue;
+  }
+  if(binding&&local.has(binding))continue;
+  if(!binding&&V5_GLOBAL_RECEIVERS.has(root.name)){
+   if(!V5_CONSOLE_PATHS.has(path[0]))v5Fail('自检 IIFE 写入了全局非 console 字段');
+   continue;
+  }
+  v5Fail('自检 IIFE 写入了外部绑定');
+ }
+}
+function v5ProveShell(shell,ix,source){
+ const fn=shell.call.callee,context={ix,source,env:new Map()};
+ const args=shell.call.arguments;
+ if(args.length!==1)v5Fail('自检 IIFE 参数数量不匹配');
+ const receiver=args[0];
+ if(!(receiver.type==='ThisExpression'||receiver.type==='Identifier'&&ix.free(receiver)&&V5_GLOBAL_RECEIVERS.has(receiver.name)))v5Fail('自检 IIFE 的全局接收者不匹配');
+ if(!v5ContainsString(fn,V5_VERSION))v5Fail('自检 IIFE 缺少 v5 版本哨兵');
+ if(!V5_SHELL_MARKERS.some(marker=>v5ContainsString(fn,marker)))v5Fail('自检 IIFE 缺少 v5 版本提示');
+ const antiDebug=v5Contains(fn,node=>node.type==='WhileStatement'&&v5Eval(node.test,context)===true)||v5Contains(fn,node=>node.type==='DebuggerStatement');
+ if(!antiDebug)v5Fail('自检 IIFE 缺少反调试循环或 debugger');
+ const consoleWrite=ix.nodes.some(node=>{
+  if(!v5Inside(node,fn)||node.type!=='AssignmentExpression')return false;
+  const rootPath=v5RootPath(node.left,ix);return !!rootPath&&rootPath.path[0]==='console';
+ });
+ if(!consoleWrite)v5Fail('自检 IIFE 缺少 console 抑制写入');
+ for(const node of ix.nodes){
+  if(!v5Inside(node,fn)||node.type!=='Identifier'||!ix.free(node))continue;
+  if(V5_SHELL_ALLOWED.has(node.name))continue;
+  if(v5Dead(node,fn,context))continue;
+  v5Fail('自检 IIFE 读取了未审查的自由全局：'+node.name);
+ }
+ const tainted=v5TaintedBindings(fn,ix,context);
+ for(const node of ix.nodes){
+  if(!v5Inside(node,fn)||v5Dead(node,fn,context))continue;
+  if(node.type==='CallExpression'){
+   const callee=node.callee;
+   if(callee.type==='Identifier'&&ix.free(callee)&&V5_HOST_CALLS.has(callee.name))v5Fail('自检 IIFE 调用了未审查的宿主 API：'+callee.name);
+   if(callee.type==='MemberExpression'){
+    const rootPath=v5RootPath(callee,ix);
+    if(!rootPath)continue;
+    const {root}=rootPath,binding=root.type==='Identifier'?ix.bindings.get(root):null;
+    if(root.type==='ThisExpression'||root.type==='Identifier'&&(!binding&&V5_GLOBAL_RECEIVERS.has(root.name)))v5Fail('自检 IIFE 调用了未审查的全局方法');
+    if(binding&&tainted.has(binding))v5Fail('自检 IIFE 调用了全局对象方法');
+   }
+  }
+  if(node.type==='NewExpression'){
+   const callee=node.callee;
+   if(callee.type==='Identifier'&&ix.free(callee)&&V5_HOST_CALLS.has(callee.name))v5Fail('自检 IIFE 构造了未审查的宿主对象：'+callee.name);
+  }
+ }
+ v5ProveNoBusinessWrites(fn,ix,context);
+ for(const node of ix.nodes){
+  if(!v5Inside(node,fn)||node.type!=='Identifier'||!ix.free(node))continue;
+  if(node.name==='$request'||node.name==='$done'||node.name.startsWith('$')){
+   if(!v5Dead(node,fn,context))v5Fail('自检 IIFE 在可达位置使用了宿主 API：'+node.name);
+  }
+ }
+ return shell;
+}
+function v5FindShell(tree,ix,source){
+ const candidates=tree.body.filter(statement=>statement.type==='ExpressionStatement'&&statement.expression.type==='CallExpression'&&statement.expression.callee.type==='FunctionExpression'&&v5ContainsString(statement.expression.callee,V5_VERSION));
+ if(candidates.length!==1)v5Fail('自检 IIFE 数量不唯一或缺失');
+ const statement=candidates[0],call=statement.expression;
+ return v5ProveShell({statement,call},ix,source);
+}
+function v5FindTimer(tree,ix){
+ const timers=tree.body.filter(statement=>statement.type==='ExpressionStatement'&&statement.expression.type==='CallExpression'&&statement.expression.callee.type==='Identifier'&&statement.expression.callee.name==='setInterval'&&ix.free(statement.expression.callee));
+ if(timers.length!==1)v5Fail('周期自检调用不唯一或缺失');
+ const statement=timers[0],call=statement.expression;
+ if(call.arguments.length!==2||v5Number(call.arguments[1])!==0xfa0)v5Fail('周期自检间隔不是 0xfa0');
+ const callback=call.arguments[0];
+ if(!functions.has(callback.type)||callback.async||callback.generator||callback.body.type!=='BlockStatement')v5Fail('周期自检回调不是闭合函数');
+ const local=v5LocalBindings(callback,ix),external=new Set(),free=new Set();
+ for(const node of ix.nodes){
+  if(!v5Inside(node,callback)||node.type!=='Identifier'||!ix.reference(node))continue;
+  const binding=ix.bindings.get(node);
+  if(binding&&!local.has(binding))external.add(binding);
+  if(!binding)free.add(node.name);
+ }
+ if(free.size)v5Fail('周期自检回调读取了自由全局：'+[...free].join('、'));
+ if(external.size!==1)v5Fail('周期自检回调引用数量不唯一');
+ const target=[...external][0];
+ if(!target.fn||target.fn.type!=='FunctionDeclaration'||!target.fn.id)v5Fail('周期自检目标不是顶层函数声明');
+ const checked=target.fn;
+ if(!v5Contains(checked,node=>node.type==='DebuggerStatement'))v5Fail('周期自检目标缺少 debugger');
+ if(!v5Contains(checked,node=>node.type==='Identifier'&&ix.free(node)&&node.name.startsWith('$')))v5Fail('周期自检目标缺少宿主分支标记');
+ for(const node of ix.nodes){
+  if(!v5Inside(node,callback)||v5Dead(node,callback,{ix,env:new Map(),source:''}))continue;
+  let write=null;
+  if(node.type==='AssignmentExpression')write=node.left;
+  else if(node.type==='UpdateExpression')write=node.argument;
+  if(!write)continue;
+  const rootPath=write.type==='MemberExpression'?v5RootPath(write,ix):write.type==='Identifier'?{root:write,path:[]}:null;
+  if(!rootPath)v5Fail('周期自检回调写入了未知目标');
+  const binding=rootPath.root.type==='Identifier'?ix.bindings.get(rootPath.root):null;
+  if(!binding||!local.has(binding))v5Fail('周期自检回调写入了外部绑定');
+ }
+ return {statement,checked,callback};
+}
+function v5FindTable(tree,ix){
+ let found=null;
+ for(const statement of tree.body){
+  if(statement.type!=='VariableDeclaration')continue;
+  const arrays=[],versions=[];
+  for(const declarator of statement.declarations){
+   if(declarator.id.type!=='Identifier')continue;
+   const values=v5StaticArray(declarator.init,ix);
+   if(values&&values.length>=2&&values.every(value=>typeof value==='string'))arrays.push({declarator,values});
+   if(v5String(declarator.init)===V5_VERSION)versions.push(declarator);
+  }
+  if(!arrays.length)continue;
+  if(found)v5Fail('字符串表声明数量不唯一');
+  if(arrays.length!==1||versions.length!==1)v5Fail('字符串表声明结构不匹配');
+  found={statement,declarator:arrays[0].declarator,values:arrays[0].values,version:versions[0]};
+ }
+ if(!found)v5Fail('缺少 v5 字符串表声明');
+ const binding=ix.bindings.get(found.declarator.id);
+ if(!binding||binding.writes.length)v5Fail('字符串表被重新赋值');
+ return {...found,binding};
+}
+function v5ShiftHelper(fn,tableBinding,ix){
+ if(fn?.type!=='FunctionExpression'||fn.params.length!==1||fn.params[0].type!=='Identifier'||fn.body.type!=='BlockStatement'||fn.body.body.length!==1)return null;
+ const loop=fn.body.body[0];
+ if(loop.type!=='WhileStatement'||loop.test.type!=='UpdateExpression'||loop.test.operator!=='--'||!loop.test.prefix||loop.test.argument.type!=='Identifier'||ix.bindings.get(loop.test.argument)!==ix.bindings.get(fn.params[0]))return null;
+ if(loop.body.type!=='BlockStatement'||loop.body.body.length!==1||loop.body.body[0].type!=='ExpressionStatement')return null;
+ const call=loop.body.body[0].expression;
+ if(call.type!=='CallExpression'||call.arguments.length!==1||call.callee.type!=='MemberExpression'||v5MemberKey(call.callee)!=='push'||ix.bindings.get(call.callee.object)!==tableBinding)return null;
+ const shifted=call.arguments[0];
+ if(shifted.type!=='CallExpression'||shifted.arguments.length||shifted.callee.type!=='MemberExpression'||v5MemberKey(shifted.callee)!=='shift'||ix.bindings.get(shifted.callee.object)!==tableBinding)return null;
+ return true;
+}
+function v5RotateWrapper(fn,ix){
+ if(fn?.type!=='FunctionExpression'||fn.params.length!==2||fn.body.type!=='BlockStatement'||fn.body.body.length!==1||fn.body.body[0].type!=='ExpressionStatement')return null;
+ const call=fn.body.body[0].expression;
+ if(call.type!=='CallExpression'||call.arguments.length!==1||call.callee.type!=='Identifier'||ix.bindings.get(call.callee)!==ix.bindings.get(fn.params[0]))return null;
+ const argument=call.arguments[0];
+ if(argument.type!=='UpdateExpression'||argument.operator!=='++'||!argument.prefix||argument.argument.type!=='Identifier'||ix.bindings.get(argument.argument)!==ix.bindings.get(fn.params[1]))return null;
+ return true;
+}
+function v5ProveRotationBranch(rotationFn,wrapperCall,ix,source){
+ let enclosing=null,parent=ix.parents.get(wrapperCall);
+ while(parent&&parent!==rotationFn){
+  if(functions.has(parent.type)){enclosing=parent;break;}
+  parent=ix.parents.get(parent);
+ }
+ if(!enclosing||enclosing===rotationFn)return;
+ const objects=ix.nodes.filter(node=>node.type==='VariableDeclarator'&&v5Inside(node,rotationFn)&&node.init?.type==='ObjectExpression'&&node.init.properties.some(entry=>entry.type==='Property'&&key(entry)==='removeCookie')&&node.init.properties.some(entry=>entry.type==='Property'&&key(entry)==='getCookie'));
+ if(objects.length!==1)v5Fail('轮转自检对象不唯一');
+ const object=objects[0],objectBinding=ix.bindings.get(object.id),properties=object.init.properties;
+ const propertyFunction=name=>{const entry=properties.find(item=>item.type==='Property'&&item.kind==='init'&&key(item)===name);return entry?.value?.type==='FunctionExpression'?entry.value:null;};
+ const removeCookie=propertyFunction('removeCookie'),getCookie=propertyFunction('getCookie');
+ if(!removeCookie||!getCookie||getCookie!==enclosing)v5Fail('轮转自检的 cookie 函数不匹配');
+ if(removeCookie.body.body.length!==1||removeCookie.body.body[0].type!=='ReturnStatement'||v5String(removeCookie.body.body[0].argument)!=='dev')v5Fail('轮转自检的 removeCookie 返回值不匹配');
+ for(const ref of objectBinding?.refs??[]){
+  const member=ix.parents.get(ref);
+  if(member?.type!=='MemberExpression'||member.object!==ref)v5Fail('轮转自检对象逃逸为普通值');
+ }
+ const updates=ix.nodes.filter(node=>node.type==='AssignmentExpression'&&node.left.type==='MemberExpression'&&ix.bindings.get(node.left.object)===objectBinding&&v5MemberKey(node.left)==='updateCookie');
+ if(updates.length!==1||updates[0].operator!=='=')v5Fail('轮转自检 updateCookie 赋值不唯一');
+ const updateValue=updates[0].right,binding=updateValue.type==='Identifier'?ix.bindings.get(updateValue):null;
+ const update=binding?.init&&binding.writes.length===0?binding.init:updateValue;
+ if(update?.type!=='FunctionExpression')v5Fail('轮转自检 updateCookie 不是闭合函数');
+ const returned=update.body.body.find(statement=>statement.type==='ReturnStatement')?.argument;
+ if(returned?.type!=='CallExpression'||returned.arguments.length!==1||returned.callee.type!=='MemberExpression'||v5MemberKey(returned.callee)!=='test')v5Fail('轮转自检 updateCookie 没有执行格式测试');
+ const regexObject=returned.callee.object,bindingRegex=regexObject?.type==='Identifier'?ix.bindings.get(regexObject):null;
+ const regex=bindingRegex?.init?.type==='NewExpression'?bindingRegex.init:regexObject;
+ if(regex?.type!=='NewExpression'||regex.callee.type!=='Identifier'||regex.callee.name!=='RegExp'||regex.arguments.length!==1||typeof v5String(regex.arguments[0])!=='string'||v5String(regex.arguments[0]).length>512)v5Fail('轮转自检正则不是有界字面量');
+ const tested=returned.arguments[0];
+ if(tested?.type!=='CallExpression'||tested.arguments.length||tested.callee.type!=='MemberExpression'||v5MemberKey(tested.callee)!=='toString')v5Fail('轮转自检没有读取 removeCookie 源码');
+ const sourceMember=tested.callee.object;
+ if(sourceMember?.type!=='MemberExpression'||v5MemberKey(sourceMember)!=='removeCookie'||ix.bindings.get(sourceMember.object)!==objectBinding)v5Fail('轮转自检读取了错误函数源码');
+ let regexValue;try{regexValue=new RegExp(v5String(regex.arguments[0]));}catch{v5Fail('轮转自检正则无法构造');}
+ if(!regexValue.test(source.slice(removeCookie.start,removeCookie.end)))v5Fail('轮转自检正则没有命中 removeCookie，轮转路径不可达');
+ const flags=ix.nodes.filter(node=>node.type==='VariableDeclarator'&&node.id.type==='Identifier'&&node.init?.type==='CallExpression'&&node.init.callee.type==='MemberExpression'&&v5MemberKey(node.init.callee)==='updateCookie'&&ix.bindings.get(node.init.callee.object)===objectBinding&&node.init.arguments.length===0);
+ if(flags.length!==1)v5Fail('轮转自检状态变量不唯一');
+ const flag=flags[0],flagBinding=ix.bindings.get(flag.id);
+ if(flagBinding?.writes.length)v5Fail('轮转自检状态变量被改写');
+ const branch=ix.nodes.find(node=>node.type==='IfStatement'&&v5Inside(node,rotationFn)&&node.test.type==='UnaryExpression'&&node.test.operator==='!'&&node.test.argument.type==='Identifier'&&ix.bindings.get(node.test.argument)===flagBinding);
+ if(!branch)v5Fail('轮转自检条件分支缺失');
+ const alternate=branch.alternate;
+ if(alternate?.type!=='IfStatement'||alternate.test.type!=='Identifier'||ix.bindings.get(alternate.test)!==flagBinding)v5Fail('轮转自检的 else-if 分支不匹配');
+ const calls=ix.nodes.filter(node=>node.type==='CallExpression'&&node.callee.type==='MemberExpression'&&v5MemberKey(node.callee)==='getCookie'&&ix.bindings.get(node.callee.object)===objectBinding);
+ if(calls.length!==1||!v5Inside(calls[0],alternate.consequent))v5Fail('轮转自检没有唯一的 getCookie 调用');
+}
+function v5FindRotation(tree,ix,table,source){
+ const rotations=[];
+ for(const statement of tree.body){
+  if(statement.type!=='ExpressionStatement'||statement.expression.type!=='CallExpression')continue;
+  const call=statement.expression;
+  if(call.callee.type!=='FunctionExpression'||call.arguments.length!==2||!v5Same(ix,call.arguments[0],table.declarator.id))continue;
+  const target=v5Number(call.arguments[1]);if(target===null)continue;
+  rotations.push({statement,call,target});
+ }
+ if(rotations.length!==1)v5Fail('轮转初始化不唯一或缺失');
+ const rotation=rotations[0],fn=rotation.call.callee;
+ if(fn.params.length!==2||fn.params.some(param=>param.type!=='Identifier')||fn.body.type!=='BlockStatement')v5Fail('轮转初始化函数结构不匹配');
+ if(!Number.isInteger(rotation.target)||rotation.target<=0||rotation.target>=table.values.length)v5Fail('轮转次数超出字符串表边界');
+ const helperDeclarations=ix.nodes.filter(node=>node.type==='VariableDeclarator'&&node.id.type==='Identifier'&&v5ShiftHelper(node.init,ix.bindings.get(fn.params[0]),ix));
+ if(helperDeclarations.length!==1)v5Fail('轮转移位函数不唯一或结构不匹配');
+ const helper=helperDeclarations[0],helperBinding=ix.bindings.get(helper.id);
+ if(helperBinding?.refs.length!==1)v5Fail('轮转移位函数存在额外引用');
+ const helperRef=helperBinding.refs[0],wrapperCall=ix.parents.get(helperRef);
+ if(wrapperCall?.type!=='CallExpression'||wrapperCall.callee.type!=='Identifier')v5Fail('轮转移位函数没有唯一转发调用');
+ const wrapperBinding=ix.bindings.get(wrapperCall.callee);
+ if(!wrapperBinding||wrapperBinding.writes.length||wrapperBinding.refs.length!==1||!v5RotateWrapper(wrapperBinding.init,ix))v5Fail('轮转 ++ 转发函数结构不匹配');
+ if(wrapperCall.arguments.length!==2||!v5Same(ix,wrapperCall.arguments[0],helper.id)||!v5Same(ix,wrapperCall.arguments[1],fn.params[1]))v5Fail('轮转转发参数不匹配');
+ if(ix.bindings.get(fn.params[1])?.writes.length)v5Fail('轮转次数参数被改写');
+ v5ProveRotationBranch(fn,wrapperCall,ix,source);
+ return {...rotation,shift:rotation.target};
+}
+function v5DecoderShape(fn,tableBinding,decoderName,ix){
+ if(fn?.type!=='FunctionExpression'||fn.params.length!==2||fn.params.some(param=>param.type!=='Identifier')||fn.body.type!=='BlockStatement')return null;
+ if(methodContract(fn,new Set(),new Map([[tableBinding.name,'TABLE'],[decoderName,'DECODER']]))!==V5_DECODER)return null;
+ const first=fn.body.body[0];
+ if(first?.type!=='ExpressionStatement'||first.expression.type!=='AssignmentExpression'||first.expression.operator!=='='||first.expression.left.type!=='Identifier'||first.expression.right.type!=='BinaryExpression'||first.expression.right.operator!=='-'||!v5Same(ix,first.expression.right.left,first.expression.left)||!v5Same(ix,first.expression.left,fn.params[0]))return null;
+ const offset=v5Number(first.expression.right.right);if(offset===null||!Number.isInteger(offset))return null;
+ const reads=ix.nodes.filter(node=>node.type==='MemberExpression'&&node.computed&&node.object.type==='Identifier'&&ix.bindings.get(node.object)===tableBinding&&node.property.type==='Identifier'&&ix.bindings.get(node.property)===ix.bindings.get(fn.params[0]));
+ if(reads.length!==1)return null;
+ const alphabets=[];let atob=false,rc4=false;
+ for(const node of ix.nodes){
+  if(!v5Inside(node,fn))continue;
+  if(v5Literal(node,'atob'))atob=true;
+  if(v5Literal(node,'rc4'))rc4=true;
+  if(node.type==='Literal'&&typeof node.value==='string'&&node.value.length===65&&/^[A-Za-z0-9+/=]{65}$/.test(node.value))alphabets.push(node.value);
+ }
+ if(!atob||!rc4||new Set(alphabets).size!==1)return null;
+ return {offset,alphabet:alphabets[0]};
+}
+function v5FindDecoder(tree,ix,table){
+ const candidates=[];
+ for(const statement of tree.body){
+  if(statement.type!=='VariableDeclaration')continue;
+  for(const declarator of statement.declarations){
+   if(declarator.id.type!=='Identifier'||declarator.init?.type!=='FunctionExpression')continue;
+   const shape=v5DecoderShape(declarator.init,table.binding,declarator.id.name,ix);
+   if(shape)candidates.push({statement,declarator,fn:declarator.init,shape});
+  }
+ }
+ if(candidates.length!==1)v5Fail('v5 解码器不唯一或缺失');
+ return candidates[0];
+}
+function v5DecodeCalls(decoder,ix,table,rotation){
+ const binding=ix.bindings.get(decoder.declarator.id),replace=new Map();
+ if(!binding||binding.writes.length)v5Fail('v5 解码器被重新赋值');
+ const rotated=table.values.slice(rotation.shift).concat(table.values.slice(0,rotation.shift));
+ for(const ref of binding.refs){
+  if(v5Inside(ref,decoder.declarator))continue;
+  const call=ix.parents.get(ref);
+  if(call?.type!=='CallExpression'||call.callee!==ref)v5Fail('v5 解码器逃逸或存在动态引用');
+  if(call.arguments.length!==2||call.arguments.some(argument=>argument.type!=='Literal')||typeof call.arguments[0].value!=='string'||typeof call.arguments[1].value!=='string')v5Fail('v5 解码器实参不是双字面量');
+  const number=Number(call.arguments[0].value);
+  if(!Number.isInteger(number))v5Fail('v5 解码器索引不是整数常量');
+  const index=number-decoder.shape.offset;
+  if(index<0||index>=rotated.length)v5Fail('v5 解码器索引超出字符串表边界');
+  const value=decodeRC4(rotated[index],call.arguments[1].value,decoder.shape.alphabet,true);
+  if(typeof value!=='string')v5Fail('v5 解码结果不是字符串');
+  replace.set(call,JSON.stringify(value));
+ }
+ if(!replace.size)v5Fail('v5 解码器没有可还原的字面量调用');
+ return replace;
+}
+export function lowerV5StringTables(source){
+ if(!source.includes(V5_VERSION))return {source,transformations:[]};
+ const tree=parse(source,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),ix=index(tree);
+ const table=v5FindTable(tree,ix);
+ const rotation=v5FindRotation(tree,ix,table,source);
+ const decoder=v5FindDecoder(tree,ix,table);
+ const replace=v5DecodeCalls(decoder,ix,table,rotation);
+ const removed=new WeakSet(),removedRanges=[];
+ const mark=node=>{if(!node)return;removed.add(node);removedRanges.push(node);};
+ mark(table.statement);mark(rotation.statement);mark(decoder.statement);
+ const isRemoved=node=>removedRanges.some(range=>node.start>=range.start&&node.end<=range.end);
+ for(const ref of table.binding.refs)if(!isRemoved(ref))v5Fail('字符串表仍被业务代码读取');
+ for(const ref of ix.bindings.get(decoder.declarator.id).refs)if(!isRemoved(ref)&&!replace.has(ix.parents.get(ref)))v5Fail('v5 解码器仍有未还原引用');
+ const decoded=renderTree(source,tree,node=>removed.has(node)?{direct:true,value:''}:replace.has(node)?{direct:true,value:replace.get(node)}:null);
+ // 解码后 IIFE 内的版本哨兵与提示字符串才成为字面量；第二阶段只在这个已解码
+ // AST 上识别并删除反调试脚手架，避免根据原始密文猜测 shell 边界。
+ const decodedTree=parse(decoded,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),decodedIx=index(decodedTree);
+ const shell=v5FindShell(decodedTree,decodedIx,decoded);
+ const timer=v5FindTimer(decodedTree,decodedIx);
+ const removedShell=new WeakSet(),removedShellRanges=[];
+ const markShell=node=>{if(!node)return;removedShell.add(node);removedShellRanges.push(node);};
+ markShell(shell.statement);markShell(timer.statement);markShell(timer.checked);
+ const versionWrites=decodedTree.body.filter(statement=>statement.type==='ExpressionStatement'&&statement.expression.type==='AssignmentExpression'&&statement.expression.operator==='='&&statement.expression.left.type==='Identifier'&&statement.expression.left.name==='encode_version'&&v5String(statement.expression.right)===V5_VERSION);
+ for(const statement of versionWrites)markShell(statement);
+ const shellRemoved=node=>removedShellRanges.some(range=>node.start>=range.start&&node.end<=range.end);
+ for(const ref of decodedIx.bindings.get(timer.checked.id).refs)if(!shellRemoved(ref))v5Fail('周期自检函数仍被业务代码引用');
+ const output=renderTree(decoded,decodedTree,node=>removedShell.has(node)?{direct:true,value:''}:null);
+ if(output.includes(V5_VERSION))v5Fail('v5 自检脚手架仍有残留');
+ return {source:output,transformations:[{kind:'jsjiami-v5-string-table',lookups:replace.size,rotation_steps:rotation.shift,removed:'字符串表、轮转、RC4 解码器与反调试自检脚手架',reason:'字符串表、轮转与 RC4 均按闭合结构证明；自检 IIFE 与周期回调只保留已验证的反调试作用'}]};
+}
+
 // Statically lower the two closed obfuscator formats found in public sources.
 // This parser never executes source functions; it interprets bounded numeric
 // expressions, table rotation and RC4 string lookups from the AST.

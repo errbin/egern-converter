@@ -12,7 +12,7 @@ import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowe
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
 import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
-import {preserveLocalFunctionSources,lowerFunctionConstructorSource,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
+import {preserveLocalFunctionSources,lowerFunctionConstructorSource,lowerV5StringTables,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
 // Compile legacy HTTP scripts to direct Egern APIs. No runtime bridge is emitted.
@@ -174,7 +174,7 @@ function compileNative(source,format,options){
   // embedded libraries. No input body is evaluated during this reduction.
   const functionSource=lowerFunctionConstructorSource(preservedSources.source);
   libraries=protectLibraries(functionSource.source);
-  const numbers=normalizeLegacyNumbers(libraries.source),literalTables=lowerLiteralStringTables(numbers.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
+  const numbers=normalizeLegacyNumbers(libraries.source),v5=lowerV5StringTables(numbers.source),literalTables=lowerLiteralStringTables(v5.source),obfuscated=lowerObfuscatedTables(literalTables.source),selfChecks=lowerDiscardedSelfCheckCallbacks(obfuscated.source),decoded=lowerStringTables(selfChecks.source),envNormalized=normalizePrototypeEnv(decoded.source),probesFolded=pruneUnusedEnvMethods(simplify(foldMultiPlatformProbes(envNormalized.source).source)),scopeThis=lowerSloppyThis(typeof probesFolded==='string'?probesFolded:probesFolded.source),nodeRequest=lowerNodeRequestClient(scopeThis.source),dispatch=nodeRequest.source.includes('eval')?lowerFunctionDispatch(nodeRequest.source):{source:nodeRequest.source,transformations:[],rejected:[]};
   if(dispatch.rejected.length)throw Error('无法证明动态 eval 函数分派的目标：'+dispatch.rejected.map(item=>'第 '+item.line+' 行').join('、')+'；仅支持封闭且不可变的函数名集合');
   if(options.state_machine_proof){
    try{
@@ -203,7 +203,7 @@ function compileNative(source,format,options){
   const evaluation=checkNativeEvaluation(dispatch.source),device=lowerDevice(dispatch.source);
   libraries.source=device.source;libraries.transformations=[];
   return {...compile(functionSource.source,format,{...options,device,allowNoCompletion:!!probesFolded?.completionRemoved,sloppyThis:{global:scopeThis.globalName,helper:scopeThis.helperName}},libraries),native_evaluation:evaluation,
-   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...preservedSources.transformations,...functionSource.transformations,...numbers.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
+   ...(stateMachineProof?{state_machine:stateMachineProof}:{}),static_transformations:[...preservedSources.transformations,...functionSource.transformations,...numbers.transformations,...v5.transformations,...literalTables.transformations,...obfuscated.transformations,...selfChecks.transformations,...decoded.transformations,...scopeThis.transformations,...nodeRequest.transformations,...dispatch.transformations,...libraries.transformations]};
  }catch(e){return {errors:[e.message],code:null,libraries:libraries?.blocks??[],...(stateMachineProof?{state_machine:stateMachineProof}:{})};}
 }
 function normalizeLegacyNumbers(source){
