@@ -178,6 +178,16 @@ console.log(JSON.stringify({ok: true}));
                                 'expected':{'result':{'body':body}}})
                 self.assertEqual(result['status'],'passed',result)
 
+    def test_platform_member_reads_inside_structured_completion_switch_use_native_fields(self):
+        # 结构流程必须在成员整体投影后再处理字段，不能先递归到裸 `$script`
+        # 并误判为平台 API 值逃逸；switch 用于保留结构化完成分派形状。
+        source=("function finish(o={}){switch($request.method){"
+                "case 'GET':console.log(`elapsed ${$script.startTime}`);$done(o);break;"
+                "default:$done({body:'other'});break;}}finish({body:'ok'});")
+        output=compile_source(source)
+        self.assertNotIn('$script',output)
+        self.assertIn('Date.now()',output)
+
     def test_closed_function_constructor_body_becomes_native_completion(self):
         from tools.egern_hub.verify import compare
         source='(+[])["constructor"]["constructor"](\'$done({body:"ok"});\')();'

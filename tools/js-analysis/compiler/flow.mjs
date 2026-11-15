@@ -1005,6 +1005,9 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
  function tail(n,asynchronous=false){
   if(deferred?.call===n)return true;
   let p=parents.get(n);
+  // 可选链只在 AST 外包一层 ChainExpression；透明跳过后再判断调用是否
+  // 位于独立语句末尾，避免把合法 HTTP 派发误判为非独立表达式。
+  while(p?.type==='ChainExpression'&&p.expression===n){n=p;p=parents.get(n);}
   while(p?.type==='UnaryExpression'&&['!','void'].includes(p.operator)){n=p;p=parents.get(n);}
   while(p?.type==='MemberExpression'&&['then','catch','finally'].includes(property(p))&&p.object===n){
    const call=parents.get(p);if(call?.type!=='CallExpression'||call.callee!==p)break;n=call;p=parents.get(n);
@@ -1023,7 +1026,11 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
  }
  const asyncCompletionReceiver=n=>{let base=n;while(base?.type==='CallExpression'&&base.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(base.callee)))base=base.callee.object;return base?.type==='CallExpression'&&targets(base.callee).some(fn=>done.has(fn)&&(fn.async||asyncAdded.has(fn)));};
  const detachedCalls=new Set(nodes.filter(n=>n.type==='CallExpression'&&parents.get(n)?.type==='ExpressionStatement'&&(targets(n.callee).some(fn=>done.has(fn)&&(asyncAdded.has(fn)||fn.async))||asyncCompletionReceiver(n)&&promiseValue(n)||closedAsyncCompletionRoot(ix,n,fn=>done.has(fn))&&promiseValue(n))&&!tail(n,true)));
- const detachedHTTP=new Set(nodes.filter(n=>n.type==='CallExpression'&&parents.get(n)?.type==='ExpressionStatement'&&isHTTP?.(n)&&targets(n.arguments[1]).some(fn=>done.has(fn))&&!tail(n,true)));
+ const standaloneStatement=n=>{
+  const p=parents.get(n);
+  return p?.type==='ExpressionStatement'||p?.type==='ChainExpression'&&parents.get(p)?.type==='ExpressionStatement';
+ };
+ const detachedHTTP=new Set(nodes.filter(n=>n.type==='CallExpression'&&standaloneStatement(n)&&isHTTP?.(n)&&targets(n.arguments[1]).some(fn=>done.has(fn))&&!tail(n,true)));
  const executorCompletion=[...executors].some(fn=>done.has(fn));
  const concurrent=executorCompletion||nodes.some(n=>done.has(timerCallback(n)))||detachedCalls.size>0||detachedHTTP.size>0;
  if(concurrent&&nodes.some(n=>n.type==='Identifier'&&n.name==='Promise'&&bindings.has(n)))fail(tree,'并发完成传播依赖标准 Promise，局部 Promise 绑定尚未证明');
@@ -1067,10 +1074,15 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   }
   if(n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&done.has(owner))return promise(n,owner,wait);
   if(n.type==='MemberExpression'&&free(n.object,'$utils'))return result(raw(n));
-  const opaqueCallee=n.type==='CallExpression'&&(n.callee.type==='MemberExpression'&&free(n.callee.object)&&['$notification','$utils','$persistentStore','$prefs','$task','$httpClient'].includes(n.callee.object.name)||n.callee.type==='Identifier'&&free(n.callee,'$log'));
-  const parts=children(n).filter(([field,c])=>(!opaqueCallee||field!=='callee')&&(!['Property','MethodDefinition'].includes(n.type)||c===n.value||n.computed)).map(([field,c])=>({field,node:c,value:expression(c,owner)}));
   // 纯读取的接收者没有求值顺序副作用，参数中的完成副作用可以先展开。
   const simpleReference=node=>node.type==='Identifier'||node.type==='ThisExpression'||node.type==='MemberExpression'&&!node.optional&&property(node)!==undefined&&simpleReference(node.object);
+  // 平台标量成员没有完成副作用，必须整体交给原生发射器投影。若继续递归
+  // 到 `$script` 等全局的标识符子节点，结构流程会在字段映射前误判为值逃逸。
+  // 请求 / 响应及普通对象成员仍走通用求值顺序处理，不能在这里跳过副作用。
+  const nativeScalarRoots=new Set(['$script','$environment','$network']);
+  if(n.type==='MemberExpression'&&!n.computed&&n.object.type==='Identifier'&&free(n.object)&&nativeScalarRoots.has(n.object.name))return result(raw(n));
+  const opaqueCallee=n.type==='CallExpression'&&(n.callee.type==='MemberExpression'&&free(n.callee.object)&&['$notification','$utils','$persistentStore','$prefs','$task','$httpClient'].includes(n.callee.object.name)||n.callee.type==='Identifier'&&free(n.callee,'$log'));
+  const parts=children(n).filter(([field,c])=>(!opaqueCallee||field!=='callee')&&(!['Property','MethodDefinition'].includes(n.type)||c===n.value||n.computed)).map(([field,c])=>({field,node:c,value:expression(c,owner)}));
   const before=[];
   for(let i=0;i<parts.length;i++){
    const p=parts[i];before.push(...p.value.before);
@@ -1109,7 +1121,10 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   return result(wait?awaitValue(code):code,before);
  }
  function functionText(n){
-  if(!(concurrent&&n.async)&&![...done,...asyncAdded].some(fn=>fn&&fn.start>=n.start&&fn.end<=n.end)&&!nodes.some(c=>c.start>=n.start&&c.end<=n.end&&c.type==='CallExpression'&&targets(c.callee).some(fn=>asyncAdded.has(fn))))return api(n);
+  // 含 HTTP 派发的辅助函数必须走结构化语句生成：原始渲染只能把
+  // `$httpClient?.(...)` 当作普通表达式并拒绝，无法保持回调/完成顺序。
+  const containsHTTP=nodes.some(c=>c.start>=n.start&&c.end<=n.end&&isHTTP?.(c));
+  if(!containsHTTP&&!(concurrent&&n.async)&&![...done,...asyncAdded].some(fn=>fn&&fn.start>=n.start&&fn.end<=n.end)&&!nodes.some(c=>c.start>=n.start&&c.end<=n.end&&c.type==='CallExpression'&&targets(c.callee).some(fn=>asyncAdded.has(fn))))return api(n);
   const prelude=(concurrent&&(done.has(n)||n.async)?`if (${completion}) return;\n`:'')+replyPrelude(n),body=n.body.type==='BlockStatement'?statement(n.body):'{'+line(expression(n.body,n),true)+'}';
   let head=patch(source,{...n,body:null,end:n.body.start},render);
   if(n.body.type!=='BlockStatement')head=head.slice(0,head.lastIndexOf('=>')+2)+' ';
@@ -1123,6 +1138,7 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
  function hasPromiseCompletion(fn){return nodes.some(n=>owners.get(n)===fn&&n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(n.callee))&&done.has(fn));}
  function line(e,ret=false){return e.before.join('\n')+(e.code==='undefined'&&e.before.length?'':'\n'+(ret?'return ':'')+(!ret&&/^\s*(?:function\b|async\s+function\b|class\b|\{)/.test(e.code)?'('+e.code+')':e.code)+';');}
  function asBlock(n){const text=statement(n);return n.type==='BlockStatement'?text:'{'+text+'}';}
+ const httpCall=n=>{const expression=n?.type==='ChainExpression'?n.expression:n;return expression?.type==='CallExpression'&&isHTTP?.(expression)?expression:null;};
  function httpCallStatement(call,owner){
   const callback=call.arguments[1],fn=targets(callback)[0];
   if(done.has(fn)&&!tail(call,true)&&!detachedHTTP.has(call))fail(call,'未等待的 HTTP 完成任务后仍有执行路径，不能串行化原有并发');
@@ -1140,22 +1156,23 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type==='ExpressionStatement'){
    if(deferred?.statement===n)return `{${deferred.promise} = (async () => {${line(expression(n.expression,owner))}})();${guard(owner)}}`;
    if(n.expression.type==='SequenceExpression'){
-    const flatten=node=>node.type==='SequenceExpression'?node.expressions.flatMap(flatten):[node],parts=flatten(n.expression),calls=parts.filter(part=>isHTTP?.(part));
+    const flatten=node=>node.type==='SequenceExpression'?node.expressions.flatMap(flatten):[node],parts=flatten(n.expression),calls=parts.map(httpCall).filter(Boolean);
     if(calls.length){
-     if(calls.length!==1||parts.at(-1)!==calls[0])fail(n,'HTTP 请求位于有后续求值的逗号表达式中，无法保持完成顺序');
-     return parts.map(part=>part===calls[0]?httpCallStatement(part,owner):line(expression(part,owner))).join('\n');
+     if(calls.length!==1||httpCall(parts.at(-1))!==calls[0])fail(n,'HTTP 请求位于有后续求值的逗号表达式中，无法保持完成顺序');
+     return parts.map(part=>httpCall(part)===calls[0]?httpCallStatement(calls[0],owner):line(expression(part,owner))).join('\n');
     }
    }
-   if(isHTTP?.(n.expression)){
-    return httpCallStatement(n.expression,owner);
+   if(httpCall(n.expression)){
+    return httpCallStatement(httpCall(n.expression),owner);
    }
    return line(expression(n.expression,owner));
   }
   if(n.type==='ReturnStatement'){
-   if(isHTTP?.(n.argument)){
-    const callback=n.argument.arguments[1],fn=targets(callback)[0];
+   const call=httpCall(n.argument);
+   if(call){
+    const callback=call.arguments[1],fn=targets(callback)[0];
     if(fn)substitutions.set(callback,functionText(fn));
-    return httpStatement(n.argument,guard(owner))+'\nreturn;';
+    return httpStatement(call,guard(owner))+'\nreturn;';
    }
    return n.argument?line(expression(n.argument,owner),true):'return;';
   }
