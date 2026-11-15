@@ -157,6 +157,9 @@ globalThis.$request=messageEntry?oldMessage(request):undefined;globalThis.$respo
 globalThis.$argument='argument' in fixture?fixture.argument:'';
 globalThis.$script={name:fixture.name??'Fixture',startTime:fixedTime/(platform==='loon'?1:1000),binaryBodyMode:!!fixture.binary};
 globalThis.$environment={language:'zh-CN',variables:fixture.env??{},...(platform==='surge'?{'surge-version':'fixture'}:platform==='stash'?{'stash-version':'fixture'}:{}),...(fixture.legacy_environment??{})};
+// 真机 Egern 以 Egern 全局标记宿主动力；差分两侧必须看到同一平台事实，
+// 否则显式支持 Egern 的原脚本会误选源平台分支，而产物已按 Egern 折叠。
+globalThis.Egern={};
 const device=fixture.device??{},oldAddress=v=>({primaryAddress:v?.address,primaryInterface:v?.interface,primaryRouter:v?.gateway});
 globalThis.$network={wifi:device.wifi,v4:oldAddress(device.ipv4),v6:oldAddress(device.ipv6),dns:device.dnsServers,'cellular-data':device.cellular};
 // Platform presence is independent of the converted script. Without $loon the
