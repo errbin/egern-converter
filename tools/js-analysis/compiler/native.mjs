@@ -11,7 +11,7 @@ import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatf
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances,lowerClosedInstanceLiteralFields} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
-import {valueFacts,regeneratorStateMachine} from '../analysis/values.mjs';
+import {valueFacts,regeneratorStateMachine,provablyDead} from '../analysis/values.mjs';
 import {preserveLocalFunctionSources,lowerFunctionConstructorSource,lowerV5StringTables,lowerStringTables,lowerLiteralStringTables,lowerObfuscatedTables,lowerDiscardedSelfCheckCallbacks,assertNoResidualSelfCheckCallbacks} from '../transforms/decoding.mjs';
 import {checkNativeEvaluation} from '../transforms/evaluation.mjs';
 
@@ -1813,7 +1813,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const argument=statement.argument;
    if(!argument||argument.type==='UnaryExpression'&&argument.operator==='void'){fields.nullable=true;fields.undefinedOnly=true;continue;}
    if(argument.type==='Literal'&&argument.value===null){fields.nullable=true;continue;}
-   const value=shape(argument,new Set(next));
+   // async 函数的 return 会被隐式 await；`return otherAsync()` 的完成形状
+   // 属于内层 async 的解决值，而不是 Promise 对象本身。非 async 函数仍按
+   // 原表达式求形，避免把同步返回的 Promise 误当成完成记录。
+   const value=fn.async?promiseShape(argument,new Set(next))??shape(argument,new Set(next)):shape(argument,new Set(next));
    if(!value)return null;
    mergeShape(fields,value,next);
   }
@@ -1934,6 +1937,18 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const left=knownBoolean(n.left);
    if(left===false)return false;
    if(left===true)return knownBoolean(n.right);
+   // 右侧恒为 false 时，无论左侧真假，逻辑与的结果都为 false；这样平台
+   // 折叠后残留的 `probe && false` 不会继续把已死分支当作完成结果求形。
+   if(knownBoolean(n.right)===false)return false;
+   if(knownBoolean(n.right)===true)return left;
+  }
+  if(n.type==='LogicalExpression'&&n.operator==='||'){
+   const left=knownBoolean(n.left);
+   if(left===true)return true;
+   if(left===false)return knownBoolean(n.right);
+   // 右侧恒为 true 时逻辑或必然为 true；右侧恒为 false 时结果只由左侧决定。
+   if(knownBoolean(n.right)===true)return true;
+   if(knownBoolean(n.right)===false)return left;
   }
   return null;
  }
@@ -2265,7 +2280,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    let fn=null,param=-1;for(const f of nodes)if(functions.has(f.type)){const i=f.params.findIndex(p=>bindings.get(p.type==='AssignmentPattern'?p.left:p)===b);if(i>=0){fn=f;param=i;break;}}
    if(fn){
     if(!closedShapeFlow(b))fail(n,'完成结果参数逃逸，无法追溯所有字段修改');
-    const calls=nodes.filter(c=>c.type==='CallExpression'&&target(c.callee)===fn);if(calls.length){
+    const calls=nodes.filter(c=>c.type==='CallExpression'&&target(c.callee)===fn&&!provablyDead(ix,c));if(calls.length){
     const values=[];
     for(const c of calls){const argument=c.arguments[param],parameter=fn.params[param],fallback=parameter.type==='AssignmentPattern'?parameter.right:undefined;const value=shape(!argument||free(argument,'undefined')?fallback:argument,new Set(seen));if(value.nullable&&argument&&truthyGuarded(argument))value.nullable=false;values.push(value);}
     if(values.length&&values.every(value=>value.hostResponse))hostResponseBindings.add(b);
@@ -2310,7 +2325,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   // Scheduled completion is a return value, never an HTTP response patch.
   // Preserve authored panel/custom fields and their ordinary JavaScript reads.
   if(scheduledOnly&&!nested&&!reference)return n?render(n):'{}';
-  if(!reference&&n?.type==='ConditionalExpression')return `(${render(n.test)} ? ${payload(n.consequent,nested)} : ${payload(n.alternate,nested)})`;
+  if(!reference&&n?.type==='ConditionalExpression'){
+   // 条件已恒定时只投影真实分支；死分支里的完成调用可能依赖无法求形的
+   // 宿主对象，不能因为文本仍然存在就要求它也满足完成字段契约。
+   const known=knownBoolean(n.test);
+   if(known===true)return payload(n.consequent,nested);
+   if(known===false)return payload(n.alternate,nested);
+   return `(${render(n.test)} ? ${payload(n.consequent,nested)} : ${payload(n.alternate,nested)})`;
+  }
   if(!reference&&stringCompletion(n)){
    if(format!=='qx'||nested)fail(n,'字符串完成结果需要 QX 的 $done(body) 契约；当前平台没有已确认的字符串完成映射');
    return '{body: '+render(n)+'}';
@@ -4918,13 +4940,27 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const snapshotStringMethods=new Set(['replace','replaceAll','trim','trimStart','trimEnd','toLowerCase','toUpperCase','toLocaleLowerCase','toLocaleUpperCase','normalize','padStart','padEnd','repeat','charAt','substring','substr','split','includes','startsWith','endsWith','match','matchAll','search','indexOf','lastIndexOf','slice']);
  // 直接内联 helper 的宿主参数只在已证明的静态字段上使用；快照在调用边界
  // 建立，后续包装记录与返回值只携带本地数据，不再保留宿主对象身份。
- const inlineHostSnapshotProof=(binding,directFields,{allowedWrites=null,allowDone=false,allowDynamicHeaders=false}={})=>{
-  if(!binding)return false;
+ const inlineHostSnapshotProof=(binding,directFields,{allowedWrites=null,allowDone=false,allowDynamicHeaders=false,allowHeaderDeletes=false,seen=new Set()}={})=>{
+  if(!binding||seen.has(binding))return false;
+  seen=new Set(seen);seen.add(binding);
   for(const ref of binding.refs){
    const p=parents.get(ref),q=parents.get(p),other=p?.left===ref?p.right:p?.right===ref?p.left:null;
    if(p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator))continue;
    if(p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')))continue;
    if(p?.type==='LogicalExpression'&&p.left===ref||['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(p?.type)&&p.test===ref)continue;
+   if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
+    // 整体快照可以继续传给同一脚本内的闭合函数；接收参数仍必须只读固定
+    // 字段，不能保存、返回给未知代码或写入动态字段。完成调用本身沿用
+    // allowDone 的既有契约。
+    if(allowDone&&(isDone(p)||target(p.callee)&&complete.has(target(p.callee))))continue;
+    if(p.optional||p.arguments.filter(argument=>argument===ref).length!==1||p.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+    const fn=functions.has(p.callee.type)?p.callee:target(p.callee);
+    if(!functions.has(fn?.type))return false;
+    const parameter=fn.params[p.arguments.indexOf(ref)];
+    const parameterBinding=parameter&&bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+    if(!inlineHostSnapshotProof(parameterBinding,directFields,{allowedWrites,allowDone,allowDynamicHeaders,allowHeaderDeletes,seen}))return false;
+    continue;
+   }
    if(p?.type==='MemberExpression'&&p.object===ref){
     const field=property(p);if(field===undefined||!directFields.has(String(field)))return false;
     if(q?.type==='MemberExpression'&&q.object===p){
@@ -4932,6 +4968,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
      if(String(field)==='headers'){
       const use=parents.get(q);
       if(nested===undefined&&!allowDynamicHeaders||['__proto__','prototype','constructor'].includes(String(nested)))return false;
+      if(use?.type==='UnaryExpression'&&use.operator==='delete'&&allowHeaderDeletes)continue;
       if(use?.type==='AssignmentExpression'&&use.left===q||use?.type==='UpdateExpression'||use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===q)return false;
       continue;
      }
@@ -4948,7 +4985,6 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='SpreadElement'&&p.argument===ref)continue;
    if(p?.type==='SequenceExpression'&&p.expressions.at(-1)===ref)continue;
    if(p?.type==='ReturnStatement'&&p.argument===ref||p?.type==='ArrowFunctionExpression'&&p.body===ref)continue;
-   if(allowDone&&p?.type==='CallExpression'&&(isDone(p)||target(p.callee)&&complete.has(target(p.callee))))continue;
    return false;
   }
   return true;
@@ -5148,8 +5184,17 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
  const hostRequestReads=proveHostRequestSnapshot();
  const proveHostResponseSnapshot=()=>{
   const reboundNames=new Set(hostRebinds.filter(rebind=>rebind.kind==='$response').map(rebind=>rebind.name));
-  if(!reboundNames.size)return null;
-  const refs=[],closed=[];
+  const requireSnapshot=!!reboundNames.size;
+  const refs=[],closed=[],snapshotOnly=new Set();
+  // 参数的所有直接调用点都传入实时 $response 时，快照替换会覆盖整个调用面；
+  // 这类绑定不能再按宿主回调 response 的正文别名渲染。混合了其它回调响应
+  // 的调用面仍保留原有着色，避免把快照与宿主对象当成同一契约。
+  const onlyRawResponseCalls=(binding,fn,position)=>{
+   const owner=nodes.find(candidate=>functions.has(candidate.type)&&candidate.params.some(parameter=>bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter)===binding));
+   if(!owner)return false;
+   const calls=nodes.filter(call=>call.type==='CallExpression'&&!call.optional&&target(call.callee)===owner);
+   return calls.length>0&&calls.every(call=>{const argument=call.arguments[position];return argument?.type==='Identifier'&&free(argument,'$response');});
+  };
   for(const assignment of nodes.filter(node=>node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'&&reboundNames.has(node.left.name))){
    const awaited=assignment.right.type==='AwaitExpression'?assignment.right.argument:assignment.right;
    if(awaited.type!=='CallExpression'||awaited.arguments.some(argument=>argument.type==='SpreadElement'))return null;
@@ -5159,14 +5204,44 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(!functions.has(awaited.callee.type)||!parameter)fail(passed[0],'宿主响应重绑目标无法证明只访问固定字段');
    const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
    if(!inlineHostSnapshotProof(binding,responseSnapshotFields,{allowedWrites:new Set(['body','status'])}))fail(passed[0],'宿主响应重绑后含未闭合字段或调用');
-   refs.push(passed[0]);closed.push(binding);
+   refs.push(passed[0]);closed.push(binding);if(onlyRawResponseCalls(binding,fn,position))snapshotOnly.add(binding);
+  }
+  const expected=new Set(refs);
+  // 宿主响应整体传入本地函数时，只有接收参数也被证明只消费固定字段，
+  // 才能在调用边界建立本地快照。这样辅助函数后续读写的是纯数据副本，
+  // 不会把实时宿主对象带入未知调用或完成结果。
+  for(const ref of nodes.filter(node=>node.type==='Identifier'&&free(node,'$response')&&!expected.has(node))){
+   const p=parents.get(ref);
+   if(p?.type!=='CallExpression'||!p.arguments.includes(ref))continue;
+   if(p.optional||p.arguments.filter(argument=>argument===ref).length!==1||p.arguments.some(argument=>argument.type==='SpreadElement'))fail(ref,'宿主响应整体传递的调用形态无法证明字段语义');
+   const fn=functions.has(p.callee.type)?p.callee:target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params[position];
+   if(!functions.has(fn?.type)||!parameter)fail(ref,'宿主响应整体传递目标无法证明只访问固定字段');
+   const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+   if(!inlineHostSnapshotProof(binding,responseSnapshotFields,{allowedWrites:new Set(['body','status']),allowHeaderDeletes:true,allowDone:true})){
+    // 没有既有重绑要求时，新增的直接传参证明只是机会性增强；证明失败应
+    // 回到原有字段语义检查，而不是把原本可处理的完成变体改成新错误。
+    if(requireSnapshot)fail(ref,'宿主响应整体传递后含未闭合字段或调用');
+    return null;
+   }
+   refs.push(ref);expected.add(ref);closed.push(binding);if(onlyRawResponseCalls(binding,fn,position))snapshotOnly.add(binding);
   }
   if(!refs.length)return null;
-  // 重绑之外的宿主读取仍可能观察实时对象；此类形态保留原有保守判据。
-  const expected=new Set(refs);
-  const unexpected=nodes.find(node=>node.type==='Identifier'&&free(node,'$response')&&!expected.has(node)&&!(parents.get(node)?.type==='ExpressionStatement'));
-  if(unexpected)fail(unexpected,'宿主响应重绑之外的实时读取无法与本地快照保持一致');
+  // 快照建立后，其它裸读取只允许保留原求值/报错时机的观察位置；任何整体
+  // 传入未知代码或动态写入都必须继续拒绝。
+  const unexpected=nodes.find(node=>node.type==='Identifier'&&free(node,'$response')&&!expected.has(node)&&(()=>{
+   const p=parents.get(node),other=p?.left===node?p.right:p?.right===node?p.left:null;
+   return !(p?.type==='ExpressionStatement'||
+    p?.type==='UnaryExpression'&&['!','typeof','void'].includes(p.operator)||
+    p?.type==='LogicalExpression'||
+    ['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(p?.type)&&p.test===node||
+    p?.type==='BinaryExpression'&&['==','!=','===','!=='].includes(p.operator)&&(other?.type==='Literal'&&other.value===null||free(other,'undefined')));
+  })());
+  if(unexpected){
+   if(requireSnapshot)fail(unexpected,'宿主响应重绑之外的实时读取无法与本地快照保持一致');
+   return null;
+  }
   for(const binding of closed)closedHostResponseSnapshotBindings.add(binding);
+  for(const binding of snapshotOnly)hostResponseBindings.delete(binding);
   return new Set(responseSnapshotFields);
  };
  const hostResponseReads=proveHostResponseSnapshot();

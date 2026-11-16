@@ -31,6 +31,29 @@ class ResponseBodyRebindingTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '直接修改|整体传递'):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_response_snapshot_flows_through_closed_async_helper(self):
+        # 助手只读固定响应字段、写本地正文并删除本地 header；调用边界建立
+        # 快照后，等待其返回值仍可投影为完成结果。
+        source = '''async function decorate(response){
+ const body=response.body||'';
+ response.body=body+':changed';
+ delete response.headers['Content-Length'];
+ return response;
+}
+(async()=>{
+ if(typeof $response!=='undefined'&&$response){
+  const result=await decorate($response);
+  $done(result);
+ }else $done({body:'none'});
+})();'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        self.assertNotIn('$response', output)
+        fixture = {'name':'whole response helper', 'request':{'url':URL},
+                   'response':{'status':200, 'headers':{'Content-Length':'99','X-Keep':'yes'}, 'body':'base'},
+                   'expected':{'result':{'body':'base:changed'}}}
+        result = compare(source, output, 'loon', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+
 
 if __name__ == '__main__':
     unittest.main()

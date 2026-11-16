@@ -1646,6 +1646,21 @@ export function constantValue(ix,node,environment=new Map(),seen=new Set(),depth
 }
 
 export function constantTruth(ix,node,environment,seen){
+ // 逻辑表达式即使左侧未知，另一侧仍可能是恒定真/假。这里单独求两侧的
+ // 真值，让 `unknown && false` / `unknown || true` 能被证明为短路分支，
+ // 同时不把未知值本身当成具体常量。
+ if(node?.type==='LogicalExpression'&&(node.operator==='&&'||node.operator==='||')){
+  const left=constantTruth(ix,node.left,environment,seen);
+  const right=constantTruth(ix,node.right,environment,seen);
+  if(node.operator==='&&'){
+   if(left===false||right===false)return false;
+   if(left===true)return right;
+  }else{
+   if(left===true||right===true)return true;
+   if(left===false)return right;
+  }
+  return null;
+ }
  return instanceValueTruth(constantValue(ix,node,environment,seen));
 }
 

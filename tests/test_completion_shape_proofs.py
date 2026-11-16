@@ -47,6 +47,35 @@ result().then(value=>$done(value || {body:'fallback'}));''',
             with self.subTest(source=source), self.assertRaisesRegex(ConversionError, '形状|可能为空'):
                 convert_script(source, 'Fixture', URL, '', source_format='loon')
 
+    def test_constant_false_completion_branches_do_not_require_dead_shapes(self):
+        # 平台折叠会留下 `unknown && false` 形式；死分支里的成员读取和完成
+        # 调用都不应再参与完成结果求形，活分支仍按原字段投影。
+        sources = [
+            '''const value={body:'changed'};
+$done(value.missing&&false?value.missing:value);''',
+            '''function finish(result){$done(result)}
+const value={body:'changed'};
+value.missing&&false?finish(value.missing):finish(value);''',
+        ]
+        for source in sources:
+            output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+            self.assertNotIn('$done(', output)
+            result = compare(source, output, 'loon', URL,
+                             {'name':'constant false completion branch', 'request':{'url':URL},
+                              'response':{'body':'original'}})
+            self.assertEqual(result['status'], 'passed', result)
+
+    def test_async_return_of_async_call_projects_resolved_shape(self):
+        source = '''async function inner(){return {body:'changed'}}
+async function outer(){return inner()}
+(async()=>{$done(await outer())})();'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        self.assertNotIn('$done(', output)
+        result = compare(source, output, 'loon', URL,
+                         {'name':'async return adoption', 'request':{'url':URL},
+                          'response':{'body':'original'}})
+        self.assertEqual(result['status'], 'passed', result)
+
 
     def test_completion_read_ignores_writes_that_cannot_reach_it(self):
         sources = [
