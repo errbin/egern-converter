@@ -47,12 +47,15 @@ def declaration(line, defaults, schema=None):
     return metadata.get('tag',key)+('：'+metadata['desc'] if metadata.get('desc') else '')
 
 
-def bind(options, defaults):
+def bind(options, defaults, synthesize=None):
     native={}
     enable=options.pop('enable',options.pop('enabled','true'))
     if enable not in {'true','false'}:
         match=re.fullmatch(r'\{([\w-]+)\}',enable)
-        if not match or not isinstance(defaults.get(match[1]),bool):raise ValueError('启停开关必须引用已声明布尔参数'+('：'+match[1]+'（无法推断未声明开关的默认值）' if match else ''))
+        if not match:raise ValueError('启停开关必须引用已声明布尔参数')
+        if match[1] not in defaults and synthesize is not None:
+            synthesize(match[1], argument_only=False)
+        if not isinstance(defaults.get(match[1]),bool):raise ValueError('启停开关必须引用已声明布尔参数：'+match[1]+'（无法推断未声明开关的默认值）')
         options.setdefault('_env',{})['_hub_enabled']='{{{'+match[1]+'}}}'
         native['enabled_env']=True
     elif enable=='false':
@@ -60,7 +63,11 @@ def bind(options, defaults):
     argument=options.get('argument')
     keys = object_keys(argument)
     if keys is not None:
-        if len(keys)!=len(set(keys)) or any(k not in defaults for k in keys):raise ValueError('对象参数引用未声明或重复的参数')
+        if len(keys)!=len(set(keys)):raise ValueError('对象参数引用未声明或重复的参数')
+        for k in keys:
+            if k not in defaults:
+                if synthesize is None:raise ValueError('对象参数引用未声明或重复的参数')
+                synthesize(k, argument_only=True)
         chunks=[]
         for k in keys:
             value='{{{'+k+'}}}'

@@ -262,6 +262,24 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                 normalizations.append({'line':number,'parameter':key,'source':entry['source'],
                     'source_line':entry['line'],'sha256':entry['sha256'],
                     'reason':'从同一原作者脚本的配套模块补全功能参数声明'})
+    synthesized_parameters=set()
+    def synthesize_parameter(key, argument_only):
+        """按“未声明即关”补充开关；参数值位置不能凭空给出会被脚本当真的值。"""
+        defaults=result.setdefault('compat_arguments',{})
+        if key in defaults:
+            return defaults[key]
+        # enable 位置关闭时必须阻断执行；argument 位置关闭时必须保持未设置效果。
+        defaults[key]='' if argument_only else False
+        result.setdefault('compat_arguments_schema',{})[key]={
+            'name':key+'（本站补充，默认关闭）',
+            'description':'上游 [Argument] 未声明该参数，本站按“未声明即关”补充为开关；'
+                          '默认关闭，保持 Loon 未设置时的行为。',
+            'default_value':'false','options':['true','false']}
+        synthesized_parameters.add(key)
+        note='本站补充参数 '+key+'：上游 [Argument] 未声明，默认关闭'
+        result['compat_arguments_desc']=(result.get('compat_arguments_desc','')+'\n'+note).strip()
+        pending_comments.append(note)
+        return defaults[key]
     for number, line in enumerate(text.lstrip('\ufeff').splitlines(), 1):
         line = line.strip()
         meta = re.match(r'#!(name|desc|author|homepage|icon)\s*=\s*(.*)', line)
@@ -356,7 +374,11 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                         keys=set(origin.get('restored',{}).get('argument_parameters',[]))
                         recover_parameters(parsed[2][0][1][0].value,keys-set(result.get('compat_arguments',{})),number)
                         if normalizations is not None:normalizations.append(dict(origin,line=number))
-                    result.setdefault('scriptings',[]).append(loon_v2_script(parsed,result.get('compat_arguments',{})))
+                    # 没有 [Argument] 模型时，V2 裸 enable 仍是未知引用；只有
+                    # 已存在参数表才视为上游漏声明并按“未声明即关”补充。
+                    defaults=result.setdefault('compat_arguments',{})
+                    result.setdefault('scriptings',[]).append(loon_v2_script(
+                        parsed,defaults,synthesize=synthesize_parameter if defaults else None))
                 else:
                     for field,entry in loon_v2_rewrites(parsed,result.get('compat_arguments',{}),rule_set_loader):
                         if field == '_header_actions':header_actions.append(entry)
@@ -533,7 +555,7 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                     name = options.pop('tag', '')
                     missing = referenced_keys(options) - set(result.get('compat_arguments', {}))
                     recover_parameters(options['script-path'],missing,number)
-                    native_options = loon_bind(options, result.get('compat_arguments', {}))
+                    native_options = loon_bind(options, result.setdefault('compat_arguments', {}), synthesize=synthesize_parameter)
                     if 'img-url' in options:
                         image = options.pop('img-url')
                         pending_comments.append('Loon script icon: '+image)
