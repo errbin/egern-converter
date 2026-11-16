@@ -53,6 +53,15 @@ class UndeclaredArgumentTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(ConversionError):
                 convert_module(module(body), 'loon', scripts_native=True, generated_headers=True, native_rewrites=True)
 
+    def test_module_without_a_declaration_table_still_rejects_undeclared_switches(self):
+        # 没有 [Argument] 说明声明表不在当前来源作用域内；此时补参数会越过来源边界，
+        # 必须保持原来的拒绝，不能靠合成开关把这类模块放行。
+        source = ('[Script]\n'
+                  'http-response ^https://a\\.com/x script-path=https://e.com/a.js, '
+                  'enable={noScopeSwitch}, tag=t\n')
+        with self.assertRaises(ConversionError):
+            convert_module(source, 'loon', scripts_native=True, generated_headers=True, native_rewrites=True)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -555,7 +555,10 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                     name = options.pop('tag', '')
                     missing = referenced_keys(options) - set(result.get('compat_arguments', {}))
                     recover_parameters(options['script-path'],missing,number)
-                    native_options = loon_bind(options, result.setdefault('compat_arguments', {}), synthesize=synthesize_parameter)
+                    # 只有在模块自身解析出声明表时才补“未声明即关”；声明表为空说明
+                    # 参数表根本不在当前来源作用域内，此时补参数会越过来源边界，仍按拒绝处理。
+                    declarations = result.setdefault('compat_arguments', {})
+                    native_options = loon_bind(options, declarations, synthesize=synthesize_parameter if declarations else None)
                     if 'img-url' in options:
                         image = options.pop('img-url')
                         pending_comments.append('Loon script icon: '+image)
