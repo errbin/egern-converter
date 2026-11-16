@@ -11,7 +11,7 @@
 - Surge Header Rewrite 在自动发现构建中编译为原生 `ctx.request/response.headers` 脚本。通过 `has/getAll/set/append/delete` 保留缺失头、已有头、多值头以及规则顺序；模块参数通过 `env` 传入。原生侧车脚本按作者、仓库、模块名称存放，独立的对象参考模型用于差分验证。
 - 平台识别仅将包含 `script-path` 的经典 `http-request/http-response` 脚本声明判为 Loon；头部规则不再触发误判。
 - 带有实际 HTTP 重写／脚本规则的模块可以解析 `force-http-engine-hosts` 域名列表：目标使用 Egern 原生 HTTP 处理链，保留重定向、处理规则和 MITM，不生成抓包配置。无关联处理规则的独立引擎指令、带端口的特殊流量仍明确报错。
-- `$utils.ungzip` 静态编译为 `await ctx.compress.gunzip`。局部别名、平台能力检测及可追溯的调用链自动处理；同步函数沿调用链改为异步并等待结果。输入按二进制视图转换，不注入平台对象。无法证明异步回调语义时拒绝输出。
+- `$utils` 压缩族按官方 `ctx.compress` 的六个成员编译：`gzip`、`gunzip`（兼容来源拼写 `ungzip`）、`deflate`、`inflate`、`brotli`、`unbrotli`。局部别名、平台能力检测及可追溯的调用链自动处理；同步函数沿调用链改为异步并等待结果。输入按二进制视图转换，不注入平台对象。官方清单之外的压缩成员、动态成员和逃逸别名仍拒绝；无法证明异步回调语义时拒绝输出。
 - 无方法重写、原型操作或接收者逃逸的本地对象／类方法参与完成结果和异步传播分析；保留原有业务方法和 `this`，不把平台全局 `this` 当作普通对象。
 - 打包脚本中的单例平台客户端通过作用域和方法 AST 契约识别，不按作者、URL 或文件名挑选。局部变量改名、空白和注释不影响方法匹配；未知方法实现、客户端逃逸、字段副作用、重新赋值或不明确的工厂参数会拒绝转换。构建直接展开已确认的平台分支，删除客户端类与工厂，把业务代码中的访问改为原生 `ctx` API，不发布客户端封装。
 - 已匹配客户端的复杂流程支持条件完成、普通返回与完成返回混用、静态分发表，以及明确的 `then/catch/finally` 链。局部变量暂存原生完成值，逐层返回；提前完成后跳过兜底路径。压缩调用的异步性质沿函数调用链传播。未知高阶回调、可修改的分发表及无法确认求值顺序的表达式继续报错。
@@ -41,7 +41,7 @@
 
 当前转换器按经过 AST 契约审核的工厂自动选择作者的 Surge 默认协议；模块来源格式继续保留，报告另记 `verification_format: surge`，构建验证与模块审计都使用同一基准。未注入兼容 API，也不虚构 `ctx.response.h2_trailers` 或把普通 headers 当作 trailers。原生消息仅包含公开字段，作者的能力检查和缺失回退保留原文；这不证明 Egern 兼容层实际也选择 Surge 分支。
 
-gzip 回归还要求已有 async 中间件内等待新异步化的解压函数；保持赋值左值与条件分支原本的求值顺序，不把整个中间件误判为新异步回调。
+压缩回归还要求已有 async 中间件内等待新异步化的压缩/解压函数；保持赋值左值与条件分支原本的求值顺序，不把整个中间件误判为新异步回调。
 
 Surge 单独 `header-add` 会追加多值头，`header-replace` 在原字段缺失时不执行。Egern 的 `add` 和 `replace` 都会在缺失时新增字段，因此不直接映射到静态字段，而通过原生请求／响应脚本实现精确条件。独立 CLI 的纯 YAML 输出仍不擅自丢弃这些条件；需要使用仓库构建发布配套脚本。
 
@@ -49,7 +49,7 @@ Surge 单独 `header-add` 会追加多值头，`header-replace` 在原字段缺�
 
 `force-http-engine-hosts` 强制指定流量进入 HTTP 引擎；Egern 的 `http_captures` 是流量记录功能，不能拿来替代。依据维护者提供的 Egern App 导入结果，Surge `[Host]` 中的 `域名 = script:名称` 可解析为 `dns.hosts`，`type=dns,engine=jsc` 可解析为同名 `generic` 脚本；保留模块参数、域名模式及参数 JSON。原生脚本参数使用 `env.argument`，不生成 `_compat.$argument`。未知引用、重复映射、未知选项和非 JSC 引擎继续拒绝。该配置映射不证明关联脚本已经原生化。
 
-Alidns 原文仍读取 `$domain` 并返回 `{addresses, ttl}`。截至本次核查，公开原生 API 文档只列出 Generic 的 Widget 返回值，没有说明 DNS 调用的原生域名输入及返回契约；维护者也未提供原生 DNS 示例，并明确选择“继续要求纯原生，暂不发布”。因此构建识别关联脚本后，报告缺少上述契约并排除整个模块，不沿用原始 Surge 脚本、不加入兼容层，也不猜测 `ctx.domain`、`ctx.env.domain` 等字段。阿里 JSON DoH 按查询域名和时间动态签名，不能用固定 DoH 上游替代。
+Alidns 原文仍读取 `$domain` 并返回 `{addresses, ttl}`。2026-11-16 取得的 Egern 官方 JavaScript API 明确只支持 Request、Response、Schedule、Generic、Network 五种脚本类型，没有 DNS 脚本类型，也没有 `$domain` 的宿主入口；`ctx.device.dnsServers` 只是本机 DNS 服务器列表，不是域名查询接口。因此这是权威依据下的永久拒绝：构建识别关联脚本后排除整个模块，不沿用原始 Surge 脚本、不加入兼容层，也不猜测 `ctx.domain`、`ctx.env.domain` 等字段。阿里 JSON DoH 按查询域名和时间动态签名，不能用固定 DoH 上游替代。只有官方新增 DNS 脚本类型并定义输入/返回契约时才重新评估。
 
 复杂对象方法中的完成结果、动态属性和平台环境封装仍需静态数据流证明。解析模块成功不表示关联脚本已转换成功；关联脚本失败时整个模块不发布。原因记录在 `dist/build-report.json`。
 
@@ -62,7 +62,7 @@ Alidns 原文仍读取 `$domain` 并返回 `{addresses, ttl}`。截至本次核�
 
 ## 压缩与调用链验证
 
-差分验证器按请求／响应二进制输入使用 Python 标准库 gzip/zlib 生成限长字节向量，通过 JSON 注入隔离 VM，分别供原平台同步 API 和 Egern 异步 API 使用。包括真实 gzip 数据解压、无效流的 `null`、函数／对象／类方法调用链及能力检测。
+差分验证器按请求／响应二进制输入使用 Python 标准库 gzip/zlib 生成长度受限的 gzip/deflate 字节向量，并用本机 Node zlib 生成同等的 brotli 向量，再通过 JSON 注入隔离 VM，分别供原平台同步 API 和 Egern 异步 API 使用。包括真实压缩流解压、无效流的 `null`、函数／对象／类方法调用链及能力检测。
 
 ## 参考
 
