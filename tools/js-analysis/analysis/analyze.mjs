@@ -1,6 +1,7 @@
 import {parse} from '../core/syntax.mjs';
 import {ordinaryReceivers} from './values.mjs';
 import {standardGlobals,privateGlobalAssignment} from '../core/ast.mjs';
+import {COMPRESSION_MEMBERS} from '../platform/globals.mjs';
 
 // Static parsing only. No upstream code or decoder is evaluated.
 export function analyze(source, sourceFormat='surge', options={}) {
@@ -56,7 +57,7 @@ const members={
   $httpClient:new Set(['get','post','put','delete','head','options','patch']),
   $persistentStore:new Set(['read','write']),
   $prefs:new Set(['valueForKey','setValueForKey','removeValueForKey']),
-  $utils:new Set(['geoip','ipasn','ipaso','ungzip']),
+  $utils:new Set(['geoip','ipasn','ipaso',...COMPRESSION_MEMBERS]),
   $script:new Set(['name','startTime','binaryBodyMode']),
   $network:new Set(['wifi','v4','v6','dns','cellular-data'])
 };

@@ -149,7 +149,7 @@ function observation(value,native=false){
  return clean({mode,result:message,events,storage:Object.fromEntries(store)});
 }
 globalThis.ctx={request:messageEntry?nativeMessage(request):undefined,response:messageEntry&&response?nativeMessage(response):undefined,env:{argument:'argument' in fixture?(typeof fixture.argument==='object'?JSON.stringify(fixture.argument):fixture.argument):'',...(fixture.env??{})},script:{name:fixture.name??'Fixture'},app:{language:'zh-CN',version:'fixture'},device:fixture.device??{},cron:fixture.cron,
- compress:Object.fromEntries(['gzip','gunzip','inflate','deflate'].map(m=>[m,async input=>compression(m,input)])),
+ compress:Object.fromEntries(['gzip','gunzip','deflate','inflate','brotli','unbrotli'].map(m=>[m,async input=>compression(m,input)])),
  storage,http:Object.fromEntries(['get','post','put','delete','head','options','patch'].map(m=>[m,async(url,o={})=>nativeMessage(network(m,url,o))])),
  notify:n=>{if(!finished)events.notifications.push(n);},respond:v=>({syntheticResponse:v}),abort:()=>({aborted:true}),lookupIP:ip=>fixture.geoip?.[ip]??null};
 const oldMessage=raw=>{const b=raw.bytes?Uint8Array.from(raw.bytes):encode(raw.body??'');return {...raw,headers:{...(raw.headers??{})},...(platform==='qx'?{bodyBytes:b.buffer}:fixture.binary&&(raw.body!=null||raw.bytes)?{body:b,bodyBytes:b}: {})};};
@@ -170,7 +170,7 @@ globalThis.$persistentStore={read:k=>storage.get(key(k)),write:(v,k)=>{if(v===nu
 globalThis.$prefs={valueForKey:k=>storage.get(key(k)),setValueForKey:(v,k)=>{storage.set(key(k),v);return true;},removeValueForKey:k=>{storage.delete(key(k));return true;}};
 if(platform==='qx')globalThis.$notify=notification;else globalThis.$notification={post:notification};
 globalThis.$utils={geoip:ip=>fixture.geoip?.[ip]?.country??null,ipasn:ip=>fixture.geoip?.[ip]?.asn??null,ipaso:ip=>fixture.geoip?.[ip]?.organization??null,
- ...Object.fromEntries(['ungzip','gzip','inflate','deflate'].map(m=>[m,input=>compression(m==='ungzip'?'gunzip':m,input)]))};
+ ...Object.fromEntries(['gzip','gunzip','ungzip','deflate','inflate','brotli','unbrotli'].map(m=>[m,input=>compression(m==='ungzip'?'gunzip':m,input)]))};
 const stop=Symbol('host completion');
 globalThis.$done=(v={})=>{if(!finished){completedObservation=observation(v);finished=true;}throw stop;};
 if(platform!=='qx')globalThis.$httpClient=Object.fromEntries(['get','post','put','delete','head','options','patch'].map(m=>[m,(r,cb)=>{let reply,error;try{reply=oldNetwork(r,m);}catch(e){error=e.message;}Promise.resolve().then(()=>{if(error!==undefined){cb(error,null,null);return;}const input=typeof r==='string'?{}:r;const h=headers(reply.headers);const hs=input['full-header-mode']?Object.entries(h).flatMap(([field,value])=>(Array.isArray(value)?value:[value]).map(value=>({field,value}))):h;cb(null,{status:reply.status??200,statusCode:reply.status??200,headers:hs},input['binary-mode']?Uint8Array.from(reply.bytes??encode(reply.body??'')):reply.body??'');}).catch(e=>{if(e!==stop&&!finished)failure=String(e.message??e);});}]));

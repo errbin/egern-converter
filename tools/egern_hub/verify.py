@@ -21,6 +21,8 @@ from .device_parameters import device_cases
 ROOT = Path(__file__).resolve().parents[2]
 HEADER_METHOD_ERROR = re.compile(r'(?:entries|getAll|keys|values|forEach|has)[^\n]{0,120}?is not a function')
 _HEADER_METHOD_CACHE = {}
+COMPRESSION_MEMBERS = ('gzip', 'gunzip', 'ungzip', 'deflate', 'inflate', 'brotli', 'unbrotli')
+COMPRESSION_SOURCE = re.compile(r'\$utils\.(?:' + '|'.join(COMPRESSION_MEMBERS) + r')\b')
 
 
 def calls_unverified_header_method(source):
@@ -41,6 +43,35 @@ def calls_unverified_header_method(source):
     return verdict
 
 
+def brotli_samples(payloads):
+    """Return brotli round-trip vectors without trusting or executing source code."""
+    script = r"""
+const fs=require('node:fs'),z=require('node:zlib');
+const rows=JSON.parse(fs.readFileSync(0,'utf8'));
+const output=rows.map(input=>{
+  const data=Buffer.from(input);
+  const compressed=z.brotliCompressSync(data);
+  let decompressed=null;
+  try{decompressed=[...z.brotliDecompressSync(data)];}catch{}
+  return {input:[...data],compressed:[...compressed],decompressed};
+});
+process.stdout.write(JSON.stringify(output));
+"""
+    try:
+        result = subprocess.run(['node', '-e', script], input=json.dumps([list(data) for data in payloads]),
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode:
+        return []
+    try:
+        rows = json.loads(result.stdout)
+        return [(bytes(row['input']), bytes(row['compressed']),
+                 None if row['decompressed'] is None else bytes(row['decompressed'])) for row in rows]
+    except (KeyError, TypeError, ValueError):
+        return []
+
+
 def compression_vectors(fixture):
     """Compute bounded binary API samples without executing the input script."""
     vectors = list(fixture.get('compression', []))
@@ -50,12 +81,25 @@ def compression_vectors(fixture):
         data = bytes(message['bytes']) if 'bytes' in message else str(message.get('body') or '').encode('utf-8')
         if len(data) <= 1024 * 1024:
             payloads.append(data)
-    # One round of derived streams covers gzip/deflate round trips. No upstream
-    # expressions, live network, or callable host objects enter the VM.
+    # One round of derived streams covers gzip/deflate/brotli round trips. No
+    # upstream expressions, live network, or callable host objects enter the VM.
     for raw in list(payloads):
         payloads.extend((gzip.compress(raw, mtime=0), zlib.compress(raw)))
-    for data in set(payloads):
-        operations = {'gzip': lambda: gzip.compress(data, mtime=0), 'deflate': lambda: zlib.compress(data)}
+    payloads = list(dict.fromkeys(payloads))
+    brotli_compressed, brotli_decompressed = {}, {}
+    for source, compressed, decompressed in brotli_samples(payloads):
+        brotli_compressed[source] = compressed
+        brotli_decompressed[source] = decompressed
+        if compressed not in payloads:
+            payloads.append(compressed)
+        brotli_decompressed.setdefault(compressed, source)
+    for data in payloads:
+        operations = {'gzip': lambda data=data: gzip.compress(data, mtime=0),
+                      'deflate': lambda data=data: zlib.compress(data)}
+        if data in brotli_compressed:
+            operations['brotli'] = lambda data=data: brotli_compressed[data]
+        if data in brotli_decompressed:
+            operations['unbrotli'] = lambda data=data: brotli_decompressed[data]
         for method, window in [('gunzip', 31), ('inflate', 15)]:
             try:
                 decoder = zlib.decompressobj(window)
@@ -77,7 +121,7 @@ def execute(source, platform, url, fixture, side):
     runner = ROOT/'tools/js-analysis/verify.mjs'
     if side == 'original' and 'original_timers' in fixture:
         fixture = {**fixture, 'timers': fixture['original_timers']}
-    if 'ungzip' in source or '.compress' in source:
+    if COMPRESSION_SOURCE.search(source) or '.compress' in source:
         fixture = {**fixture, 'compression': compression_vectors(fixture)}
     payload = {'source':source, 'platform':platform, 'url':url, 'fixture':fixture, 'side':side}
     # Fresh process and VM realm per side/case; no host env, imports or live HTTP.

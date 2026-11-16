@@ -7,7 +7,7 @@ import {structuredFlow,completionStatements,pendingCompletion,closedIdentityMeth
 import {simplify} from '../transforms/simplify.mjs';
 import {lowerEnv,foldTargetEnvironments,pruneTargetEnvironments,lowerClosedEnv,lowerExtendedClosedEnv,normalizePrototypeEnv,foldMultiPlatformProbes,pruneUnusedEnvMethods} from '../platform/environment.mjs';
 import {specializeParameters,normalizeRecordParameters,lowerMessageParameters,lowerClosedMessageObjects,lowerClosedAccessors,specializeCallbacks,lowerClosedReceiverArguments,lowerFiniteMethodCalls,lowerFunctionDispatch,lowerSloppyThis,collectSloppyMemberWrites,lowerMinimalRegenerator,lowerCompletionForwarders,lowerAsyncRegenerator,lowerReboundHostGlobals,lowerClosedCompletionWrappers,lowerClosedStorageFacades} from '../transforms/specialization.mjs';
-import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes,lowerMissingGlobalCatchFallbacks} from '../platform/globals.mjs';
+import {foldFactoryProbes,platformFold,lowerAPIObjectAliases,lowerQualifiedPlatformGlobals,lowerSelfNormalizedArgument,lowerDirectGlobalPlatformReceivers,assertSafeMissingGlobalProbes,lowerMissingGlobalCatchFallbacks,compressionTarget} from '../platform/globals.mjs';
 import {pruneGeneratedFunctions,lowerStatefulFactories,lowerLegacyFactories,lowerGlobalMessages,lowerImplicitInstances,lowerClosedInstanceLiteralFields} from '../transforms/factories.mjs';
 import {protectLibraries,lowerDetachedGlobalObjectAliases} from '../analysis/libraries.mjs';
 import {functions,property,key,children,index,patch,renderTree,initializedAfter,isolatedSwitchCase,closedMethodCallers} from '../core/ast.mjs';
@@ -1193,9 +1193,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    return !!actual&&closedCallbackValue(actual);
   });
  }
- const compressionNames={ungzip:'gunzip'};
  function compressionMethod(n,seen=new Set()){
-  if(n?.type==='MemberExpression'&&free(n.object,'$utils'))return compressionNames[property(n)]??null;
+  if(n?.type==='MemberExpression'&&free(n.object,'$utils'))return compressionTarget(property(n));
   if(n?.type==='Identifier'){const b=bindings.get(n);if(b?.init&&!b.writes.length&&!seen.has(b)){seen.add(b);return compressionMethod(b.init,seen);}}
   return null;
  }
@@ -5469,7 +5468,7 @@ function lowerCompressionFallbacks(source){
   const yes=n.consequent.type==='MemberExpression'&&free(n.consequent.object,'$utils')?property(n.consequent):null;
   const no=n.alternate.type==='MemberExpression'&&free(n.alternate.object,'$utils')?property(n.alternate):null;
   const name=yes??no;
-  if(!['ungzip'].includes(name)||!guarded(n.test,name)?.probe)continue;
+  if(!compressionTarget(name)||!guarded(n.test,name)?.probe)continue;
   const declaration=parents.get(n),binding=declaration?.type==='VariableDeclarator'&&declaration.init===n&&declaration.id.type==='Identifier'?bindings.get(declaration.id):null;
   if(!binding||binding.writes.length||!binding.refs.length||binding.refs.some(ref=>{const call=parents.get(ref);return call?.type!=='CallExpression'||call.callee!==ref||call.optional||call.arguments.some(a=>a.type==='SpreadElement');}))continue;
   replace.set(n,`$utils.${name}`);changed=true;

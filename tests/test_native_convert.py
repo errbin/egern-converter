@@ -300,6 +300,45 @@ console.log(JSON.stringify({ok: true}));
                  'response':{'bytes':[0,1,2]},'expected':{'result':{'body':'true'}}}
         self.assertEqual(compare(source,output,'surge','https://example.test/source.js',fixture)['status'],'passed')
 
+    def test_compression_api_covers_official_six_members_and_rejects_unknown(self):
+        import gzip
+        import zlib
+        from tools.egern_hub.verify import brotli_samples, compare
+        data='官方压缩契约回归'.encode()
+        brotli=brotli_samples([data])[0][1]
+        cases=[
+            ('gzip','gzip',data),
+            ('gunzip','gunzip',gzip.compress(data,mtime=0)),
+            ('ungzip','gunzip',gzip.compress(data,mtime=0)),
+            ('deflate','deflate',data),
+            ('inflate','inflate',zlib.compress(data)),
+            ('brotli','brotli',data),
+            ('unbrotli','unbrotli',brotli),
+        ]
+        for member,target,body in cases:
+            with self.subTest(member=member):
+                source=f'$done({{body:$utils.{member}($response.body)}});'
+                output=compile_source(source,binary=True)
+                self.assertRegex(output,rf'await ctx\d*\.compress\.{target}\(')
+                fixture={'name':member,'binary':True,'request':{'url':'https://example.test/'},
+                         'response':{'bytes':list(body)}}
+                result=compare(source,output,'surge','https://example.test/source.js',fixture)
+                self.assertEqual(result['status'],'passed',result)
+
+                guarded=(f'const run=typeof $utils==="object"&&typeof $utils?.{member}==="function"'
+                         f'?$utils.{member}:b=>{{throw new Error("fallback must not run")}};'
+                         '$done({body:run($response.body)});')
+                guarded_output=compile_source(guarded,binary=True)
+                self.assertRegex(guarded_output,rf'await ctx\d*\.compress\.{target}\(')
+
+        for member in ('lzma','zip','uncompress','brotliCompress','rawDeflate'):
+            with self.subTest(member=member),self.assertRaises(ConversionError):
+                compile_source(f'$done({{body:$utils.{member}($response.body)}});',binary=True)
+        for source in ('$done({body:$utils[$request.url]($response.body)});',
+                       'const name=$request.url;$done({body:$utils[name]($response.body)});'):
+            with self.subTest(source=source),self.assertRaises(ConversionError):
+                compile_source(source,binary=True)
+
     def test_closed_object_and_class_methods_propagate_completion(self):
         sources=[
             'const result={finish(){ $done({body:"ok"}); }};result.finish();$notify("wrong");',

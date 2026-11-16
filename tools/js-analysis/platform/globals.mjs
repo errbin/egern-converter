@@ -6,6 +6,11 @@ import {provablyDead,constantProbeValue,constantProbeCall,CONSTANT_UNKNOWN} from
 const UNKNOWN=Symbol('not statically known');
 const PRESENT_VERSION=Symbol('platform version exists; exact value unknown');
 const PRESENT_GLOBALS=new Map();
+// 源平台公开的 $utils 压缩成员到 Egern ctx.compress 的静态映射。gunzip 与
+// ungzip 是同一解压语义的两种来源拼写，其余成员按官方名称一一对应。
+export const COMPRESSION_TARGETS=Object.freeze({gzip:'gzip',gunzip:'gunzip',ungzip:'gunzip',deflate:'deflate',inflate:'inflate',brotli:'brotli',unbrotli:'unbrotli'});
+export const COMPRESSION_MEMBERS=new Set(Object.keys(COMPRESSION_TARGETS));
+export function compressionTarget(name){return typeof name==='string'?COMPRESSION_TARGETS[name]??null:null;}
 // 目标宿主确定没有的 Node/浏览器全局。裸读取仍然抛 ReferenceError；
 // 只有明确位于 catch 回退赋值右侧时，才按这一既定语义改写为抛错表达式。
 const MISSING_HOST_GLOBALS=new Set(['window','global','module','exports','process','require','importModule','document','$drive']);
@@ -507,7 +512,7 @@ function fold(source,format,options,qxHint){
      if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name))){complete(probeResultSafe(n)?'undefined':UNKNOWN);continue;}
      if(n.operator==='typeof'&&ix.free(n.argument,'globalThis')){complete('object');continue;}
      if(n.operator==='typeof'&&n.argument.type==='ChainExpression'){frame.argument=n.argument.expression;}
-     else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip'){complete('function');continue;}
+     else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&compressionTarget(property(n.argument))){complete('function');continue;}
      else if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$task')&&property(n.argument)==='fetch'&&types.$task==='object'){complete('function');continue;}
      else if(n.operator==='typeof'&&ix.free(n.argument)&&n.argument.name.startsWith('$')){complete(Object.hasOwn(types,n.argument.name)?types[n.argument.name]:UNKNOWN);continue;}
      frame.state='unary';stack.push({node:frame.argument??n.argument,state:'start'});continue;
@@ -707,7 +712,7 @@ function fold(source,format,options,qxHint){
    if(n.operator==='typeof'&&['window','global','module','exports','process','require','importModule','document','$drive'].some(name=>ix.free(n.argument,name)))return probeResultSafe(n)?'undefined':UNKNOWN;
    if(n.operator==='typeof'&&ix.free(n.argument,'globalThis'))return 'object';
    if(n.operator==='typeof'&&n.argument.type==='ChainExpression')return value({...n,argument:n.argument.expression},seen);
-   if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&property(n.argument)==='ungzip')return 'function';
+   if(n.operator==='typeof'&&n.argument.type==='MemberExpression'&&ix.free(n.argument.object,'$utils')&&compressionTarget(property(n.argument)))return 'function';
    if(n.operator==='typeof'&&ix.free(n.argument)&&n.argument.name.startsWith('$'))return Object.hasOwn(types,n.argument.name)?types[n.argument.name]:UNKNOWN;
    const v=value(n.argument,seen);if(v===UNKNOWN)return UNKNOWN;
    if(v&&records.has(v)&&!['typeof','!','void'].includes(n.operator))return UNKNOWN;
