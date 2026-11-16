@@ -1,5 +1,5 @@
 import {parse} from '../core/syntax.mjs';
-import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument,literalExpression} from '../core/ast.mjs';
+import {index,patch,renderTree,property,key,children,functions,initializedAfter,factoryArgument,literalExpression,privateGlobalAssignment} from '../core/ast.mjs';
 import {provablyDead,constantProbeValue,constantProbeCall,CONSTANT_UNKNOWN} from '../analysis/values.mjs';
 
 // Fold proven source-platform probes, preserving unknown device/version data.
@@ -997,7 +997,7 @@ export function lowerQualifiedPlatformGlobals(source,format){
  const api=new Set(['$request','$response','$argument','$httpClient','$task','$prefs','$persistentStore','$notification','$notify','$done','$utils','$script','$network','$environment','$cronexp','$loon','$rocket']);
  const globals=nodes.filter(n=>free(n,'globalThis'));
  const writable=n=>{const p=parents.get(n);return p?.type==='AssignmentExpression'&&p.left===n||p?.type==='UpdateExpression'||p?.operator==='delete'||['ForInStatement','ForOfStatement'].includes(p?.type)&&p.left===n;};
- if(globals.some(n=>{const p=parents.get(n);return p?.type!=='MemberExpression'||p.object!==n||property(p)===undefined||writable(p);} ))return source;
+ if(globals.some(n=>{const p=parents.get(n);return p?.type!=='MemberExpression'||p.object!==n||property(p)===undefined||writable(p)&&!privateGlobalAssignment(ix,n);} ))return source;
  for(const n of globals){
   const member=parents.get(n),name=property(member);
   if(!api.has(name)&&name!=='$intent')continue;

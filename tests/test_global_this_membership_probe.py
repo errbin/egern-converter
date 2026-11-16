@@ -78,6 +78,17 @@ class GlobalThisMembershipProbeTests(unittest.TestCase):
         self.assertIn('_fixture_private',output)
         self.assertIn('globalThis._fixture_private',output)
 
+    def test_private_static_global_write_does_not_block_qualified_api_lowering(self):
+        # 私有全局写入只用于保留脚本自身状态，不是宿主能力查询；它不应让
+        # 同一脚本中的限定平台 API 整体失去归一化机会。
+        source=("globalThis._fixture_private=1;"
+                "globalThis.$httpClient.get({url:'https://example.test'},()=>{});"
+                "$done({body:'ok'});")
+        output=convert_script(source,'Fixture',URL,'',source_format='surge')
+        self.assertIn('globalThis._fixture_private',output)
+        self.assertNotIn('globalThis.$httpClient',output)
+        self.assertIn('ctx.http.get',output)
+
     def test_global_write_outside_private_whole_value_stays_rejected(self):
         for change in [
             "const value=globalThis._fixture_private;",
