@@ -4,6 +4,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from tools.egern_hub.convert import ConversionError
 from tools.egern_hub.script_convert import convert_script
 from tools.egern_hub.verify import compare
 
@@ -48,6 +49,42 @@ $done({body:String(present)});"""
         result = compare(source, native, 'surge', URL, case)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_surge_build_branch_comparison_folds_to_the_modern_branch_without_a_version_literal(self):
+        cases = [
+            ('if($environment["surge-build"]<3112)$done({body:"legacy"});'
+             'else $done({body:"modern"});', 'modern'),
+            ('if(3112>$environment["surge-build"])$done({body:"legacy"});'
+             'else $done({body:"modern"});', 'modern'),
+        ]
+        for source, body in cases:
+            with self.subTest(source=source):
+                native = convert_script(source, 'Fixture', URL, '', source_format='surge')
+                self.assertNotIn('3112', native)
+                self.assertNotIn('$environment', native)
+                self.assertNotIn('surge-build', native)
+                case = {'name': 'surge build branch', 'request': {'url': URL},
+                        'expected': {'result': {'body': body}}}
+                self.assertEqual(compare(source, native, 'surge', URL, case)['status'], 'passed')
+
+    def test_platform_version_values_never_escape_or_compare_as_exact_versions(self):
+        cases = [
+            '$done({body:$environment["surge-build"]});',
+            'const build=$environment["surge-build"];$done({body:build});',
+            'unknown($environment["surge-build"]);$done({});',
+            'if($environment["surge-build"])$done({body:"new"});else $done({body:"old"});',
+            'Boolean($environment["surge-build"])?$done({body:"new"}):$done({body:"old"});',
+            '$environment["surge-build"]&&$done({body:"new"});',
+            'if($environment["surge-build"]===3112)$done({body:"new"});else $done({body:"old"});',
+            'if($environment["surge-build"]>=3112)$done({body:"new"});else $done({body:"old"});',
+            '$done({body:$environment["surge-version"]});',
+            'const version=$environment["surge-version"];$done({body:version});',
+            'if($environment["surge-version"]>"5.0")$done({body:"new"});else $done({body:"old"});',
+            'if($environment["surge-version"]<3112)$done({body:"old"});else $done({body:"new"});',
+        ]
+        for source in cases:
+            with self.subTest(source=source), self.assertRaises(ConversionError):
+                convert_script(source, 'Fixture', URL, '', source_format='surge')
+
     def test_surge_build_probe_selects_the_modern_notification_projection(self):
         probe = """
 import assert from 'node:assert/strict';
@@ -72,6 +109,8 @@ console.log(JSON.stringify({ok:true}));
                   'else{$notification.post("t","s","b",{action:"open-url",url:"https://a.test/",'
                   '"media-url":"https://a.test/i.png"})}$done({});')
         native = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertNotIn('3112', native)
+        self.assertNotIn('$environment', native)
         case = {'name': 'surge build probe', 'request': {'url': URL},
                 'expected': {'events': {'notifications': [
                     {'title': 't', 'subtitle': 's', 'body': 'b',
