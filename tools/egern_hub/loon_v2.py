@@ -334,9 +334,55 @@ def rewrite_entries(parsed, defaults, loader=None):
     output=[]
     if len(actions)>1 and any(name.startswith('reject') for name,_ in actions):
         raise ValueError('Loon V2 终止响应管道尚未合并为单个原生响应，不能拆分执行')
+    body_writes=[name for name,_ in actions if name in {
+        'response.body.mock','response.body.mock_file','response.body.replace',
+        'response.json.jq','response.json.jq_file','response.json.add','response.json.replace','response.json.delete',
+    }]
+    if len(body_writes)>1:
+        raise ValueError('Loon V2 响应管道包含多个 Body 写入，不能合并为同一原生响应')
     mock_actions=[name for name,_ in actions if name in {'response.body.mock','response.body.mock_file'}]
-    if mock_actions and (len(mock_actions)!=1 or len(actions)!=1):
-        raise ValueError('Loon V2 Mock 与 Header 管道需要合并为同一原生响应，当前不拆分执行')
+    if mock_actions and len(actions)!=1:
+        headers=[(name,args) for name,args in actions if name not in {'response.body.mock','response.body.mock_file'}]
+        if len(mock_actions)!=1 or any(name not in {'response.header.set','response.header.del'} for name,_ in headers):
+            raise ValueError('Loon V2 Mock 与 Header 管道需要合并为同一原生响应，当前不拆分执行')
+        def header_rows(args):
+            rows=[list(args)]
+            if args and isinstance(args[0],list):
+                if not all(isinstance(value,list) and value for value in args) or len({len(value) for value in args})!=1:
+                    raise ValueError('Loon V2 批量参数需要等长非空数组，不能与单值混用')
+                rows=[list(values) for values in zip(*args)]
+            return rows
+        mock_name,mock_args=next((name,args) for name,args in actions if name in {'response.body.mock','response.body.mock_file'})
+        compiled=rewrite_action(phase,pattern,mock_name,list(mock_args),defaults,loader)
+        if len(compiled)!=1 or compiled[0][0]!='rewrites':
+            raise ValueError('Loon V2 Mock 无法生成单一原生响应')
+        respond=compiled[0][1]['actions'][0]['respond']
+        merged=dict(respond.get('headers') or {})
+
+        def set_header(key,value):
+            # Header 名大小写不敏感；同一字段以管道中最后一次赋值为准。
+            for existing in [name for name in merged if name.casefold()==key.casefold()]:
+                del merged[existing]
+            merged[key]=value
+
+        def delete_header(key):
+            for existing in [name for name in merged if name.casefold()==key.casefold()]:
+                del merged[existing]
+
+        # 按源顺序应用 Header 动作；所有动作仍只落在这个 respond 上。
+        for name,values in headers:
+            for row in header_rows(values):
+                compiled_header=rewrite_action(phase,pattern,name,row,defaults,loader)
+                field,entry=compiled_header[0]
+                if name=='response.header.set':
+                    if field!='rewrites':raise ValueError('Loon V2 Header Set 无法合并到原生响应')
+                    key,value=next(iter(entry['actions'][0]['response_headers']['set'].items()))
+                    set_header(key,value)
+                else:
+                    if field!='header_rewrites':raise ValueError('Loon V2 Header Del 无法合并到原生响应')
+                    delete_header(entry['delete']['name'])
+        respond=dict(respond,headers=merged)
+        return [('rewrites',{'match':pattern,'actions':[{'respond':respond}]})]
     if any(name in {'url.replace','redirect'} for name,_ in actions) and len(actions)!=1:
         raise ValueError('Loon V2 URL 修改管道需要保留修改后的条件与动作顺序，当前不拆分执行')
     for name,args in actions:
