@@ -85,3 +85,23 @@ class NativeForwardingTests(unittest.TestCase):
         ]:
             with self.subTest(source=source), self.assertRaises(ConversionError):
                 convert_script(source, 'Test', URL, '', source_format='loon')
+
+    def test_conditional_http_runner_keeps_the_generated_bare_return(self):
+        # `return runner(...)` 在条件接收者改写后形成 `$httpClient.get(...);return;`；
+        # 这个无值 return 只是保持原立即返回顺序，不应被当作完成调用后的并发语句。
+        source = '''function request(method, options, callback){
+          method = method.toUpperCase();
+          const runner = method == "GET" ? $httpClient.get : $httpClient.post;
+          return runner(options, (error, response, body) => {
+            if (error == null || error == "") { response.body = body; callback("", body, response); }
+            else { callback(error, "", response); }
+          });
+        }
+        const done = (value = {}) => $done(value);
+        request("get", {url:"https://api.test/"}, (e, b, r) => done({body:b}));'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        case = {'name': 'conditional runner', 'request': {'url': URL},
+                'http': [{'url': 'https://api.test/', 'body': 'ok'}],
+                'expected': {'result': {'body': 'ok'}}}
+        result = compare(source, output, 'loon', URL, case)
+        self.assertEqual(result['status'], 'passed', result)

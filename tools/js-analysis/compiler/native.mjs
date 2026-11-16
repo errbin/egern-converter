@@ -1520,7 +1520,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   for(let p=parents.get(child);p;child=p,p=parents.get(p)){
    if(['Program','BlockStatement'].includes(p.type)){
     const rest=p.body.slice(p.body.indexOf(child)+1);
-    if(rest.some(s=>!['FunctionDeclaration','EmptyStatement'].includes(s.type)))return false;
+    // 终止调用后只允许无值 return：它可能由条件接收者分支改写生成，
+    // 用于保持作者原 `return runner(...)` 的立即返回顺序。
+    if(rest.some(s=>!['FunctionDeclaration','EmptyStatement'].includes(s.type)&&!(s.type==='ReturnStatement'&&!s.argument)))return false;
    }
    if(p===owners.get(statement))break;
   }
