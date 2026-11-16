@@ -822,7 +822,21 @@ export function structuredFlow({source,tree,ix,context,fresh,api,payload,isDone,
   if(n.type==='Identifier'){
    const actual=environmentValue(n,environment);
    if(actual)return promiseValue(actual.node,state,actual.environment);
-   const previous=priorValue(n,state);return !!previous&&promiseValue(previous.node,previous.seen,environment);
+   const previous=priorValue(n,state);if(previous)return promiseValue(previous.node,previous.seen,environment);
+   // 循环内按 `chain = chain.then(...)` 推进的链：只要初始值已证明是
+   // Promise，且每次写回仍以同一绑定为接收者，归纳可得每次写回仍是
+   // Promise。其它来源的写回仍交给常规证明拒绝。
+   const binding=bindings.get(n);
+   if(binding?.init){
+    const selfChained=value=>{
+     let base=value;
+     while(base?.type==='CallExpression'&&base.callee.type==='MemberExpression'&&['then','catch','finally'].includes(property(base.callee)))base=base.callee.object;
+     return base?.type==='Identifier'&&bindings.get(base)===binding;
+    };
+    if(binding.writes.every(write=>write.type==='AssignmentExpression'&&write.operator==='='&&write.left.type==='Identifier'&&bindings.get(write.left)===binding&&selfChained(write.right))
+      &&promiseValue(binding.init,state,environment))return true;
+   }
+   return false;
   }
   if(n.type==='AssignmentExpression'&&n.operator==='=')return promiseValue(n.right,state,environment);
   if(n.type==='SequenceExpression')return promiseValue(n.expressions.at(-1),state,environment);

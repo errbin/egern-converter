@@ -192,3 +192,16 @@ class PromiseHTTPTests(unittest.TestCase):
         for cellular,wifi in [({'carrier':'synthetic','radio':'NR'},{'ssid':'Synthetic','bssid':'00:00:00:00:00:00'}),({'carrier':None,'radio':None},{'ssid':None,'bssid':None})]:
             case={'name':'device network','request':{'url':'https://example.test/'},'device':{'cellular':cellular,'wifi':wifi,'ipv4':{'address':'192.0.2.1','gateway':'192.0.2.254','interface':'en0'},'ipv6':{'address':'2001:db8::1','interface':'en0'},'dnsServers':['192.0.2.53']}}
             self.assertEqual(compare(source,output,'surge','https://example.test/a.js',case)['status'],'passed')
+
+    def test_self_chained_promise_receiver_is_proven_from_its_initial_value(self):
+        # 循环内 `chain = chain.then(...)` 是归纳推进；只要初始值已证明是
+        # Promise，且每次写回仍以同一绑定为接收者，后续接收者契约成立。
+        source=("let value='';let chain=Promise.resolve();"
+                "for(let i=0;i<3;i++)chain=chain.then(()=>{value+=String(i);});"
+                "chain.then(()=>$done({body:value}));")
+        output=convert_script(source,'Fixture','https://example.test/self-chain.js','',source_format='surge')
+        case={'name':'self chained promise','event_loop':True,
+              'request':{'url':'https://example.test/self-chain.js'},
+              'expected':{'result':{'body':'012'}}}
+        result=compare(source,output,'surge','https://example.test/self-chain.js',case)
+        self.assertEqual(result['status'],'passed',result)
