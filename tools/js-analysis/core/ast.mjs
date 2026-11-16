@@ -247,9 +247,12 @@ export function initializedAfter(ix,statement,ref){
 // 且声明支配调用点的本地异步函数；完成回调必须是内联函数或同样闭合的命名
 // 函数。条件/循环/异常边界、绑定写入、回调别名逃逸，以及根之后出现无法证明
 // 的普通语句，都会否决整条链。后续如果还有完成根，也必须是同样可证的根。
-export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set()){
+export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set(),assumed=new Set()){
  const {parents,bindings,free}=ix;
  const methods=new Set(['then','catch','finally']);
+ // 条件两支各自启动一条完成链时，两支互为对方的“另一条完成路径”。只在
+ // 外层正在证明的根集合内接受这一互相引用，不把任意链当成已完成。
+ if(assumed.has(call))return true;
  if(call?.type!=='CallExpression'||seen.has(call))return false;
  const statement=parents.get(call);
  if(statement?.type!=='ExpressionStatement'||statement.expression!==call)return false;
@@ -360,18 +363,25 @@ export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set()){
  // 显式 return/throw/break/continue，或可能走另一路径的条件/循环/异常结构。
  const normalFallthrough=node=>['ExpressionStatement','VariableDeclaration','FunctionDeclaration','ClassDeclaration','EmptyStatement','DebuggerStatement'].includes(node.type);
  // 另一分支必须存在可达完成点；沿块顺序扫描，完成点之前的控制转移一律否决。
- const completesStatement=node=>{
+ const completesStatement=(node,branchAssumed=assumed)=>{
   if(!node)return false;
   if(node.type==='BlockStatement'){
    for(const statement of node.body){
-    if(completesStatement(statement))return true;
+    if(completesStatement(statement,branchAssumed))return true;
     if(!normalFallthrough(statement))return false;
    }
    return false;
   }
-  if(node.type==='ExpressionStatement')return completesExpression(node.expression);
-  if(node.type==='IfStatement')return !!node.alternate&&completesStatement(node.consequent)&&completesStatement(node.alternate);
+  if(node.type==='ExpressionStatement')return completesExpression(node.expression)||branchRoot(node,branchAssumed);
+  if(node.type==='IfStatement')return !!node.alternate&&completesStatement(node.consequent,branchAssumed)&&completesStatement(node.alternate,branchAssumed);
   return false;
+ };
+ // 另一分支是独立的 Promise 完成根时，它同样在启动后异步完成；把当前根
+ // 加入假设集合即可让两条条件分支互相闭合。
+ const branchRoot=(node,branchAssumed=assumed)=>{
+  if(node?.type!=='ExpressionStatement'||node.expression.type!=='CallExpression')return false;
+  const nextAssumed=new Set(branchAssumed);nextAssumed.add(call);
+  return closedAsyncCompletionRoot(ix,node.expression,completes,seen,nextAssumed);
  };
  const closedLocalIIFE=node=>{
   if(node?.type!=='CallExpression'||node.optional||!['FunctionExpression','ArrowFunctionExpression'].includes(node.callee.type))return false;
@@ -402,7 +412,8 @@ export function closedAsyncCompletionRoot(ix,call,completes,seen=new Set()){
   if(parent.type==='Program'||functions.has(parent.type))break;
   if(parent.type==='IfStatement'){
    const other=parent.consequent===child?parent.alternate:parent.alternate===child?parent.consequent:null;
-   if(!other||!completesStatement(other)||completesExpression(parent.test))return false;
+   const nextAssumed=new Set(assumed);nextAssumed.add(call);
+   if(!other||!(completesStatement(other,nextAssumed)||branchRoot(other))||completesExpression(parent.test))return false;
    continue;
   }
   if(['ConditionalExpression','LogicalExpression','SwitchStatement','SwitchCase','ForStatement','ForInStatement','ForOfStatement','WhileStatement','DoWhileStatement','TryStatement','CatchClause'].includes(parent.type))return false;

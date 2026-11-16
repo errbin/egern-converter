@@ -114,6 +114,30 @@ class AsyncDominanceTests(unittest.TestCase):
         )
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_conditional_completion_roots_can_cross_reference_each_other(self):
+        # 两支各自启动 Promise 完成链时，另一支就是它自己的完成路径；这只是
+        # 条件根内部的互证，不能放宽到任意后续语句。
+        source = (
+            "let log='';"
+            "if($request.url.includes('/left')){"
+            "(async()=>{await Promise.resolve();log+='L';$done({body:log})})()"
+            ".catch(()=>{}).finally(()=>$done({body:log+'F'}));"
+            "}else{"
+            "Promise.resolve().then(()=>{log+='R';$done({body:log})})"
+            ".catch(()=>{}).finally(()=>$done({body:log+'F'}));"
+            "}"
+            "Promise.resolve().then(()=>{log+='T';$done({body:log})}).catch(()=>{});"
+        )
+        output = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        self.assertNotIn('$done', output)
+        for suffix, body in [('left', 'L'), ('right', 'R')]:
+            case = {'name': suffix, 'event_loop': True,
+                    'request': {'url': URL + '/' + suffix},
+                    'expected': {'result': {'body': body}}}
+            with self.subTest(suffix=suffix):
+                result = compare(source, output, 'surge', URL, case)
+                self.assertEqual(result['status'], 'passed', result)
+
     def test_conditional_root_requires_both_branches_to_reach_completion(self):
         source = ("function finishB(){$done({body:'b'})}"
                   "const flag=$request.url.endsWith('/a');"
