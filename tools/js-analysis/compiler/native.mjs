@@ -4244,7 +4244,13 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(use?.type==='MemberExpression'&&use.object===headerMember){
    if(use.computed&&use.property?.type!=='Literal')return false;
    const method=property(use),call=parents.get(use);
-   return method!==undefined&&responseHeaderReads.has(String(method))&&call?.type==='CallExpression'&&call.callee===use&&!call.optional;
+  if(method===undefined)return false;
+  // 固定名字的头部读取只是普通字符串观察；头部对象本身没有逃逸。
+  if(!(call?.type==='CallExpression'&&call.callee===use)){
+   return !(call?.type==='AssignmentExpression'&&call.left===use||call?.type==='UpdateExpression'||
+    call?.type==='UnaryExpression'&&call.operator==='delete');
+  }
+  return responseHeaderReads.has(String(method))&&!call.optional;
   }
   if(use?.type==='CallExpression'&&use.arguments.includes(headerMember)){
    const callee=use.callee;
@@ -4253,7 +4259,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   }
   return false;
  }
- function responsePassParameter(fn,parameter,seen=new Set()){
+ function responsePassParameter(fn,parameter,seen=new Set(),fields=null){
   if(!functions.has(fn?.type)||fn.generator)return false;
   const binding=bindings.get(parameter);
   if(!binding||binding.writes.length||seen.has(binding))return false;
@@ -4267,6 +4273,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(parent?.type==='MemberExpression'&&parent.object===current){
     const name=property(parent);
     if(name===undefined||!responsePassFields.has(String(name)))return false;
+    fields?.add(String(name));
     const use=parents.get(parent);
     if(use?.type==='AssignmentExpression'&&use.left===parent||use?.type==='UpdateExpression'||
        use?.type==='UnaryExpression'&&use.operator==='delete'||use?.type==='CallExpression'&&use.callee===parent)return false;
@@ -4280,47 +4287,62 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     continue;
    }
    if(parent?.type==='CallExpression'&&parent.arguments.includes(current)){
-    const next=replyTarget(parent.callee),nextParameter=next?.params[parent.arguments.indexOf(current)];
+    const next=replyTarget(parent.callee)??(parent.callee.type==='MemberExpression'?target(parent.callee):null),position=parent.arguments.indexOf(current),nextParameter=next?.params[position]??(next?.params.length===1&&next.params[0].type==='RestElement'?next.params[0]:null);
     const id=nextParameter?.type==='AssignmentPattern'?nextParameter.left:nextParameter;
-    if(!next||id?.type!=='Identifier'||!responsePassParameter(next,id,seen))return false;
+    if(next&&nextParameter?.type==='RestElement'&&nextParameter.argument?.type==='Identifier'&&closedConsoleForwarder(next,nextParameter.argument))continue;
+    if(!next||id?.type!=='Identifier'||!responsePassParameter(next,id,seen,fields))return false;
     continue;
    }
    return false;
   }
   return true;
  }
+ // 已物化的响应快照可以交给只逐项转交 console 的本地 logger。这里不接受
+ // 任意 rest 函数：函数体必须只有一次 for-in 遍历，元素仅作为 console 方法
+ // 的实参，且该函数绑定不可重绑。
+ function closedConsoleForwarder(fn,parameter){
+  if(!functions.has(fn.type)||fn.async||fn.generator||fn.params.length!==1)return false;
+  const parent=parents.get(fn),id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),binding=id?.type==='Identifier'?bindings.get(id):null;
+  if(!binding||binding.writes.length)return false;
+  const value=bindings.get(parameter);if(!value||value.writes.length||value.refs.length!==2)return false;
+  if(fn.body.type!=='BlockStatement'||fn.body.body.length!==1)return false;
+  const loop=fn.body.body[0];
+  if(loop.type!=='ForInStatement'||loop.right.type!=='Identifier'||bindings.get(loop.right)!==value)return false;
+  if(loop.left.type!=='VariableDeclaration'||loop.left.declarations.length!==1)return false;
+  const index=loop.left.declarations[0].id;
+  if(index?.type!=='Identifier'||!bindings.get(index))return false;
+  const statement=loop.body.type==='BlockStatement'?(loop.body.body.length===1?loop.body.body[0]:null):loop.body;
+  if(statement?.type!=='ExpressionStatement')return false;
+  const call=statement.expression;
+  if(call.type!=='CallExpression'||call.callee.type!=='MemberExpression'||!free(call.callee.object,'console')||
+     !['log','warn','error','info','debug'].includes(property(call.callee)))return false;
+  return value.refs.every(ref=>ref.start>=loop.start&&ref.end<=loop.end);
+ }
  // 整体响应交给闭合回调形参时，沿每个调用点递归确认实际回调函数；实际函数
  // 只能读取稳定响应字段或继续把响应交给已闭合 helper，null/缺失响应按错误
  // 路径处理。任何逃逸、改绑或未知字段都会否决该调用参数。
- function closedResponseCallbackValue(n,responseIndex,seen=new Set()){
+ function closedResponseCallbackValue(n,responseIndex,seen=new Set(),fields=null){
   if(!Number.isInteger(responseIndex)||responseIndex<0)return false;
   if(n?.type==='Literal'&&n.value===null||free(n,'undefined')||n?.type==='UnaryExpression'&&n.operator==='void')return true;
   if(functions.has(n?.type)){
    const parameter=n.params[responseIndex],id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
-   return id?.type==='Identifier'&&responsePassParameter(n,id,new Set());
+   return id?.type==='Identifier'&&responsePassParameter(n,id,new Set(),fields);
   }
   if(n?.type!=='Identifier')return false;
   const binding=bindings.get(n);
   if(!binding||seen.has(binding)||binding.writes.length)return false;
   const next=new Set(seen);next.add(binding);
-  if(binding.fn)return closedResponseCallbackValue(binding.fn,responseIndex,next);
-  if(binding.init)return closedResponseCallbackValue(binding.init,responseIndex,next);
+  if(binding.fn)return closedResponseCallbackValue(binding.fn,responseIndex,next,fields);
+  if(binding.init)return closedResponseCallbackValue(binding.init,responseIndex,next,fields);
   const entries=parameterFunctions.get(binding);
   if(!entries||entries.length!==1)return false;
-  const {fn,position}=entries[0],parent=parents.get(fn),parameter=fn.params[position];
-  const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fb=id?.type==='Identifier'?bindings.get(id):null;
-  let calls;
-  if(parent?.type==='MethodDefinition'){calls=closedMethodCalls(parent);if(!calls)return false;}
-  else{
-   if(!fb||fb.writes.length)return false;
-   calls=fb.refs.map(ref=>parents.get(ref));
-   if(calls.some((call,i)=>call?.type!=='CallExpression'||call.optional||call.callee!==fb.refs[i]||call.arguments.some(a=>a.type==='SpreadElement')))return false;
-  }
+  const {fn,position}=entries[0],calls=replyCallers(fn);
   if(!calls?.length)return false;
   return calls.every(call=>{
+   if(call.optional||call.arguments.some(a=>a.type==='SpreadElement'))return false;
    if(call.arguments.length<=position)return true;
    const actual=call.arguments[position];
-   return closedResponseCallbackValue(actual,responseIndex,next);
+   return closedResponseCallbackValue(actual,responseIndex,next,fields);
   });
  }
  function reply(binding,fn=null,allowSnapshot=false){
@@ -4331,7 +4353,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     httpReplies.set(binding,info);return info;
    }
   }
-  const refs=binding?.refs??[],uses=new Set(),callbackCalls=new Set();for(const ref of refs){const p=parents.get(ref);
+  const refs=binding?.refs??[],uses=new Set(),deleted=new Set(),callbackCalls=new Set();for(const ref of refs){const p=parents.get(ref);
    if(p?.type==='VariableDeclarator'&&p.init===ref&&p.id.type==='ObjectPattern'){
     for(const entry of p.id.properties){const name=entry.type==='Property'?key(entry):null;if(!['body','bodyBytes','status','statusCode','headers'].includes(name))fail(entry,'未知 HTTP 响应解构字段');uses.add(name);}continue;
    }
@@ -4339,11 +4361,14 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    if(p?.type==='CallExpression'&&p.arguments.includes(ref)){
     const position=p.arguments.indexOf(ref),targetFn=replyTarget(p.callee),parameter=targetFn?.params[position];
     const id=parameter?.type==='AssignmentPattern'?parameter.left:parameter;
-    if(targetFn&&id?.type==='Identifier'&&responsePassParameter(targetFn,id,new Set([binding])))continue;
-    if(closedResponseCallbackValue(p.callee,position,new Set([binding]))){callbackCalls.add(p);continue;}
+    if(targetFn&&id?.type==='Identifier'&&responsePassParameter(targetFn,id,new Set([binding]),uses))continue;
+    if(closedResponseCallbackValue(p.callee,position,new Set([binding]),uses)){callbackCalls.add(p);continue;}
    }
-   if(p?.type!=='MemberExpression'||p.object!==ref)fail(ref,'HTTP 响应整体传递无法静态转换');const k=property(p);if(!['body','bodyBytes','status','statusCode','headers'].includes(k))fail(p,'未知 HTTP 响应字段');uses.add(k);}
-  const info={uses,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn,callbackForward:callbackCalls.size>0,replyCalls:callbackCalls};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
+   if(p?.type!=='MemberExpression'||p.object!==ref)fail(ref,'HTTP 响应整体传递无法静态转换');const k=property(p),use=parents.get(p);if(!['body','bodyBytes','status','statusCode','headers'].includes(k))fail(p,'未知 HTTP 响应字段');
+   if(use?.type==='UnaryExpression'&&use.operator==='delete'&&use.argument===p){if(!['status','statusCode'].includes(k))fail(p,'响应字段删除无法证明为本地快照投影');deleted.add(k);continue;}
+   uses.add(k);}
+  for(const name of deleted)uses.delete(name);
+  const info={uses,deleted,body:uses.has('body')?fresh('responseText'):null,bytes:uses.has('bodyBytes')?fresh('responseBytes'):null,fn,callbackForward:callbackCalls.size>0,replyCalls:callbackCalls};if(binding)httpReplies.set(binding,info);if(fn&&(info.body||info.bytes))asyncFns.add(fn);return info;
  }
  function replyPrelude(info,name){const out=[];if(info.bytes)out.push(`const ${info.bytes} = await ${name}.arrayBuffer();`);if(info.body)out.push(`const ${info.body} = ${info.bytes?`new TextDecoder().decode(${info.bytes})`:`await ${name}.text()`};`);return out.join('\n');}
  // Promise 执行器把宿主响应整体交给 resolver 时，响应对象会穿过局部工厂和
@@ -4513,7 +4538,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const info={uses:fields,body:fields.has('body')?fresh('responseText'):null,bytes:fields.has('bodyBytes')||fields.has('body')?fresh('responseBytes'):null,snapshot:true,promiseForward:true,fn};
   httpReplies.set(binding,info);if(info.body||info.bytes)asyncFns.add(fn);return info;
  }
- function forwardedHeaders(raw){return `Object.fromEntries(Object.entries(${raw}.headers))`;}
+ function forwardedHeaders(raw){const entries=`Object.entries(${raw}.headers)`;return format==='qx'
+  ? `Object.fromEntries(${entries}.map(([field, value]) => [String(field).toLowerCase(), value]))`
+  : `Object.fromEntries(${entries})`;}
  function forwardedSnapshot(info,raw){
   const out=[];
   for(const name of ['status','statusCode','headers','body','bodyBytes','ok','statusText'])if(info.uses.has(name)){
@@ -4619,6 +4646,10 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   if(n.type==='AssignmentExpression'&&n.operator==='='&&n.left.type==='MemberExpression'&&n.left.object.type==='Identifier'){
    const info=httpReplies.get(bindings.get(n.left.object)),name=property(n.left);
    if(info?.promiseForward&&['body','bodyBytes'].includes(String(name))&&sameReplyMember(n.right,n.left))return name==='bodyBytes'?info.bytes:info.body;
+  }
+  if(n.type==='UnaryExpression'&&n.operator==='delete'&&n.argument.type==='MemberExpression'&&n.argument.object.type==='Identifier'){
+   const info=httpReplies.get(bindings.get(n.argument.object)),name=property(n.argument);
+   if(info?.deleted?.has(name))return 'true';
   }
   if(n.type==='AssignmentExpression'&&n.operator==='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+n.left.name+' = ('+render(n.right)+'), '+guardedImplicit.get(n.left.name)+' = true, '+n.left.name+')';
   if(n.type==='AssignmentExpression'&&n.operator!=='='&&free(n.left)&&guardedImplicit.has(n.left.name))return '('+guardedImplicit.get(n.left.name)+' ? ('+n.left.name+' '+n.operator+' ('+render(n.right)+')) : (() => {throw new '+(referenceError??'ReferenceError')+'('+JSON.stringify(n.left.name+' is not defined')+');})())';

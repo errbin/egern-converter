@@ -95,6 +95,23 @@ function Request(options,method){return new Promise((resolve,reject)=>{((selecte
         result = compare(source, output, 'qx', URL, fixture)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_qx_whole_response_reaches_callback_of_closed_object_method(self):
+        source = '''const api=(()=>{
+const send=(req,cb)=>{$task.fetch(req).then(r=>{r.status=r.statusCode;delete r.statusCode;cb("",r.body,r);},e=>cb(e.error||e,"",null));};
+return {send};})();
+const log=(...n)=>{for(let i in n)console.log(n[i])};
+function get(req){return new Promise((resolve,reject)=>{api.send(req,(err,body,resp)=>{if(err)return reject(err);log("response",resp);resolve({status:resp.status,location:resp.headers?.location,body:body||''})})})}
+(async()=>{const r=await get({url:'https://api.test/'});$done({body:r.status+':'+r.location+':'+r.body})})();'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='qx')
+        self.assertNotIn('$task', output)
+        fixture = {'name': 'qx object method callback', 'request': {'url': URL},
+                   'http': [{'url': 'https://api.test/', 'status': 303,
+                             'headers': {'Location': '/mission/daily?fr=redeem'}, 'body': 'ok'}],
+                   'expected': {'result': {'body': '303:/mission/daily?fr=redeem:ok'}}}
+        result = compare(source, output, 'qx', URL, fixture)
+        self.assertEqual(result['status'], 'passed', result)
+        self.assertIn('headers:', output)
+
     def test_qx_structured_callback_rejects_unknown_escape_and_wrong_alias(self):
         template = ("function send(req,cb){$task.fetch(req).then("
                     "r=>{__ALIAS__;cb(null,r,r.body);},"
