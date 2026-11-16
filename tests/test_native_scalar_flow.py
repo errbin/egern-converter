@@ -27,6 +27,22 @@ class NativeScalarFlowTests(unittest.TestCase):
             {'title':'t','subtitle':'','body':'','action':{'type':'openUrl','url':''}},
             {'title':'t','subtitle':'','body':'','action':{'type':'openUrl','url':'https://a.test'}}]}}})
 
+    def test_qx_local_notification_link_rebinds_project_fixed_fields_at_runtime(self):
+        source='''const isQuanX=typeof $task!=="undefined";
+function alert(title,body="",subtitle="",options={}){let link=null;switch(typeof options){
+case "string":link=isQuanX?{"open-url":options}:options;break;
+case "object":if(JSON.stringify(options)!=="{}"){link=isQuanX?options:options["open-url"];break}
+default:link=isQuanX?{}:""}
+if(isQuanX)return $notify(title,subtitle,body,link)}
+alert("t1","b1","s1","https://a.test");alert("t2","b2","s2",{"open-url":"https://b.test"});alert("t3","b3","s3");$done({});'''
+        output=convert_script(source,'Fixture',URL,'',source_format='qx')
+        fixture={'name':'QX local notification link','request':{'url':URL},'expected':{'events':{'notifications':[
+            {'title':'t1','subtitle':'s1','body':'b1','action':{'type':'openUrl','url':'https://a.test'}},
+            {'title':'t2','subtitle':'s2','body':'b2','action':{'type':'openUrl','url':'https://b.test'}},
+            {'title':'t3','subtitle':'s3','body':'b3'}]}}}
+        result=compare(source,output,'qx',URL,fixture)
+        self.assertEqual(result['status'],'passed',result)
+
     def test_initialized_local_capture_in_later_promise_callback(self):
         self.check('function run(){const url="https://a.test";Promise.resolve().then(()=>$notification.post("t","","",url)).then(()=>$done({}));}run();')
 

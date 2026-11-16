@@ -2499,7 +2499,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const opt=resolve(a[3]);if(free(opt,'undefined')||opt?.type==='UnaryExpression'&&opt.operator==='void'&&opt.argument.type==='Literal'||opt?.type==='Literal'&&opt.value===null){}
    else if(opt?.type==='Literal'&&typeof opt.value==='string'||values.string(a[3]))out.push(`action: {type: 'openUrl', url: ${argument(3)}}`);
    else {
-    const mutable=returned??notificationFields(a[3],n)??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
+    const mutable=returned??notificationFields(a[3],n)??notificationLocalValue(a[3],n)??(scalarNotificationOption(a[3])?{fields:new Map(),optional:new Set(),nullable:true,stringUrl:true}:null);
     if(mutable?.stringUrl)out.push(`...(typeof ${argument(3)} === 'string' ? {action: {type: 'openUrl', url: ${argument(3)}}} : {})`);
     const f=mutable?.fields??object(a[3],'通知参数'),allowed=NOTIFICATION_OPTION_FIELDS;
     const value=k=>captured?`${argument(3)}${mutable?.nullable?'?.':''}[${JSON.stringify(k)}]`:render(f.get(k));
@@ -2696,6 +2696,54 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   for(const member of writes){const k=property(member);if(k==='__proto__')return null;if(!fields.has(k))optional.add(k);fields.set(k,parents.get(member).right);}
   if([...fields.keys()].some(k=>!NOTIFICATION_OPTION_FIELDS.includes(k)))return null;
   return {fields,optional};
+ }
+ // QX 平台折叠会把多平台通知链接收窄为本地重绑：初值为 null，随后只在
+ // 通知调用前写入字符串或固定字段对象。这里证明值域只包含字符串和已适配
+ // 的对象，且绑定没有别名、成员改写或调用后写入；运行时仍按固定字段投影。
+ function notificationSourceValue(n,seen=new Set()){
+  if(!n)return false;
+  if(free(n,'undefined')||n.type==='Literal'&&(n.value===null||typeof n.value==='string')||
+     n.type==='TemplateLiteral'||n.type==='UnaryExpression'&&n.operator==='void')return true;
+  if(n.type==='SequenceExpression')return notificationSourceValue(n.expressions.at(-1),seen);
+  if(n.type==='ConditionalExpression')return notificationSourceValue(n.consequent,seen)&&notificationSourceValue(n.alternate,seen);
+  if(n.type==='ObjectExpression')return n.properties.every(entry=>
+   entry.type==='Property'&&entry.kind==='init'&&!entry.method&&!entry.computed&&key(entry)!==undefined&&
+   key(entry)!=='__proto__'&&NOTIFICATION_OPTION_FIELDS.includes(key(entry)));
+  if(n.type!=='Identifier')return false;
+  const binding=bindings.get(n);
+  if(!binding||seen.has(binding))return false;
+  seen=new Set(seen);seen.add(binding);
+  const entries=parameterFunctions.get(binding);
+  if(entries?.length)return entries.every(({fn,position})=>{
+   const calls=replyCallers(fn);
+   if(!calls?.length)return false;
+   return calls.every(call=>{
+    if(call.optional||call.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+    let actual=call.arguments[position],parameter=fn.params[position];
+    if((!actual||free(actual,'undefined'))&&parameter.type==='AssignmentPattern')actual=parameter.right;
+    return notificationSourceValue(actual,seen);
+   });
+  });
+  return !binding.writes.length&&binding.init?notificationSourceValue(binding.init,seen):false;
+ }
+ function notificationLocalValue(ref,call){
+  if(ref.type!=='Identifier')return null;
+  const binding=bindings.get(ref);
+  if(!binding||!binding.writes.length||!notificationSourceValue(binding.init))return null;
+  if(nodes.filter(n=>n.type==='VariableDeclarator'&&bindings.get(n.id)===binding).length!==1)return null;
+  const written=new Set();
+  for(const write of binding.writes){
+   if(write.type!=='AssignmentExpression'||write.operator!=='='||write.left.type!=='Identifier'||
+      bindings.get(write.left)!==binding||write.start>=call.start||!notificationSourceValue(write.right))return null;
+   written.add(write.left);
+  }
+  for(const use of binding.refs){
+   if(written.has(use))continue;
+   const parent=parents.get(use);
+   if(parent===call&&parent.type==='CallExpression'&&parent.arguments[3]===use)continue;
+   return null;
+  }
+  return {fields:new Map(),optional:new Set(),nullable:true,stringUrl:true,returnedRecord:true};
  }
  function http(input,method,qx){
   // `{url: op, ...op}` 只把同一个闭合请求记录重新展开一次。展开值会覆盖
