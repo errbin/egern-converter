@@ -5195,6 +5195,70 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
    const calls=nodes.filter(call=>call.type==='CallExpression'&&!call.optional&&target(call.callee)===owner);
    return calls.length>0&&calls.every(call=>{const argument=call.arguments[position];return argument?.type==='Identifier'&&free(argument,'$response');});
   };
+  // helper 直接返回宿主响应参数时，调用结果就是本地快照本身。返回值不能再
+  // 逃逸到未知代码，成员读取也只能落在固定字段上；给完成投影或继续传给
+  // 闭合 helper 时才允许沿身份链继续证明。
+  const returnsSnapshotParameter=(fn,binding)=>{
+   if(!functions.has(fn?.type)||!binding)return false;
+   return binding.refs.some(ref=>{
+    let value=ref;
+    for(;;){
+     const parent=parents.get(value);
+     if(parent?.type==='AwaitExpression'&&parent.argument===value||parent?.type==='ChainExpression'&&parent.expression===value){value=parent;continue;}
+     if(parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===value){value=parent;continue;}
+     break;
+    }
+    const parent=parents.get(value);
+    return parent?.type==='ReturnStatement'&&parent.argument===value||
+     parent?.type==='ArrowFunctionExpression'&&parent.body===value;
+   });
+  };
+  const returnedSnapshotUseClosed=(value,seen=new Set())=>{
+   if(!value||seen.has(value))return false;
+   seen=new Set(seen);seen.add(value);
+   let node=value,parent=parents.get(node);
+   for(;;){
+    if(parent?.type==='AwaitExpression'&&parent.argument===node||parent?.type==='ChainExpression'&&parent.expression===node){node=parent;parent=parents.get(node);continue;}
+    if(parent?.type==='SequenceExpression'&&parent.expressions.at(-1)===node&&node!==value){node=parent;parent=parents.get(node);continue;}
+    break;
+   }
+   const bindingUseClosed=binding=>{
+    if(!binding||binding.writes.length)return false;
+    return binding.refs.every(ref=>returnedSnapshotUseClosed(ref,seen));
+   };
+   if(!parent)return true;
+   if(parent.type==='ExpressionStatement'&&parent.expression===node)return true;
+   if(parent.type==='UnaryExpression'&&['!','typeof','void'].includes(parent.operator))return true;
+   if(parent.type==='BinaryExpression'&&['==','!=','===','!=='].includes(parent.operator)&&
+      (parent.left===node?parent.right:parent.left)?.type==='Literal')return true;
+   if(parent.type==='LogicalExpression'&&(parent.left===node||parent.right===node))return true;
+   if(['IfStatement','ConditionalExpression','WhileStatement','DoWhileStatement'].includes(parent.type)&&parent.test===node)return true;
+   if(parent.type==='VariableDeclarator'&&parent.init===node&&parent.id.type==='Identifier')return bindingUseClosed(bindings.get(parent.id));
+   if(parent.type==='AssignmentExpression'&&parent.operator==='='&&parent.right===node&&parent.left.type==='Identifier')return bindingUseClosed(bindings.get(parent.left));
+   if(parent.type==='CallExpression'&&parent.arguments.includes(node)){
+    if(parent.optional||parent.arguments.filter(argument=>argument===node).length!==1||parent.arguments.some(argument=>argument.type==='SpreadElement'))return false;
+    // 整体完成会在 payload 边界按完成字段重新投影，不再暴露快照身份。
+    if(isDone(parent)||target(parent.callee)&&complete.has(target(parent.callee)))return true;
+    const fn=functions.has(parent.callee.type)?parent.callee:target(parent.callee),parameter=fn?.params[parent.arguments.indexOf(node)];
+    if(!functions.has(fn?.type)||!parameter)return false;
+    const binding=bindings.get(parameter.type==='AssignmentPattern'?parameter.left:parameter);
+    if(!inlineHostSnapshotProof(binding,responseSnapshotFields,{allowDone:true,allowDynamicHeaders:true}))return false;
+    return returnsSnapshotParameter(fn,binding)?returnedSnapshotUseClosed(parent,seen):true;
+   }
+   if(parent.type==='MemberExpression'&&parent.object===node){
+    const field=property(parent);
+    if(field===undefined||!responseSnapshotFields.has(String(field)))return false;
+    const outer=parents.get(parent);
+    if(outer?.type==='MemberExpression'&&outer.object===parent){
+     if(String(field)!=='headers'||property(outer)===undefined)return false;
+     const use=parents.get(outer);
+     if(use?.type==='CallExpression'&&use.callee===outer)return false;
+     if(use?.type==='AssignmentExpression'&&use.left===outer&&use.operator!=='=')return false;
+    }else if(outer?.type==='CallExpression'&&outer.callee===parent)return false;
+    return true;
+   }
+   return false;
+  };
   for(const assignment of nodes.filter(node=>node.type==='AssignmentExpression'&&node.operator==='='&&node.left.type==='Identifier'&&reboundNames.has(node.left.name))){
    const awaited=assignment.right.type==='AwaitExpression'?assignment.right.argument:assignment.right;
    if(awaited.type!=='CallExpression'||awaited.arguments.some(argument=>argument.type==='SpreadElement'))return null;
@@ -5213,6 +5277,9 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   for(const ref of nodes.filter(node=>node.type==='Identifier'&&free(node,'$response')&&!expected.has(node))){
    const p=parents.get(ref);
    if(p?.type!=='CallExpression'||!p.arguments.includes(ref))continue;
+   // 整体完成由 payload 按完成字段投影；QX 的整响应契约也必须在 payload
+   // 处保留原有专用报错，不能误走本地 helper 的快照判据。
+   if(isDone(p)||target(p.callee)&&complete.has(target(p.callee)))continue;
    if(p.optional||p.arguments.filter(argument=>argument===ref).length!==1||p.arguments.some(argument=>argument.type==='SpreadElement'))fail(ref,'宿主响应整体传递的调用形态无法证明字段语义');
    const fn=functions.has(p.callee.type)?p.callee:target(p.callee),position=p.arguments.indexOf(ref),parameter=fn?.params[position];
    if(!functions.has(fn?.type)||!parameter)fail(ref,'宿主响应整体传递目标无法证明只访问固定字段');
@@ -5223,6 +5290,7 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
     if(requireSnapshot)fail(ref,'宿主响应整体传递后含未闭合字段或调用');
     return null;
    }
+   if(returnsSnapshotParameter(fn,binding)&&!returnedSnapshotUseClosed(p))fail(ref,'宿主响应 helper 返回值逃逸，无法证明只访问固定字段');
    refs.push(ref);expected.add(ref);closed.push(binding);if(onlyRawResponseCalls(binding,fn,position))snapshotOnly.add(binding);
   }
   if(!refs.length)return null;
