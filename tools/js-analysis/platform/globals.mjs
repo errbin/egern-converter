@@ -5,6 +5,7 @@ import {provablyDead,constantProbeValue,constantProbeCall,CONSTANT_UNKNOWN} from
 // Fold proven source-platform probes, preserving unknown device/version data.
 const UNKNOWN=Symbol('not statically known');
 const PRESENT_VERSION=Symbol('platform version exists; exact value unknown');
+const SURGE_BUILD=Symbol('surge build exists; exact value unknown');
 const PRESENT_GLOBALS=new Map();
 // 源平台公开的 $utils 压缩成员到 Egern ctx.compress 的静态映射。gunzip 与
 // ungzip 是同一解压语义的两种来源拼写，其余成员按官方名称一一对应。
@@ -497,10 +498,23 @@ function fold(source,format,options,qxHint){
  // 脚本常以字符串 "undefined" 作为缺失哨兵；存在性已证时，该哨兵不可能等于
  // 版本值。除此之外的任何字符串比较都必须继续保持未知，不能按名称猜测。
  function presentVersionComparison(operator,a,b){
-  if(!['===','!==','==','!='].includes(operator)||a!==PRESENT_VERSION&&b!==PRESENT_VERSION||a===PRESENT_VERSION&&b===PRESENT_VERSION)return undefined;
-  const other=a===PRESENT_VERSION?b:a;
+  const present=value=>value===PRESENT_VERSION||value===SURGE_BUILD;
+  if(!['===','!==','==','!='].includes(operator)||!present(a)&&!present(b)||present(a)&&present(b))return undefined;
+  const other=present(a)?b:a;
   if(other!=='undefined')return undefined;
   return ['===','=='].includes(operator)?false:true;
+ }
+ // 目标宿主 Egern 的 API 面属于现代版，不绑定某个 Surge build 数值。
+ // 因此只允许把“build 低于某阈值”的旧版判定折叠为 false：build 在左的
+ // <、<=，或字面量在左的 >、>=。反向的现代正向判定需要证明一个最小 build，
+ // 没有真机版本证据时保持拒绝；产物也不保留任何版本字面量。
+ function modernBuildComparison(operator,a,b){
+  const leftBuild=a===SURGE_BUILD,rightBuild=b===SURGE_BUILD;
+  if(leftBuild===rightBuild||!['<','<=','>','>='].includes(operator))return undefined;
+  const other=leftBuild?b:a;
+  if(typeof other!=='number'||!Number.isFinite(other))return undefined;
+  const below=leftBuild?operator==='<'||operator==='<=':operator==='>'||operator==='>=';
+  return below?false:undefined;
  }
  function valueExpression(root,seen){
   const stack=[{node:root,state:'start'}];let result=UNKNOWN;
@@ -530,6 +544,7 @@ function fold(source,format,options,qxHint){
     const v=frame.child;if(v===UNKNOWN){complete(UNKNOWN);continue;}
     if(v&&records.has(v)&&!['typeof','!','void'].includes(n.operator)){complete(UNKNOWN);continue;}
     if(v===PRESENT_VERSION){complete(n.operator==='!'?false:UNKNOWN);continue;}
+    if(v===SURGE_BUILD){complete(UNKNOWN);continue;}
     if(n.operator==='!'){complete(!v);continue;}if(n.operator==='typeof'){complete(typeof v);continue;}
     if(n.operator==='+'){complete(+v);continue;}if(n.operator==='-'){complete(-v);continue;}if(n.operator==='void'){complete(undefined);continue;}
     complete(UNKNOWN);continue;
@@ -538,9 +553,11 @@ function fold(source,format,options,qxHint){
     frame.left=frame.child;frame.state='binary-right';stack.push({node:n.right,state:'start'});continue;
    }
    if(frame.state==='binary-right'){
-    const a=frame.left,b=frame.child,presence=presentVersionComparison(n.operator,a,b);
+    const a=frame.left,b=frame.child,build=modernBuildComparison(n.operator,a,b);
+    if(build!==undefined){complete(build);continue;}
+    const presence=presentVersionComparison(n.operator,a,b);
     if(presence!==undefined){complete(presence);continue;}
-    if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION){complete(UNKNOWN);continue;}
+    if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION||a===SURGE_BUILD||b===SURGE_BUILD){complete(UNKNOWN);continue;}
     const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
     if(presentA||presentB){
      if(['===','!==','==','!='].includes(n.operator)){
@@ -557,12 +574,14 @@ function fold(source,format,options,qxHint){
    }
    if(frame.state==='logical-left'){
     const a=frame.child;if(a===UNKNOWN){complete(UNKNOWN);continue;}
+    if(a===SURGE_BUILD){complete(UNKNOWN);continue;}
     if(n.operator==='&&'&&!a||n.operator==='||'&&a||n.operator==='??'&&a!==null&&a!==undefined){complete(a);continue;}
     frame.state='logical-right';stack.push({node:n.right,state:'start'});continue;
    }
    if(frame.state==='logical-right'){complete(frame.child);continue;}
    if(frame.state==='conditional-test'){
     const test=frame.child;if(test===UNKNOWN){complete(UNKNOWN);continue;}
+    if(test===SURGE_BUILD){complete(UNKNOWN);continue;}
     frame.state='conditional-branch';stack.push({node:test?n.consequent:n.alternate,state:'start'});continue;
    }
    if(frame.state==='conditional-branch'){complete(frame.child);continue;}
@@ -611,6 +630,7 @@ function fold(source,format,options,qxHint){
   const environment=Object.create(null);
   environment['surge-version']=format==='surge'?PRESENT_VERSION:undefined;
   environment['stash-version']=format==='stash'?PRESENT_VERSION:undefined;
+  environment['surge-build']=format==='surge'?SURGE_BUILD:undefined;
   records.add(environment);
   return environment;
  }
@@ -628,14 +648,14 @@ function fold(source,format,options,qxHint){
     // Retain the function AST as data so a direct call can be folded below;
     // no callback, alias or escaped method reference is admitted.
     if(functions.has(p.value?.type)){out[key(p)]=p.value;continue;}
-    const v=value(p.value,new Set(seen));if(v===UNKNOWN&&!pureProbe(p.value)||v===PRESENT_VERSION||v!==null&&typeof v==='object')return UNKNOWN;out[key(p)]=v;
+    const v=value(p.value,new Set(seen));if(v===UNKNOWN&&!pureProbe(p.value)||v===PRESENT_VERSION||v===SURGE_BUILD||v!==null&&typeof v==='object')return UNKNOWN;out[key(p)]=v;
    }records.add(out);if(cacheable)staticObjectRecords.set(n,out);return out;
   }
   if(n.type==='MemberExpression'&&ix.free(n.object,'$environment')){
    const name=property(n);
    if(name==='surge-version')return format==='surge'?PRESENT_VERSION:undefined;
    if(name==='stash-version')return format==='stash'?PRESENT_VERSION:undefined;
-   if(name==='surge-build')return format==='surge'?PRESENT_VERSION:undefined;
+   if(name==='surge-build')return format==='surge'?SURGE_BUILD:undefined;
   }
   if(n.type==='MemberExpression'&&!n.computed&&ix.free(n.object,'globalThis')&&absentMembers.has(property(n))&&probeBuiltinsStable&&absentMemberProbeResult(n))return undefined;
  if(n.type==='MemberExpression'){const object=value(n.object,new Set(seen));if(object&&records.has(object)&&Object.hasOwn(object,property(n)))return object[property(n)];}
@@ -644,6 +664,7 @@ function fold(source,format,options,qxHint){
  if(n.type==='CallExpression'&&!n.optional&&n.arguments.length===1&&n.callee.type==='Identifier'&&ix.free(n.callee,'Boolean')){
   const v=value(n.arguments[0],new Set(seen));
   if(v===PRESENT_VERSION)return true;
+  if(v===SURGE_BUILD)return UNKNOWN;
   if(v!==UNKNOWN&&!records.has(v))return !!v;
  }
   if(n.type==='Identifier'){
@@ -717,13 +738,16 @@ function fold(source,format,options,qxHint){
    const v=value(n.argument,seen);if(v===UNKNOWN)return UNKNOWN;
    if(v&&records.has(v)&&!['typeof','!','void'].includes(n.operator))return UNKNOWN;
    if(v===PRESENT_VERSION)return n.operator==='!'?false:UNKNOWN;
+   if(v===SURGE_BUILD)return UNKNOWN;
    if(n.operator==='!')return !v;if(n.operator==='typeof')return typeof v;if(n.operator==='+')return +v;if(n.operator==='-')return -v;if(n.operator==='void')return undefined;
   }
   if(n.type==='BinaryExpression'){
    const membership=membershipProbe(n,seen);if(membership!==UNKNOWN)return membership;
-   const a=value(n.left,seen),b=value(n.right,seen),presence=presentVersionComparison(n.operator,a,b);
+   const a=value(n.left,seen),b=value(n.right,seen),build=modernBuildComparison(n.operator,a,b);
+   if(build!==undefined)return build;
+   const presence=presentVersionComparison(n.operator,a,b);
    if(presence!==undefined)return presence;
-   if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION)return UNKNOWN;
+   if(a===UNKNOWN||b===UNKNOWN||a===PRESENT_VERSION||b===PRESENT_VERSION||a===SURGE_BUILD||b===SURGE_BUILD)return UNKNOWN;
    const presentA=presentGlobalNames.get(a),presentB=presentGlobalNames.get(b);
    if(presentA||presentB){
     if(['===','!==','==','!='].includes(n.operator)){
@@ -895,18 +919,18 @@ function fold(source,format,options,qxHint){
    if(n.operator==='&&'&&b===false&&pureRead(n.left))return {direct:true,value:'false'};
    if(n.operator==='||'&&b===true&&pureRead(n.left))return {direct:true,value:'true'};
    if(a===PRESENT_VERSION&&n.operator==='&&')return {children:[n.right],render:child=>'('+child(n.right)+')'};
-   if(a!==UNKNOWN&&a!==PRESENT_VERSION){
+   if(a!==UNKNOWN&&a!==PRESENT_VERSION&&a!==SURGE_BUILD){
     const branch=n.operator==='&&'?a?n.right:n.left:n.operator==='||'?a?n.left:n.right:n.operator==='??'?a==null?n.right:n.left:null;
     if(branch)return {children:[branch],render:child=>'('+child(branch)+')'};
    }
   }
   if(n.type==='UnaryExpression'&&n.operator==='typeof'){const v=value(n);if(v!==UNKNOWN)return {direct:true,value:JSON.stringify(v)};}
-  if(n.type==='ConditionalExpression'){const v=value(n.test);if(v!==UNKNOWN){const branch=v?n.consequent:n.alternate;return {children:[branch],render:child=>'('+child(branch)+')'};}}
+  if(n.type==='ConditionalExpression'){const v=value(n.test);if(v!==UNKNOWN&&v!==SURGE_BUILD){const branch=v?n.consequent:n.alternate;return {children:[branch],render:child=>'('+child(branch)+')'};}}
   if(n.type==='SwitchStatement'){
    const sequence=n.discriminant.type==='SequenceExpression'?n.discriminant.expressions:[n.discriminant],v=value(sequence.at(-1));
-   if(v!==UNKNOWN&&v!==PRESENT_VERSION){
+   if(v!==UNKNOWN&&v!==PRESENT_VERSION&&v!==SURGE_BUILD){
     const cases=n.cases.map(c=>c.test?value(c.test):null);
-    if(cases.every(c=>c!==UNKNOWN&&c!==PRESENT_VERSION)){
+     if(cases.every(c=>c!==UNKNOWN&&c!==PRESENT_VERSION&&c!==SURGE_BUILD)){
      let start=n.cases.findIndex(c=>c.test&&value(c.test)===v);if(start<0)start=n.cases.findIndex(c=>!c.test);
      const selected=[];let stopped=false;
      for(const c of n.cases.slice(start<0?n.cases.length:start))for(const s of c.consequent){
@@ -950,9 +974,9 @@ function fold(source,format,options,qxHint){
    }
   }
   if(n.type==='IfStatement'){
-   if(n.test.type==='SequenceExpression'){const v=value(n.test.expressions.at(-1));if(v!==UNKNOWN&&v!==PRESENT_VERSION){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
-   if(n.test.type==='AssignmentExpression'&&n.test.operator==='='&&n.test.left.type==='Identifier'){const v=value(n.test.right);if(v!==UNKNOWN&&v!==PRESENT_VERSION){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
-   const v=value(n.test);if(v!==UNKNOWN){const branch=v?n.consequent:n.alternate;return branch?{children:[branch],render:child=>'{'+child(branch)+'}'}:{direct:true,value:'{}'};}
+   if(n.test.type==='SequenceExpression'){const v=value(n.test.expressions.at(-1));if(v!==UNKNOWN&&v!==PRESENT_VERSION&&v!==SURGE_BUILD){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
+   if(n.test.type==='AssignmentExpression'&&n.test.operator==='='&&n.test.left.type==='Identifier'){const v=value(n.test.right);if(v!==UNKNOWN&&v!==PRESENT_VERSION&&v!==SURGE_BUILD){const branch=v?n.consequent:n.alternate,children=[n.test,...(branch?[branch]:[])];return {children,render:child=>'{'+child(n.test)+';'+(branch?child(branch):'')+'}'};}}
+   const v=value(n.test);if(v!==UNKNOWN&&v!==SURGE_BUILD){const branch=v?n.consequent:n.alternate;return branch?{children:[branch],render:child=>'{'+child(branch)+'}'}:{direct:true,value:'{}'};}
   }
   return null;
  });
