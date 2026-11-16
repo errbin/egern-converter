@@ -65,7 +65,7 @@ Loon V2 的词法解析位于 `tools/egern_hub/loon_v2.py`，由现有 `convert_
 
 经典 Loon 的 `cron`、`generic`、`network-changed` 与新版声明进入同一原生脚本链，分别输出 `schedule`、`generic`、`network`；动态 Cron 字符串和启停开关保留为模块参数。V2 迁移残留的裸或花括号 `enable` 引用规范为变量引用；缺失声明先由同一脚本原作者的配套模块补全，仍缺失时仅对 `enable` 位置按“未声明即关”补充默认关闭的本站开关，并在参数描述与条目注释中明确标注。`argument=[{X}]`、`argument={X}` 等参数值位置未声明时类型不可知，仍按原路径拒绝；`cron`、`timeout` 等需要具体值的槽位也拒绝补充，重复引用继续拒绝。单一 URL 条件有唯一结束分隔符且不含复合条件时，可以规范内部未转义的 `/`，不改变匹配语义。每次规范记录原始行和原因；损坏的替换字符串、缺少动作及含糊的条件继续拒绝，不能靠丢弃规则发布半个模块。
 
-当前原生映射覆盖 URL 条件及其 AND / OR、固定字符串 URL、常见 Reject、响应 Mock、JSON 增删改 / jq / jq_file、正文正则、Header set / del / add 和单独的 URL 替换 / 重定向。Header add 由既有原生 Headers 编译器实现追加及多值保留。方法 / Header / 状态条件、动态超时与 debug、Header 正则替换、请求正文 Mock，以及需要跨不同原生配置阶段保持顺序的混合管道仍明确拒绝，不删除条件或丢弃动作来冒充成功。未知属性、重复参数、缺少引号、未闭合字符串 / 正则、裸参数名等错误逐行报告；原作者损坏的 V2 声明不会自动猜测修补或发布成残缺模块。
+当前原生映射覆盖 URL 条件及其 AND / OR、固定字符串 URL、常见 Reject、响应 Mock、JSON 增删改 / jq / jq_file、正文正则、Header set / del / add 和单独的 URL 替换 / 重定向。单个响应 `body.mock` / `body.mock_file` 与任意 `header.set` / `header.del` 管道合并为同一个原生 `respond`，Header 名按大小写不敏感的最后一次赋值确定；同一管道出现两个及以上 Body 写入、Header add，或与 Mock 状态/消息分帧冲突的 Header 动作仍拒绝。Header add 由既有原生 Headers 编译器实现追加及多值保留。方法 / Header / 状态条件、动态超时与 debug、Header 正则替换、请求正文 Mock，以及需要跨不同原生配置阶段保持顺序的混合管道仍明确拒绝，不删除条件或丢弃动作来冒充成功。未知属性、重复参数、缺少引号、未闭合字符串 / 正则、裸参数名等错误逐行报告；原作者损坏的 V2 声明不会自动猜测修补或发布成残缺模块。
 
 验证命令：`.venv/bin/python build.py --offline --verify`，单元测试 `.venv/bin/python -m unittest discover -s tests`。测试包含递归逻辑、引用边界、JSON 路径、参数类型、平台环境判定、二进制 Mock 和执行顺序；探针未触发行为不记为功能通过。
 
