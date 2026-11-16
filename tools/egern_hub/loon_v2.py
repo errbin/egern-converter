@@ -211,19 +211,24 @@ def parse(line, *, defaults=None, repairs=None, parameter_loader=None):
             name = parser.word(); parser.expect('=')
             if name in options: raise ValueError('Loon V2 重复属性：'+name)
             parser.space()
-            # Some published migrations retain a bare legacy enable key. Only
-            # a complete token declared as a boolean can establish its meaning.
-            bare = re.match(r'([\w-]+)(?=\s*(?:,|$))',parser.source[parser.pos:])
-            if (name=='enable' and bare and bare[1] not in {'true','false'}
-                    and bare[1] not in (defaults or {}) and parameter_loader
-                    and len(actions)==1 and actions[0][0]=='script' and actions[0][1]
-                    and isinstance(actions[0][1][0],String)):
-                parameter_loader(actions[0][1][0].value,{bare[1]})
-            if name=='enable' and bare and bare[1] not in {'true','false'} and type((defaults or {}).get(bare[1])) is bool:
-                parser.pos += len(bare[0])
-                options[name] = Variable(bare[1])
+            # Published V2 migrations retain both bare and braced enable keys.
+            # Parse them as parameter references; declaration checks stay in bind().
+            reference = None
+            if name == 'enable':
+                reference = (re.match(r'\{([\w-]+)\}(?=\s*(?:,|$))', parser.source[parser.pos:])
+                             or re.match(r'([\w-]+)(?=\s*(?:,|$))', parser.source[parser.pos:]))
+                if reference and reference[1] in {'true','false'}:
+                    reference = None
+            if reference:
+                key = reference[1]
+                if (key not in (defaults or {}) and parameter_loader
+                        and len(actions)==1 and actions[0][0]=='script' and actions[0][1]
+                        and isinstance(actions[0][1][0],String)):
+                    parameter_loader(actions[0][1][0].value,{key})
+                parser.pos += len(reference[0])
+                options[name] = Variable(key)
                 if repairs is not None:
-                    repairs.append({'parameter':bare[1], 'reason':'将已声明布尔参数的旧式裸 enable 引用规范为 V2 变量引用'})
+                    repairs.append({'parameter':key, 'reason':'将 Loon 旧式 enable 引用规范为 V2 变量引用'})
             else:
                 options[name] = parser.value()
             if not parser.take(','): break
@@ -272,7 +277,7 @@ def json_expression(value, defaults):
     return json.dumps(literal(value,defaults),ensure_ascii=False)
 
 
-def script_entry(parsed, defaults):
+def script_entry(parsed, defaults, synthesize=None):
     from .loon_arguments import bind
     phase, condition, actions, attributes = parsed
     if len(actions)!=1 or actions[0][0]!='script': raise ValueError('Loon V2 Script 必须只有一个 script() 动作')
@@ -290,7 +295,7 @@ def script_entry(parsed, defaults):
         if isinstance(arg,PluginObject): options['argument']='{'+','.join(arg.keys)+'}'
         elif isinstance(arg,String): string_argument=literal(arg,defaults)
         else: raise ValueError('Loon V2 Script 参数必须为字符串或插件对象')
-    native = bind(options,defaults)
+    native = bind(options,defaults,synthesize=synthesize)
     if string_argument is not None: options['argument']=string_argument
     kind={'request':'http_request','response':'http_response','cron':'schedule','generic':'generic','network-changed':'network'}[phase]
     if 'tag' in attributes and not isinstance(attributes['tag'],String):raise ValueError('Loon V2 tag 需要固定字符串')
