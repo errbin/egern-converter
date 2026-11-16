@@ -74,6 +74,16 @@ class NodeBrowserDeadBranchTests(unittest.TestCase):
         )
         self.check(source, 'egern', format='surge')
 
+    def test_typeof_probe_branch_value_folds_when_the_conditional_value_is_discarded(self):
+        # 探测结果只作为条件分支内部的逻辑值出现，而整个条件表达式的值被
+        # 丢弃；此时分支值仍应继续追踪到表达式语句，而不是在分支处误拒。
+        source = (
+            "let state_isNode='function'==typeof require;let changed=0;"
+            "$request.method==='GET'?(state_isNode&&(changed=1)):0;"
+            "$done({body:String(state_isNode)});"
+        )
+        self.check(source, 'false', format='surge')
+
     def test_typeof_probe_in_closed_conditional_comparison_folds(self):
         source = (
             "const ops={};ops.eq=(a,b)=>a===b;ops.neq=(a,b)=>a!==b;"

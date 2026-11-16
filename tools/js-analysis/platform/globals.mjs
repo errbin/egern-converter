@@ -103,7 +103,8 @@ export function probeResultSafeAt(ix,start){
   // 字符串解码等非函数成员不会成为可调用方法；只证明函数成员本身封闭。
   return methods.every(closedFunction);
  };
- function walk(node){
+ function walk(node){const result=walkCore(node);if(process.env.EGERN_TRACE_PROBE&&result===false){const p=ix.parents.get(node);process.stderr.write('TRACE_FALSE '+node.start+' '+node.end+' '+node.type+' parent='+(p?.type)+'\n');}return result;}
+ function walkCore(node){
   if(seen.has(node))return true;seen.add(node);
   const parent=ix.parents.get(node);if(!parent)return true;
   if(parent.type==='ChainExpression'&&parent.expression===node)return walk(parent);
@@ -116,9 +117,10 @@ export function probeResultSafeAt(ix,start){
   }
   if(parent.type==='ConditionalExpression'){
    // 条件测试只决定执行哪个分支，探测值本身不会成为条件表达式的值。
-   // 分支结果仍需在后续使用点单独证明；这里不能把测试值误当成分支值追踪。
+   // 分支值仍按整个条件表达式继续追踪到真实消费点；不能因为测试安全就
+   // 直接放行分支值，也不能在分支值被丢弃时误拒。
    if(parent.test===node)return true;
-   return false;
+   return walk(parent);
   }
   if(['IfStatement','WhileStatement','DoWhileStatement','ForStatement'].includes(parent.type)&&parent.test===node)return true;
   if(parent.type==='SwitchCase'&&parent.test===node)return true;
