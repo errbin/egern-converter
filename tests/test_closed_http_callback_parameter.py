@@ -51,6 +51,19 @@ api.get({url:'https://api.test/a'},(error,response,body)=>$done({body}));api.get
                 self.assertEqual(result['status'], 'passed', result)
                 self.assertEqual(result.get('differences'), [])
 
+    def test_callback_value_forwarded_through_inline_iife_parameter(self):
+        source = '''const state_logErr=(error,response)=>{};
+const state_queryStr=t=>'';
+const state_post=(t,e=(()=>{}))=>{const s=t.method?t.method.toLocaleLowerCase():'post';{t.body&&t.headers&&!t.headers['Content-Type']&&!t.headers['content-type']&&(t.headers['content-type']='application/x-www-form-urlencoded');t.headers&&(delete t.headers['Content-Length'],delete t.headers['content-length']);((false)),$httpClient[s](t,(t,s,a)=>{!t&&s&&(s.body=a,s.statusCode=s.status?s.status:s.statusCode,s.status=s.statusCode),e(t,s,a)});}};
+const state_get=(t,e=(()=>{}))=>{{t.headers&&(delete t.headers['Content-Type'],delete t.headers['Content-Length'],delete t.headers['content-type'],delete t.headers['content-length']);t.params&&(t.url+='?'+state_queryStr(t.params));{false;
+$httpClient.get(t,(t,s,a)=>{!t&&s&&(s.body=a,s.statusCode=s.status?s.status:s.statusCode,s.status=s.statusCode),e(t,s,a)});}}};
+function httpRequest(options,method){typeof method==='undefined'?('body' in options?method='post':method='get'):method=method;return new Promise(resolve=>{((selectedMethod,selectedArgument,selectedCallback)=>{if(selectedMethod==='post')return state_post(selectedArgument,selectedCallback);if(selectedMethod==='get')return state_get(selectedArgument,selectedCallback);throw new TypeError('Unknown HTTP method')})(method,options,(error,response,body)=>{if(error){state_logErr(error);resolve();return}resolve(body)});});}
+function Request(options,method){return new Promise((resolve,reject)=>{((selectedMethod,selectedArgument)=>{if(selectedMethod==='post')return (record=>new Promise((resolve,reject)=>state_post(record,(error,response)=>error?reject(error):resolve(response))))(selectedArgument);if(selectedMethod==='get')return (record=>new Promise((resolve,reject)=>state_get(record,(error,response)=>error?reject(error):resolve(response))))(selectedArgument);throw new TypeError('Unknown HTTP method')})(method.toLowerCase(),options);});}
+(async()=>{await Request({url:'https://api.test/delegated'},'get');await new Promise(resolve=>{state_post({url:'https://api.test/post'},async(error,response,body)=>{try{resolve(JSON.parse(body))}catch(error){resolve()}})});await httpRequest({url:'https://api.test/http'});$done({body:'ok'});})();'''
+        output = convert_script(source, 'Fixture', URL, '', source_format='loon')
+        self.assertNotIn('$httpClient', output)
+        self.assertIn('ctx.http.', output)
+
     def test_forwarded_callback_rejects_escape_rebinding_and_nonlocal_values(self):
         cases = [
             ("function send(req,cb){consume(cb);$httpClient.get(req,(err,resp,body)=>cb(err,resp,body));}"

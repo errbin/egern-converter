@@ -1156,7 +1156,8 @@ function emitNative(source,original,format,options,libraries,{pipeline,bundled,d
   const {fn,position}=entries[0],parent=parents.get(fn),parameter=fn.params[position];
   const id=fn.id??(parent?.type==='VariableDeclarator'?parent.id:null),fb=id?.type==='Identifier'?bindings.get(id):null;
   let calls;
-  if(parent?.type==='MethodDefinition'){calls=closedMethodCalls(parent);if(!calls)return false;}
+  if(parent?.type==='CallExpression'&&parent.callee===fn&&!parent.optional&&parent.arguments.every(argument=>argument.type!=='SpreadElement'))calls=[parent];
+  else if(parent?.type==='MethodDefinition'){calls=closedMethodCalls(parent);if(!calls)return false;}
   else{
    if(!fb||fb.writes.length)return false;
    calls=fb.refs.map(ref=>parents.get(ref));
