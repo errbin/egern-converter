@@ -2588,7 +2588,7 @@ function decoderCandidates(source){
  const seen=new Set(),out=[];
  for(const n of scan.nodes){
   if(n.type!=='FunctionDeclaration')continue;
-  if(methodContract(n)!==KS_DECODER&&!cachedDecoderShape(n,scan))continue;
+  if(methodContract(n)!==KS_DECODER&&methodContract(n)!==PDD_DECODER&&!cachedDecoderShape(n,scan))continue;
   // 共用同一张表工厂的外壳属于同一个解码器族，只取首个作为族代表，避免重复折叠
   const factory=tableFactoryName(n,scan),id=factory??n.id?.name;
   if(!id||seen.has(id))continue;
