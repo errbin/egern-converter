@@ -630,6 +630,7 @@ function fold(source,format,options,qxHint){
    const name=property(n);
    if(name==='surge-version')return format==='surge'?PRESENT_VERSION:undefined;
    if(name==='stash-version')return format==='stash'?PRESENT_VERSION:undefined;
+   if(name==='surge-build')return format==='surge'?PRESENT_VERSION:undefined;
   }
   if(n.type==='MemberExpression'&&!n.computed&&ix.free(n.object,'globalThis')&&absentMembers.has(property(n))&&probeBuiltinsStable&&absentMemberProbeResult(n))return undefined;
  if(n.type==='MemberExpression'){const object=value(n.object,new Set(seen));if(object&&records.has(object)&&Object.hasOwn(object,property(n)))return object[property(n)];}
@@ -1169,7 +1170,7 @@ export function foldFactoryProbes(source,format,options){
    const expr=parse(folded,{ecmaVersion:'latest'}).body[0].declarations[0].init;return expr.type==='Literal'?expr.value:UNKNOWN_PROBE;
   }
   if(n.type==='MemberExpression'&&free(n.object,'$environment')){
-   if(property(n)==='surge-version'&&format!=='surge'||property(n)==='stash-version'&&format!=='stash')return undefined;
+   if((property(n)==='surge-version'||property(n)==='surge-build')&&format!=='surge'||property(n)==='stash-version'&&format!=='stash')return undefined;
    return UNKNOWN_PROBE;
   }
   if(n.type==='UnaryExpression'){

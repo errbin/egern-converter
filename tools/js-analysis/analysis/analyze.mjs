@@ -51,7 +51,7 @@ let done=false, asynchronous=false;
 const apis=new Set();
 const members={
   $notification:new Set(['post']),
-  $environment:new Set(['language','variables']),
+  $environment:new Set(['language','variables','surge-version','stash-version','surge-build']),
   $task:new Set(['fetch']),
   $httpClient:new Set(['get','post','put','delete','head','options','patch']),
   $persistentStore:new Set(['read','write']),

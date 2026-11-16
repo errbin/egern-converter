@@ -48,6 +48,37 @@ $done({body:String(present)});"""
         result = compare(source, native, 'surge', URL, case)
         self.assertEqual(result['status'], 'passed', result)
 
+    def test_surge_build_probe_selects_the_modern_notification_projection(self):
+        probe = """
+import assert from 'node:assert/strict';
+import {platformFold} from './tools/js-analysis/platform/globals.mjs';
+const fold=(source,format)=>platformFold(source,format).source;
+const sentinel='const present=typeof $environment!=="undefined"&&$environment["surge-build"]!=="undefined";';
+assert.equal(fold(sentinel,'surge'),'const present = true;');
+assert.equal(fold(sentinel,'loon'),'const present = false;');
+assert.equal(fold(sentinel,'qx'),'const present = false;');
+console.log(JSON.stringify({ok:true}));
+"""
+        result = subprocess.run(
+            ['node', '--input-type=module', '-e', probe],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), {'ok': True})
+        source = ('const legacy=$environment["surge-build"]<3112;'
+                  'if(legacy){$notification.post("t","s","b",{url:"https://a.test/"})}'
+                  'else{$notification.post("t","s","b",{action:"open-url",url:"https://a.test/",'
+                  '"media-url":"https://a.test/i.png"})}$done({});')
+        native = convert_script(source, 'Fixture', URL, '', source_format='surge')
+        case = {'name': 'surge build probe', 'request': {'url': URL},
+                'expected': {'events': {'notifications': [
+                    {'title': 't', 'subtitle': 's', 'body': 'b',
+                     'action': {'type': 'openUrl', 'url': 'https://a.test/'},
+                     'attachment': {'url': 'https://a.test/i.png'}}]}}}
+        self.assertEqual(compare(source, native, 'surge', URL, case)['status'], 'passed')
+
 
 if __name__ == '__main__':
     unittest.main()
