@@ -277,7 +277,7 @@ def json_expression(value, defaults):
     return json.dumps(literal(value,defaults),ensure_ascii=False)
 
 
-def script_entry(parsed, defaults, synthesize=None):
+def script_entry(parsed, defaults, synthesize=None, synthesized=()):
     from .loon_arguments import bind
     phase, condition, actions, attributes = parsed
     if len(actions)!=1 or actions[0][0]!='script': raise ValueError('Loon V2 Script 必须只有一个 script() 动作')
@@ -295,7 +295,7 @@ def script_entry(parsed, defaults, synthesize=None):
         if isinstance(arg,PluginObject): options['argument']='{'+','.join(arg.keys)+'}'
         elif isinstance(arg,String): string_argument=literal(arg,defaults)
         else: raise ValueError('Loon V2 Script 参数必须为字符串或插件对象')
-    native = bind(options,defaults,synthesize=synthesize)
+    native = bind(options,defaults,synthesize=synthesize,synthesized=synthesized)
     if string_argument is not None: options['argument']=string_argument
     kind={'request':'http_request','response':'http_response','cron':'schedule','generic':'generic','network-changed':'network'}[phase]
     if 'tag' in attributes and not isinstance(attributes['tag'],String):raise ValueError('Loon V2 tag 需要固定字符串')

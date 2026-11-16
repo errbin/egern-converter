@@ -263,13 +263,12 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                     'source_line':entry['line'],'sha256':entry['sha256'],
                     'reason':'从同一原作者脚本的配套模块补全功能参数声明'})
     synthesized_parameters=set()
-    def synthesize_parameter(key, argument_only):
-        """按“未声明即关”补充开关；参数值位置不能凭空给出会被脚本当真的值。"""
+    def synthesize_parameter(key):
+        """仅对 enable 位置按“未声明即关”补充布尔开关，并标注来源。"""
         defaults=result.setdefault('compat_arguments',{})
         if key in defaults:
             return defaults[key]
-        # enable 位置关闭时必须阻断执行；argument 位置关闭时必须保持未设置效果。
-        defaults[key]='' if argument_only else False
+        defaults[key]=False
         result.setdefault('compat_arguments_schema',{})[key]={
             'name':key+'（本站补充，默认关闭）',
             'description':'上游 [Argument] 未声明该参数，本站按“未声明即关”补充为开关；'
@@ -378,7 +377,8 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                     # 已存在参数表才视为上游漏声明并按“未声明即关”补充。
                     defaults=result.setdefault('compat_arguments',{})
                     result.setdefault('scriptings',[]).append(loon_v2_script(
-                        parsed,defaults,synthesize=synthesize_parameter if defaults else None))
+                        parsed,defaults,synthesize=synthesize_parameter if defaults else None,
+                        synthesized=synthesized_parameters))
                 else:
                     for field,entry in loon_v2_rewrites(parsed,result.get('compat_arguments',{}),rule_set_loader):
                         if field == '_header_actions':header_actions.append(entry)
@@ -558,7 +558,8 @@ def convert_module(text, source_format='surge', scripts_native=False, *, generat
                     # 只有在模块自身解析出声明表时才补“未声明即关”；声明表为空说明
                     # 参数表根本不在当前来源作用域内，此时补参数会越过来源边界，仍按拒绝处理。
                     declarations = result.setdefault('compat_arguments', {})
-                    native_options = loon_bind(options, declarations, synthesize=synthesize_parameter if declarations else None)
+                    native_options = loon_bind(options, declarations, synthesize=synthesize_parameter if declarations else None,
+                                               synthesized=synthesized_parameters)
                     if 'img-url' in options:
                         image = options.pop('img-url')
                         pending_comments.append('Loon script icon: '+image)
