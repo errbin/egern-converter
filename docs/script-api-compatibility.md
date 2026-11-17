@@ -67,6 +67,8 @@ HTTP URL 可沿未逃逸的局部函数参数追溯，包括 JSON 数据中字�
 
 无状态、未逃逸的对象式 Env 工厂由 AST 自动建立方法调用图：保留实际使用的方法正文，内部 `this.method(...)` 静态展开为局部函数调用，移除未使用的 Node / 其他平台实现，再转换实际 API。构造器副作用、动态访问、状态字段、方法改写与对象逃逸不走此路径。已审查的 Chavy Env 构造器、辅助闭包和使用方法继续匹配语义契约，但不再要求整个类的未调用方法逐字匹配；新增未调用的设备或平台探测不会阻挡完成 / 普通键存储转换，构造器及调用链有变化则拒绝匹配。不会按作者、文件名或方法名称手写替代业务逻辑。
 
+Surge 官方脚本 API 只定义 `$argument`：脚本声明中的 `argument` 任意字符串。中间件客户端常见的 `setupArgument` 不是 Surge API，而是打包 SDK 的内部方法。转换器仅接受已审查的“先合并默认对象，再在 `$argument` 为字符串时 JSON 解析并合并”的实现，并把 `$argument` 映射为 `ctx.env.argument`；日志接收者按带静态 `log` 方法的类归一，合并逻辑、动态键和值逃逸仍逐字拒绝。中间件 `run()` 的 compose 函数必须匹配已审查实现，入口允许 `var r=new Runner; r.use(...); r.run()` 与 `new Runner().use(...).run()` 两种同构链。
+
 “支持 Egern”的兼容库须区分旧 `$done` / `$notification` 分支与原生 `export default async (ctx)` 入口。前者仍需静态转换，不能作为原生脚本原样引用的依据。
 
 HTTP 参数按来源解释：Surge timeout 秒转毫秒；Loon timeout 已是毫秒，未指定时使用 5000 ms；QX `$task.fetch` 的 timeout 已是毫秒并原样映射。policy、policy-descriptor、重定向、Cookie 和 TLS 选项映射到对应原生字段。QX Cookie 默认关闭，Surge / Loon 默认开启。QX 错误处理中使用的 `error` 字段就地保留；没有通用 HTTP 包装器。QX 正文和 bodyBytes 同时使用时只读一次流，分别解码文本和保留 ArrayBuffer；Surge / Loon 的二进制正文为 Uint8Array。
