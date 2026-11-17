@@ -334,15 +334,18 @@ def rewrite_entries(parsed, defaults, loader=None):
     output=[]
     if len(actions)>1 and any(name.startswith('reject') for name,_ in actions):
         raise ValueError('Loon V2 终止响应管道尚未合并为单个原生响应，不能拆分执行')
-    body_writes=[name for name,_ in actions if name in {
-        'response.body.mock','response.body.mock_file','response.body.replace',
-        'response.json.jq','response.json.jq_file','response.json.add','response.json.replace','response.json.delete',
+    mock_names={'response.body.mock','response.body.mock_file'}
+    body_actions=[name for name,_ in actions if name in mock_names|{
+        'response.body.replace','response.json.jq','response.json.jq_file',
+        'response.json.add','response.json.replace','response.json.delete',
     }]
-    if len(body_writes)>1:
+    mock_actions=[name for name in body_actions if name in mock_names]
+    # Mock 占用唯一的整体响应；与其他 Body 动作混用时无法保留明确的覆盖顺序。
+    if len(mock_actions)>1 or (mock_actions and any(
+            name not in mock_names for name in body_actions)):
         raise ValueError('Loon V2 响应管道包含多个 Body 写入，不能合并为同一原生响应')
-    mock_actions=[name for name,_ in actions if name in {'response.body.mock','response.body.mock_file'}]
     if mock_actions and len(actions)!=1:
-        headers=[(name,args) for name,args in actions if name not in {'response.body.mock','response.body.mock_file'}]
+        headers=[(name,args) for name,args in actions if name not in mock_names]
         if len(mock_actions)!=1 or any(name not in {'response.header.set','response.header.del'} for name,_ in headers):
             raise ValueError('Loon V2 Mock 与 Header 管道需要合并为同一原生响应，当前不拆分执行')
         def header_rows(args):
