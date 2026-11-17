@@ -68,16 +68,33 @@ class LoonV2ResponsePipelineTests(unittest.TestCase):
         self.assertEqual(obj['rewrites'][0]['actions'][0]['respond']['headers'],
                          {'Content-Type': 'application/json', 'X-A': '1', 'X-B': '2'})
 
-    def test_multiple_body_writes_are_rejected(self):
+    def test_ordered_body_transforms_are_merged_in_source_order(self):
+        prefix = 'response if ${url} ~= /api/ then '
+        pipelines = [
+            ('response.json.delete("data.ads") | response.json.replace("data.vip", true) | '
+             'response.json.add("data.tip", "hello, then | world")', 3),
+            ('response.json.jq(`.data = []`) | response.body.replace(/a/, "b")', 2),
+        ]
+        for pipeline, count in pipelines:
+            with self.subTest(pipeline=pipeline):
+                obj = convert(prefix + pipeline)
+                self.assertEqual(len(obj['rewrites']), 1)
+                self.assertEqual(len(obj['rewrites'][0]['actions']), count)
+        obj = convert(prefix + pipelines[1][0])
+        self.assertIn('jq', obj['rewrites'][0]['actions'][0]['response_body'])
+        self.assertEqual(obj['rewrites'][0]['actions'][1]['response_body']['regex'], 'a')
+
+    def test_ambiguous_mock_body_replacements_are_rejected(self):
         prefix = 'response if ${url} ~= /api/ then '
         for pipeline in [
             'response.body.mock("json", "{}") | response.body.mock("json", "[]")',
+            'response.body.mock("json", "{}") | response.body.mock_file("json", "mock.json")',
             'response.body.mock("json", "{}") | response.json.jq(`.data = []`)',
+            'response.body.mock("json", "{}") | response.json.jq_file("filter.jq")',
             'response.body.mock("json", "{}") | response.body.replace(/a/, "b")',
-            'response.json.jq(`.data = []`) | response.body.replace(/a/, "b")',
         ]:
             with self.subTest(pipeline=pipeline), self.assertRaisesRegex(ConversionError, '多个 Body 写入'):
-                convert(prefix + pipeline)
+                convert(prefix + pipeline, loader=lambda _: '{}')
 
     def test_unprovable_header_actions_and_framing_headers_are_rejected(self):
         prefix = 'response if ${url} ~= /api/ then response.body.mock("json", "{}") | '
