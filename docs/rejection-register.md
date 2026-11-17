@@ -292,15 +292,15 @@ Egern 官方 JavaScript API 的完整 `ctx` 字段清单没有“动态节点、
   `docs/conversion-boundaries.md:54,83`（动态字段、别名逃逸和方法覆写不能
   放行）；`docs/remaining-work-roi.md:130,143-144`。
 
-## v2fly/domain-list-community 的 regexp 裁定
+## v2fly/domain-list-community 的 regexp 裁定（已撤销错误归一化）
 
 - 来源：`v2fly/domain-list-community` 的 1557 个离线 `data/` 文件，2026-11-18 快照。
-- 事实：上游 `regexp:` 使用 Go `regexp.Compile` / `MatchString`，即搜索语义；Egern 官方规则页只说明“通过正则表达式匹配域名”，未明确整串或搜索。
-- 裁定：不整文件拒绝。对每条模式先做双语义等价归一化，再输出 `domain_regex_set`；不能证明等价的模式才按文件与行号拒绝。
-- 归一化：`^...$`、`.*...$`、`.+...$` 原样保留；`(^|\.)...$` 改写为 `(^|.*\.)...$`；其余以 `$` 结尾的未锚定模式前置 `.*`。
-- 依据：搜索语义与整串语义的差异仅来自未吸收的前缀。`.*` 在整串匹配中枚举所有前缀切分，在搜索匹配中可为空，因此两种宿主语义下都等价于原 Go 搜索。真实域名不含换行，`.` 的行边界差异不进入集合。
-- 实测：163 条 regexp 中 18 条原样、144 条点边界前缀改写、1 条 `kinopub` 模式前置 `.*`；1557 个文件全部通过，无 regexp 拒绝。真实域名与合成域名抽查中，原模式 `search` 与归一化模式 `fullmatch` / `search` 一致。
-- 重开条件：Egern 官方给出与上述不同的正则语言契约，或 `domain_regex` 不接受 `.*`、`^`、`$`、捕获组等通用构造。届时按实际契约重跑全量等价检查，不能直接删除归一化。
+- 撤销的旧裁定：曾假设 Egern `domain_regex` 是整串匹配，因而对 `(^|\.)...$` 追加 `.*`、对其他 `$` 结尾模式前置 `.*`，并拒绝无法证明双语义等价的未锚定模式。该假设已被官方文档否定。
+- 权威依据：Egern 官方 DNS 文档明确 `domain_regex` 为 PCRE2 **find / 搜索语义**——任意子串命中即匹配；v2fly 的 `regexp:` 使用 Go `regexp.Compile` 校验、`MatchString` 匹配，同为搜索语义。两侧语义相同，不需要也不允许归一化。
+- 当前裁定：`regexp:` 的值原样写入 `domain_regex_set`。删除 `_normalized_regexp`、`normalize_regexp` 以及 anchored / prefix_wide / dot_boundary / other_dollar 分类；除 Python 语法校验失败外，不拒绝任何 regexp。
+- 恢复收录：`data/okaapps` 第 4 行的 `^(.+\.)*zh\.okaapps\.com$` 不再被当作等价性超时项或拒绝项，已随原串收录。该模式的嵌套重复在回溯引擎上有性能风险，应在运行期做超时或长度保护，但不能据此改写或拒绝。
+- 实测：163 条 regexp 出现 163/163 收录，拒绝 0 条；Python 与 Go 编译结论不一致 0 条；转换输出对 56,066 个语料域名按 `re.search` 与原串逐条比对，mismatch 为 0。详细报告见 `.local/dlc-regex-report2.json`。
+- 重开条件：只有官方给出与 find 语义不同的 `domain_regex` 契约，才重新评估；不得恢复基于整串假设的前缀改写或未锚定拒绝。
 
 ## 重开与验收协议
 
