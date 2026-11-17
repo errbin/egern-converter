@@ -11,6 +11,7 @@ import yaml
 
 from .rule_syntax import logical_rule, strip_comment, ip_flags
 from .body_syntax import body_rewrite, mock_response
+from .domain_list import DomainListError, convert as convert_domain_list, looks_like as looks_like_domain_list
 from .loon_arguments import declaration as loon_declaration, bind as loon_bind, referenced_keys
 from .header_syntax import loon_headers
 from .loon_normalize import normalize as normalize_loon, v2_url_regex
@@ -43,6 +44,15 @@ def active_lines(text):
         line = line.strip()
         if line and not line.startswith(('#', '//', ';')):
             yield number, line
+
+
+def detect_rule_format(text):
+    """按内容特征识别规则文件格式，不依赖仓库或文件名。"""
+    if re.search(r'(?m)^payload\s*:', text):
+        return 'clash-classical'
+    if looks_like_domain_list(text):
+        return 'v2fly-domain-list'
+    return 'surge'
 
 
 def rule(line, policy=None):
@@ -89,8 +99,13 @@ def rule(line, policy=None):
     return kind, data
 
 
-def convert_rules(text, source_format='surge'):
+def convert_rules(text, source_format='surge', *, source_path='', include_loader=None):
     """Policies are deliberately removed; the importing rule supplies its policy."""
+    if source_format == 'v2fly-domain-list':
+        try:
+            return convert_domain_list(text, source=source_path, include_loader=include_loader)
+        except DomainListError as exc:
+            raise ConversionError(str(exc)) from exc
     if source_format in {'clash-classical','clash-classic','clash','mihomo','stash'}:
         obj = yaml.safe_load(text)
         if not isinstance(obj, dict) or not isinstance(obj.get('payload'), list):
