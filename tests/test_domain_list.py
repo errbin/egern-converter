@@ -24,7 +24,7 @@ class DomainListTests(unittest.TestCase):
             'domain_suffix_set': ['github.com', 'example.org'],
             'domain_set': ['api.example.org'],
             'domain_keyword_set': ['google'],
-            'domain_regex_set': [r'(^|.*\.)ads\.example$'],
+            'domain_regex_set': [r'(^|\.)ads\.example$'],
         })
 
     def test_attributes_and_affiliations_are_dropped_after_parsing(self):
@@ -74,30 +74,37 @@ class DomainListTests(unittest.TestCase):
             'bad.example unknown\n': '未知字段',
             'include:child &AFF\n': 'include 不允许归属标注',
             'include:child @-\n': '无效的 ban 属性',
-            'regexp:unanchored\n': '无法证明 regexp',
+            'regexp:(\n': '无效 regexp',
         }
         for source, message in cases.items():
             with self.subTest(source=source):
                 with self.assertRaisesRegex(ConversionError, message):
                     convert_rules(source, 'v2fly-domain-list', source_path='root')
 
-    def test_regexp_normalization_is_equivalent_under_search_and_full_match(self):
+    def test_regexp_is_passed_through_verbatim(self):
         cases = [
-            (r'(^|\.)foo\.com$', r'(^|.*\.)foo\.com$', ['foo.com', 'x.foo.com', 'foo.com.evil', 'xfoo.com']),
-            (r'^ads?\..+$', r'^ads?\..+$', ['ads.example', 'ad.example', 'x.ads.example']),
-            (r'.+\.awsdns-[0-9]+\.com$', r'.+\.awsdns-[0-9]+\.com$', ['a.awsdns-1.com', 'x.a.awsdns-1.com', 'awsdns-1.com']),
-            (r'(\w+)-static-[0-9]+\.example$', r'.*(\w+)-static-[0-9]+\.example$',
-             ['foo-static-1.example', 'x-foo-static-1.example', 'static-1.example']),
+            r'(^|\.)foo\.com$',
+            r'^ads?\..+$',
+            r'.+\.awsdns-[0-9]+\.com$',
+            r'(\w+)-static-[0-9]+\.example$',
+            r'^(.+\.)*zh\.okaapps\.com$',
+            r'unanchored',
         ]
-        for original, normalized, domains in cases:
-            with self.subTest(original=original):
-                before, after = re.compile(original), re.compile(normalized)
-                for domain in domains:
-                    expected = bool(before.search(domain))
-                    self.assertEqual(bool(after.fullmatch(domain)), expected, domain)
-                    self.assertEqual(bool(after.search(domain)), expected, domain)
-        self.assertEqual(convert_rules('regexp:(^|\\.)foo\\.com$\n', 'v2fly-domain-list'),
-                         {'domain_regex_set': [r'(^|.*\.)foo\.com$']})
+        for pattern in cases:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(convert_rules(f'regexp:{pattern}\n', 'v2fly-domain-list'),
+                                 {'domain_regex_set': [pattern]})
+
+    def test_regexp_uses_find_semantics_without_prefix_rewrite(self):
+        dot_pattern = re.compile(r'(^|\.)foo\.com$')
+        for domain in ('foo.com', 'x.foo.com'):
+            self.assertTrue(dot_pattern.search(domain), domain)
+        for domain in ('foo.com.evil', 'xfoo.com'):
+            self.assertFalse(dot_pattern.search(domain), domain)
+
+        suffix_only = re.compile(r'(\w+)-static-[0-9]+\.example$')
+        for domain in ('foo-static-1.example', 'x-foo-static-1.example'):
+            self.assertTrue(suffix_only.search(domain), domain)
 
     def test_format_detection_uses_content_only(self):
         self.assertEqual(detect_rule_format('github.com\nfull:api.github.com\n'), 'v2fly-domain-list')
