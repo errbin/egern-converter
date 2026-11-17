@@ -90,34 +90,6 @@ def _fields(parts, *, source, line, inclusion):
     return frozenset(attrs), frozenset(must), frozenset(ban), tuple(affiliations)
 
 
-def _normalized_regexp(pattern, *, source, line):
-    try:
-        re.compile(pattern)
-    except re.error as exc:
-        _error(source, line, f'无效 regexp：{pattern}（{exc}）')
-    anchored = pattern.startswith('^') and pattern.endswith('$')
-    prefix_wide = (pattern.startswith('.*') or pattern.startswith('.+')) and pattern.endswith('$')
-    dot_boundary = pattern.startswith(r'(^|\.)') and pattern.endswith('$')
-    if anchored or prefix_wide:
-        normalized = pattern
-    elif dot_boundary:
-        normalized = r'(^|.*\.)' + pattern[len(r'(^|\.)'):]
-    elif pattern.endswith('$'):
-        normalized = '.*' + pattern
-    else:
-        _error(source, line, f'无法证明 regexp 在整串与搜索语义下等价：{pattern}')
-    try:
-        re.compile(normalized)
-    except re.error as exc:
-        _error(source, line, f'归一化后的 regexp 无效：{normalized}（{exc}）')
-    return normalized
-
-
-def normalize_regexp(pattern):
-    """返回对 Go 搜索语义与 Egern 整串语义等价的模式。"""
-    return _normalized_regexp(pattern, source='<test>', line=0)
-
-
 def parse(text, source=''):
     entries, inclusions = [], []
     for line_no, raw in enumerate(text.lstrip('\ufeff').splitlines(), 1):
@@ -153,7 +125,12 @@ def parse(text, source=''):
             if not valid:
                 _error(source, line_no, f'无效域名：{value}')
         elif kind == 'regexp':
-            value = _normalized_regexp(value, source=source, line=line_no)
+            # Python re 仅用于语法校验；模式原样保留。若 Python 与 Go RE2
+            # 结论不同，属于工具差异，应在全量报告中单独列出，不能静默归为上游错误。
+            try:
+                re.compile(value)
+            except re.error as exc:
+                _error(source, line_no, f'无效 regexp（Python re；若 Go RE2 可编译则属工具差异）：{value}（{exc}）')
         else:
             _error(source, line_no, f'未知规则类型：{kind}')
         attrs, must, ban, affiliations = _fields(parts[1:], source=source, line=line_no, inclusion=False)
