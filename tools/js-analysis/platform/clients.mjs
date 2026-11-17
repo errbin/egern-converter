@@ -386,7 +386,8 @@ export const pipelineContracts = {
   "surge.setupArgument": [
     "18fa5fe9c1ee323473623d4035e859276f02e78c0fe5b0d7aab285544724bc27",
     "89e8af89a312b6027997d9e3e510707832b95f0aeed170b6865732e4d5b3ce91",
-    "8f3efe7b45d2627e91ff9937a34ba018bb0ec41df6e6ac3277f8dc3f19b8e9d3"
+    "8f3efe7b45d2627e91ff9937a34ba018bb0ec41df6e6ac3277f8dc3f19b8e9d3",
+    "6cc8ae4eaaa75970ba562ab4ccaee26c461f61334291fa3ebbb17678dec8b760"
   ],
   "surge.getVal": [
     "21699d187794c4d6eaf18dd58bc5918651be987bffb00ec720ac1bde59bda662"
@@ -422,10 +423,12 @@ export const pipelineContracts = {
     "b961a677c413d0f33dc367a52dbfc6c72897f95afdc2ff78304e60a389d92c7e"
   ],
   "runner": [
-    "458e9992caa1fa2f827b89a8df7788410df37ac36af395bc3fab3cff4d2b3bd6",
-    "19c423889fa6c0cf84346f40473d4c00f723d8dcf37ad12a6e5908641ed36a06"
+    "9436538b9df0e0b50990750c93ec35c3a01a6132e19bca207af2a0d7755e384a"
   ]
 };
+
+// 已审查的中间件 compose 实现：固定参数中间件数组，再按顺序等待整条链。
+const middlewareCompose='3d06962ea77d2dd97f1e1b7ed056a9a9e217ad5eaae25ce77fbb8bd34b787199';
 
 // Specialize reviewed middleware clients, keeping upstream routing/business JS.
 // Contracts cover SDK methods, never whole files or handwritten business output.
@@ -467,6 +470,18 @@ export function lowerPipeline(source,format,options={}) {
    const externalNames=new Map();
    if(method&&kind==='surge.fetch')for(const n of nodes){
     if(n.type==='Identifier'&&n.start>=method.start&&n.end<=method.end&&ix.reference(n)&&binaryPredicates.has(bindings.get(n)))externalNames.set(n.name,{reviewedExternal:'byte-array-predicate'});
+   }
+   // setupArgument 只把默认对象与 $argument 合并；日志接收者不参与参数语义。
+   // 仅当它解析为带静态 log 方法的类时归一，其余同名实现仍按原契约拒绝。
+   if(method&&kind==='surge.setupArgument')for(const n of nodes){
+    if(n.type!=='Identifier'||n.start<method.start||n.end>method.end||!ix.reference(n))continue;
+    const member=parents.get(n),value=resolve(n);
+    if(member?.type==='MemberExpression'&&member.object===n&&property(member)==='log'&&value?.type==='ClassExpression'&&value.body.body.some(m=>m.type==='MethodDefinition'&&m.static&&key(m)==='log'))externalNames.set(n.name,{reviewedExternal:'logger-sink'});
+   }
+   // runner 的 compose 名称不是行为证明；先要求函数体匹配已审查实现，再归一名称。
+   if(method&&kind==='runner'){
+    const chain=method.value.body.body.at(-1)?.expression,caught=chain?.callee?.object,dispatch=caught?.callee?.object,compose=dispatch?.callee?.callee;
+    if(compose?.type==='Identifier'&&functions.has(resolve(compose)?.type)&&methodContract(resolve(compose))===middlewareCompose)externalNames.set(compose.name,{reviewedExternal:'middleware-compose'});
    }
    if(!method||!pipelineContracts[kind]?.includes(methodContract(method.value,classNames,externalNames)))fail(method??root,'未知的 '+kind+' 语义契约，拒绝替换 SDK 行为');
   }
@@ -571,7 +586,18 @@ export function lowerPipeline(source,format,options={}) {
   edits.set(factoryCall,'new '+source.slice(factoryCall.callee.object.start,factoryCall.callee.object.end)+'()');
   const localText=emit(statements[0]),instance=local.id.name;
   edits.set(runnerMethod,`async run(){${localText}try{await ${emit(caught)};}finally{return ${instance}.end();}}`);
-  const entries=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&property(n.callee)==='run'&&resolve(n.callee.object)?.type==='NewExpression'&&resolve(resolve(n.callee.object).callee)===runner);
+  // 同构入口既可以是 `var r=new Runner; r.use(...); r.run()`，也可以是
+  // `new Runner().use(...).run()`。只沿静态 use 调用回溯到唯一的新实例。
+  function runnerReceiver(value){
+   value=resolve(value);
+   while(value?.type==='CallExpression'&&value.callee.type==='MemberExpression'&&property(value.callee)==='use')value=resolve(value.callee.object);
+   return value;
+  }
+  const entries=nodes.filter(n=>{
+   if(n.type!=='CallExpression'||n.callee.type!=='MemberExpression'||property(n.callee)!=='run')return false;
+   const origin=runnerReceiver(n.callee.object);
+   return origin?.type==='NewExpression'&&resolve(origin.callee)===runner;
+  });
   if(entries.length!==1||parents.get(entries[0])?.type!=='ExpressionStatement'||parents.get(parents.get(entries[0]))!==tree)fail(runner,'中间件入口不是唯一的顶层调用');
   edits.set(parents.get(entries[0]),'return await '+emit(entries[0])+';');
   edits.set(root,originalRoot());
