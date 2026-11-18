@@ -14,6 +14,26 @@ def ascii_slug(value, fallback='resource'):
     return value or fallback
 
 
+def rule_identity(value):
+    """将规则集 basename 归一为跨来源合并身份，保留 ``!`` 的排除语义。"""
+    name = re.sub(r'(?i)\.(?:list|yaml|yml)$', '', PurePosixPath(str(value)).name)
+    text = unicodedata.normalize('NFKC', name).casefold()
+    tokens, current = [], []
+    for char in text:
+        if char.isalnum():
+            current.append(char)
+            continue
+        if current:
+            tokens.append(''.join(current))
+            current = []
+        if char == '!':
+            # ``geolocation-!cn`` 表示排除中国，不能与 ``geolocation-cn`` 合并。
+            tokens.append('not')
+    if current:
+        tokens.append(''.join(current))
+    return '-'.join(tokens)
+
+
 def assign_inline_outputs(items, names=None):
     """Name message modules together so aliases and collisions are deterministic."""
     groups = {}

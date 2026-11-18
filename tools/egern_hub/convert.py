@@ -1,5 +1,6 @@
 """Conservative, offline Egern converters. Never execute upstream JavaScript."""
 import argparse
+from collections import Counter
 import csv
 import ipaddress
 import json
@@ -37,6 +38,45 @@ TYPES = {
     'PROTOCOL': 'protocol', 'SSID': 'ssid', 'BSSID': 'bssid', 'CELLULAR': 'cellular',
 }
 IP_TYPES = {'ip_cidr', 'ip_cidr6', 'asn', 'geoip'}
+RULE_CASE_INSENSITIVE_TYPES = {'domain', 'domain_suffix', 'geoip'}
+
+
+def rule_value_identity(kind, value):
+    """沿用 convert_rules 的去重语义，供跨来源规则并集复用。"""
+    if kind in RULE_CASE_INSENSITIVE_TYPES:
+        return value.lower() if isinstance(value, str) else value
+    return json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value
+
+
+def merge_rule_objects(objects):
+    """按 kind+值取确定性并集；不改变任一来源的条目顺序语义。"""
+    objects = list(objects)
+    if not objects:
+        raise ConversionError('规则集为空')
+    result, seen, ip_flags = {}, {}, set()
+    for obj in objects:
+        if not isinstance(obj, dict):
+            raise ConversionError('规则集对象必须是映射')
+        if any(key in obj for key in {'ip_cidr_set', 'ip_cidr6_set', 'asn_set', 'geoip_set'}):
+            ip_flags.add(bool(obj.get('no_resolve')))
+        for key, values in obj.items():
+            if key == 'no_resolve':
+                continue
+            if not isinstance(values, list):
+                raise ConversionError(f'{key} 必须是数组')
+            kind = key.removesuffix('_set')
+            identities = seen.setdefault(key, set())
+            for value in values:
+                identity = rule_value_identity(kind, value)
+                if identity in identities:
+                    continue
+                identities.add(identity)
+                result.setdefault(key, []).append(value)
+    if len(ip_flags) > 1:
+        raise ConversionError('合并规则集的 no-resolve 语义不一致')
+    if ip_flags == {True}:
+        result['no_resolve'] = True
+    return result
 
 
 def active_lines(text):
@@ -99,7 +139,8 @@ def rule(line, policy=None):
     return kind, data
 
 
-def convert_rules(text, source_format='surge', *, source_path='', include_loader=None):
+def convert_rules(text, source_format='surge', *, source_path='', include_loader=None,
+                  ignored_rule_types=None, diagnostics=None):
     """Policies are deliberately removed; the importing rule supplies its policy."""
     if source_format == 'v2fly-domain-list':
         try:
@@ -113,9 +154,23 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
         lines = list(enumerate(obj['payload'], 1))
     else:
         lines = list(active_lines(text))
+    ignored_rule_types = {str(value).upper() for value in (ignored_rule_types or ())}
     result, seen, flags = {}, {}, set()
     for number, line in lines:
         try:
+            if ignored_rule_types and isinstance(line, str):
+                active = strip_comment(line)
+                rule_type = active.split(',', 1)[0].strip().upper()
+                if rule_type in ignored_rule_types:
+                    fields = next(csv.reader([active], skipinitialspace=True))
+                    if diagnostics is not None:
+                        diagnostics.append({
+                            'type': rule_type,
+                            'line': number,
+                            'value': fields[1].strip() if len(fields) > 1 else '',
+                            'reason': 'Egern 规则集不支持该匹配类型',
+                        })
+                    continue
             if source_format == 'domain-set':
                 if not isinstance(line, str) or not re.fullmatch(r'\.?[\w*-]+(?:\.[\w*-]+)*', line):
                     raise ConversionError('无效 domain-set 域名')
@@ -126,7 +181,7 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
             key = kind + '_set'
             value = item['match']
             # Regex, URL, keyword and User-Agent values may be case-sensitive.
-            identity = value.lower() if kind in {'domain', 'domain_suffix', 'geoip'} else (json.dumps(value, sort_keys=True) if isinstance(value, (dict,list)) else value)
+            identity = rule_value_identity(kind, value)
             if identity not in seen.setdefault(key, set()):
                 result.setdefault(key, []).append(value)
                 seen[key].add(identity)
@@ -137,6 +192,10 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
     if flags == {True}:
         result['no_resolve'] = True
     if not seen:
+        if diagnostics:
+            counts = Counter(row['type'] for row in diagnostics)
+            detail = '、'.join(f'{rule_type} x {count}' for rule_type, count in sorted(counts.items()))
+            raise ConversionError(f'规则集为空（已跳过 Egern 不支持的 {detail}）')
         raise ConversionError('规则集为空')
     return result
 

@@ -34,4 +34,6 @@ Egern 官方 DNS 文档明确 `domain_regex` 使用 PCRE2，并按 **find / 搜�
 
 规则集统一发布到 `rules/<basename>.yaml`，例如 `rules/geolocation-!cn.yaml`，不保留作者、仓库或上游 `data/` 层级。`!` 是合法 POSIX 路径字符，文件名本身不编码；上游 URL 继续由 `quote(..., safe='/')` 编码为 `%21`。来源信息由产物头部的 `# Source:` 注释保留。
 
-全批次路径分配按大小写不敏感的 basename 判定冲突：唯一来源保留 `rules/<basename>.yaml`；多个来源同名时改为 `rules/<basename>-<owner>.yaml`；同 owner 不同仓库仍冲突时再加 `-<repo>`。owner 和 repo 使用小写 ASCII slug。仍有无法消解的冲突时构建直接报错并列出条目，不静默覆盖。
+跨仓库同名规则集先按归一化身份合并为一个小写产物，例如 `Telegram.list` 与 `telegram` 合并为 `rules/telegram.yaml`；内容取 kind + 值并集，`upstream` 指向主来源，`upstreams` 保留全部来源，`updated` 取最早来源时间。`!` 会映射为独立 `not` token，确保 `geolocation-!cn` 与 `geolocation-cn` 等 8 组排除语义不碰撞。详见 [规则集产物与跨来源合并](https://github.com/errbin/egern-core/blob/main/docs/rule-sets.md)。
+
+合并后若仍有非跨来源冲突，路径分配继续按大小写不敏感的 basename 判定：唯一来源保留 `rules/<basename>.yaml`；多个来源同名时改为 `rules/<basename>-<owner>.yaml`；同 owner 不同仓库仍冲突时再加 `-<repo>`。owner 和 repo 使用小写 ASCII slug。仍有无法消解的冲突时构建直接报错并列出条目，不静默覆盖。
