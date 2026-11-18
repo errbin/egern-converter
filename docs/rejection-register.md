@@ -292,6 +292,38 @@ Egern 官方 JavaScript API 的完整 `ctx` 字段清单没有“动态节点、
   `docs/conversion-boundaries.md:54,83`（动态字段、别名逃逸和方法覆写不能
   放行）；`docs/remaining-work-roi.md:130,143-144`。
 
+## loon.createResponse 的 trailers 描述符（丢弃，不是放行宿主能力）
+
+- 来源：`kokoryh/Sparkle` 提交 `0f27e7e9`（2026-11-17，“fix(bilibili): support
+  trailers and mark fixResponseHeaders”）起，`dist/bilibili.protobuf.request.js`
+  的 Loon 子类覆盖 `createResponse`，并在 `bodyBytes` 之外增加
+  `trailers:{get(){return this.h2_trailers},set(t){this.h2_trailers=t}}`。
+- 契约裁定：`loon.createResponse` 的无 trailers 基态按 `methodContract()` 的
+  alpha 归一哈希登记；含 `trailers` 的形态必须是“该基态 + 恰好一个安全访问器”
+  的结构变体。剥离 `trailers` 后仍用同一哈希匹配，不为含 trailers 的实现登记
+  第二份哈希，也不按脚本名、URL、作者或文件摘要开特例。
+- 丢弃裁定：Egern 原生响应 API 没有 trailers 等价物。转换时丢弃该描述符，
+  同时丢弃响应侧 `trailers` 写入、把响应侧读取归为 `undefined`，并重新解析产物
+  拒绝残留字段；`te: trailers` 请求头字符串属于协议语义，不在丢弃范围。
+- 证据 A（不进入完成结果）：源文件全部 7 处 `trailers` 只用于声明描述符、业务
+  赋值 `s.response.trailers=m.trailers` 和中间件读取判断；`done(e){$done({...e})}`
+  只复制可枚举自身属性，而 `Object.create` 的描述符默认不可枚举，trailers 不会
+  进入 `$done` 输出。
+- 证据 B（行为差异安全）：唯一读取点 `Ut` 在 `有trailers × te头(trailers/无/gzip)
+  × headers有无grpc-status` 的 12 种组合中，11 种结果一致；唯一差异是
+  `有trailers + te=trailers + 无grpc-status` 时，忽略后补上 `grpc-status: "0"`。
+  这正是原作者为“无 trailers 环境”准备的回退分支，方向是增加成功标记而非掩盖
+  失败。
+- 证据 C（失败路径不经过回退）：彻底失败在 `fe()` 中记录错误后调用 `j(1)`；
+  `j` 直接抛错进入 `onerror`，不经过 `Ut` 的补值分支。补值只作用于子请求成功
+  但未带 trailers 的场合。
+- 继续拒绝的反例：任一额外字段（`status`、`headers`、自造键）、`trailers`
+  访问器指向 `this.h2_trailers` 之外、`trailers` 使用 `value` 或带
+  `enumerable`、`bodyBytes` 的 getter/setter 改动、`writable` /
+  `configurable` 等标志变化，以及第二个多余描述符。
+- 重开条件：只有 Egern 官方新增可观察的 trailers API，才重新评估保留该描述符；
+  在此之前不得把 trailers 写回产物。
+
 ## v2fly/domain-list-community 的 regexp 裁定（已撤销错误归一化）
 
 - 来源：`v2fly/domain-list-community` 的 1557 个离线 `data/` 文件，2026-11-18 快照。
@@ -316,5 +348,14 @@ Egern 官方 JavaScript API 的完整 `ctx` 字段清单没有“动态节点、
 - 普查：`285/327` 组合、`95/109` URL；剩余 `42` 个失败组合即本清单 14 个 URL。
 - 全量套件：`894` tests、`38` failures、`67` skipped；失败集合与
   `92d8cf7` 基线逐条 `diff=0`。新增测试只覆盖压缩 API 正反例，没有放行旧失败。
+- 2026-11-18 `loon.createResponse` / trailers 裁定：转换器全量 `934` tests、
+  `38` failures、`67` skipped，失败集合与 `test-baseline-fails-full.txt` 的
+  `38/38` 条逐条 `diff=0`；egern-core 全量 `353` tests、`37` failures/errors、
+  `2` skipped，失败集合与 `core-prev-fails.txt` 的 `37/37` 条逐条 `diff=0`。
+  最新 `blockAds.plugin` 全量转换成功（规则 2968、改写 1293、URL 改写 105、
+  脚本 220，合计 4586）；`blockAdsV1.plugin` 同样成功（2964 / 1295 / 101 /
+  219，合计 4579）。Sparkle 最新 `bilibili.protobuf.request.js`、
+  `bilibili.protobuf.response.js`、`bilibili.json.js` 的 loon / surge 均可转，
+  产物中 trailers 属性访问与对象键均为 `0`。
 - 本文件中的结案与拒收口径是文档变更；`ctx.compress` 的六成员能力在独立单元
   提交，不改变两条永久拒绝的判定。

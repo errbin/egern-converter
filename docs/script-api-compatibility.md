@@ -69,6 +69,10 @@ HTTP URL 可沿未逃逸的局部函数参数追溯，包括 JSON 数据中字�
 
 Surge 官方脚本 API 只定义 `$argument`：脚本声明中的 `argument` 任意字符串。中间件客户端常见的 `setupArgument` 不是 Surge API，而是打包 SDK 的内部方法。转换器仅接受已审查的“先合并默认对象，再在 `$argument` 为字符串时 JSON 解析并合并”的实现，并把 `$argument` 映射为 `ctx.env.argument`；日志接收者按带静态 `log` 方法的类归一，合并逻辑、动态键和值逃逸仍逐字拒绝。中间件 `run()` 的 compose 函数必须匹配已审查实现，入口允许 `var r=new Runner; r.use(...); r.run()` 与 `new Runner().use(...).run()` 两种同构链。
 
+Loon 中间件子类的 `loon.createResponse` 基态与已登记的 `surge.createResponse` 同形，按 `methodContract()` 的 alpha 归一哈希登记。只有在该基态上恰好增加一个安全 `trailers` 描述符时才允许转换：其 `get` / `set` 必须分别只读取和写入 `this.h2_trailers`，不得带 `value`、`enumerable`、`writable`、`configurable` 或第二个多余描述符。实现先验证这一结构，再剥离 `trailers` 属性并对剩余 AST 重新计算同一个基态哈希；因此参数改名和描述符换序仍可匹配，而额外字段、访问器目标变化、`bodyBytes` 改动或描述符标志变化仍因哈希不匹配被拒绝。这是结构判据，不是为某个含 `trailers` 的完整实现再登记一个哈希。
+
+Egern 原生响应没有 trailers 等价物，因此被接受的安全描述符会在转换时丢弃，响应侧 `trailers` 写入改为无操作、读取归为 `undefined`；产物会重新解析并拒绝任何残留 `trailers` / `h2_trailers` 字段。HTTP 请求头中的 `te: trailers` 是协议值，不是响应字段，保持原样。丢弃依据见[既定拒绝清单](rejection-register.md)。
+
 “支持 Egern”的兼容库须区分旧 `$done` / `$notification` 分支与原生 `export default async (ctx)` 入口。前者仍需静态转换，不能作为原生脚本原样引用的依据。
 
 HTTP 参数按来源解释：Surge timeout 秒转毫秒；Loon timeout 已是毫秒，未指定时使用 5000 ms；QX `$task.fetch` 的 timeout 已是毫秒并原样映射。policy、policy-descriptor、重定向、Cookie 和 TLS 选项映射到对应原生字段。QX Cookie 默认关闭，Surge / Loon 默认开启。QX 错误处理中使用的 `error` 字段就地保留；没有通用 HTTP 包装器。QX 正文和 bodyBytes 同时使用时只读一次流，分别解码文本和保留 ArrayBuffer；Surge / Loon 的二进制正文为 Uint8Array。
