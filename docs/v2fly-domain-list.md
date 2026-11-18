@@ -32,4 +32,6 @@ Egern 官方 DNS 文档明确 `domain_regex` 使用 PCRE2，并按 **find / 搜�
 
 ## 输出路径
 
-规则集按上游 basename 输出，例如 `geolocation-!cn.yaml`，不额外保留 `data/` 层级。`!` 是合法 POSIX 路径字符，文件名本身不编码；上游 URL 继续由 `quote(..., safe='/')` 编码为 `%21`。若同一来源存在重名 basename，则回退到上游完整相对路径，避免输出碰撞。
+规则集统一发布到 `rules/<basename>.yaml`，例如 `rules/geolocation-!cn.yaml`，不保留作者、仓库或上游 `data/` 层级。`!` 是合法 POSIX 路径字符，文件名本身不编码；上游 URL 继续由 `quote(..., safe='/')` 编码为 `%21`。来源信息由产物头部的 `# Source:` 注释保留。
+
+全批次路径分配按大小写不敏感的 basename 判定冲突：唯一来源保留 `rules/<basename>.yaml`；多个来源同名时改为 `rules/<basename>-<owner>.yaml`；同 owner 不同仓库仍冲突时再加 `-<repo>`。owner 和 repo 使用小写 ASCII slug。仍有无法消解的冲突时构建直接报错并列出条目，不静默覆盖。

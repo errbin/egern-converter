@@ -100,10 +100,8 @@ def read_source(root, item):
         return source.read()
 
 
-def artifact_path(item, kind=None):
-    kind = kind or item['kind']
-    if kind not in {'modules', 'rules', 'scripts'}:
-        raise ValueError('无效产物类型')
+def _artifact_filename(item, kind):
+    """返回不含作者层级的上游文件名，供模块、脚本和规则集共用。"""
     identity = _relative(item['id'])
     if len(identity.parts) != 1:
         raise ValueError('无效产物 ID')
@@ -130,4 +128,92 @@ def artifact_path(item, kind=None):
         (ascii_slug(PurePosixPath(part).stem, item['id']) + suffix if index==len(filename.parts)-1
          else ascii_slug(part, item['id']))
         for index,part in enumerate(filename.parts)))
+    return filename
+
+
+def artifact_path(item, kind=None):
+    kind = kind or item['kind']
+    if kind not in {'modules', 'rules', 'scripts'}:
+        raise ValueError('无效产物类型')
+    filename = _artifact_filename(item, kind)
+    if kind == 'rules':
+        # 规则集需要跨来源聚合，公开路径只保留文件名，来源信息由 YAML 头部承载。
+        return str(PurePosixPath('rules', filename.name))
     return str(PurePosixPath(kind, *repository_parts(item), filename))
+
+
+def assign_rule_outputs(items):
+    """为整批规则集分配确定性文件名，并消解大小写不敏感的路径冲突。
+
+    单个来源保留 ``<basename>.yaml``；同名来源按 owner、repo 逐级派生。
+    同一输入集合的分配结果固定，新增同名来源只会影响进入冲突组的条目。
+    """
+    entries = []
+    for item in items:
+        if item.get('kind') != 'rules':
+            continue
+        # 首次分配时记录上游 basename；后续重跑不能把派生出的 output 当成新的基准名。
+        base_name = item.get('_rule_base')
+        if not base_name:
+            base_name = _artifact_filename(item, 'rules').name
+            item['_rule_base'] = base_name
+        base = PurePosixPath(base_name)
+        owner, repo = repository_parts(item)
+        entries.append({
+            'item': item,
+            'base': base,
+            'stem': base.stem,
+            'suffix': base.suffix,
+            'owner': ascii_slug(owner, 'owner'),
+            'repo': ascii_slug(repo, 'repo'),
+            'level': 0,
+        })
+    groups = {}
+    for entry in entries:
+        groups[entry['base'].name.casefold()] = groups.get(entry['base'].name.casefold(), 0) + 1
+    for entry in entries:
+        if groups[entry['base'].name.casefold()] > 1:
+            entry['level'] = 1
+        entry['candidate'] = _rule_candidate(entry)
+
+    # 先保护无冲突的单来源文件名，再逐级把冲突条目提升到 owner、repo 后缀。
+    while True:
+        conflicts = {}
+        for entry in entries:
+            conflicts.setdefault(str(entry['candidate']).casefold(), []).append(entry)
+        conflicts = {path: rows for path, rows in conflicts.items() if len(rows) > 1}
+        if not conflicts:
+            break
+        escalated = False
+        blocked = []
+        for path, rows in sorted(conflicts.items()):
+            levels = {entry['level'] for entry in rows}
+            if 0 in levels:
+                targets = [entry for entry in rows if 0 < entry['level'] < 2]
+            else:
+                lowest = min(levels)
+                targets = [entry for entry in rows if entry['level'] == lowest and entry['level'] < 2]
+            if not targets:
+                blocked.append((path, rows))
+                continue
+            for entry in targets:
+                entry['level'] += 1
+                entry['candidate'] = _rule_candidate(entry)
+            escalated = True
+        if not escalated:
+            details = []
+            for path, rows in sorted(blocked):
+                details.append(path + ' ← ' + '、'.join(
+                    f"{entry['item']['id']} ({entry['item'].get('repository', '')})" for entry in rows))
+            raise ValueError('规则集产物路径无法消解：' + '；'.join(details))
+
+    for entry in entries:
+        entry['item']['output'] = entry['candidate'].name
+
+
+def _rule_candidate(entry):
+    if entry['level'] == 0:
+        return entry['base']
+    if entry['level'] == 1:
+        return PurePosixPath(f"{entry['stem']}-{entry['owner']}{entry['suffix']}")
+    return PurePosixPath(f"{entry['stem']}-{entry['owner']}-{entry['repo']}{entry['suffix']}")
