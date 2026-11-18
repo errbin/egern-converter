@@ -383,6 +383,9 @@ export const pipelineContracts = {
   "surge.createResponse": [
     "9a250df3c244e74a6d8562cddaeaebcefa8cbef0be532f5be3abf8a01dff3df8"
   ],
+  "loon.createResponse": [
+    "9a250df3c244e74a6d8562cddaeaebcefa8cbef0be532f5be3abf8a01dff3df8"
+  ],
   "surge.setupArgument": [
     "18fa5fe9c1ee323473623d4035e859276f02e78c0fe5b0d7aab285544724bc27",
     "89e8af89a312b6027997d9e3e510707832b95f0aeed170b6865732e4d5b3ce91",
@@ -444,6 +447,7 @@ export function lowerPipeline(source,format,options={}) {
  const roots=classes.filter(c=>c.body.body.some(m=>m.static&&key(m)==='createInstance'));
  if(!roots.length)return {source,lowered:false};
  const edits=new WeakMap(),removed=new Set(),preamble=[],gaps=[];
+ let trailersDiscarded=false;
  const names=new Set(nodes.filter(n=>n.type==='Identifier').map(n=>n.name));
  const fresh=base=>{let name=base,i=2;while(names.has(name))name=base+i++;names.add(name);return name;};
  const fail=(n,message)=>{throw Error('中间件客户端第 '+source.slice(0,n.start).split('\n').length+' 行：'+message);};
@@ -459,12 +463,46 @@ export function lowerPipeline(source,format,options={}) {
   const family=new Set([root]);let changed=true;
   while(changed){changed=false;for(const c of classes)if(!family.has(c)&&family.has(resolve(c.superClass))){family.add(c);changed=true;}}
   const classNames=new Set(nodes.filter(n=>n.type==='Identifier'&&family.has(resolve(n))).map(n=>n.name));
+  const outside=n=>![...family].some(c=>n.start>=c.start&&n.end<=c.end);
   const binaryPredicates=new Set();
   for(const binding of new Set(nodes.filter(n=>n.type==='Identifier').map(n=>bindings.get(n)).filter(Boolean))){
    const fn=binding.fn,statements=fn?.body?.body;
    if(binding.writes.length||fn?.params.length!==1||fn.params[0].type!=='Identifier'||!Array.isArray(statements)||statements.length!==1||statements[0].type!=='ReturnStatement')continue;
    const result=statements[0].argument;
    if(result?.type==='BinaryExpression'&&result.operator==='instanceof'&&result.left.type==='Identifier'&&bindings.get(result.left)===bindings.get(fn.params[0])&&free(result.right,'Uint8Array'))binaryPredicates.add(binding);
+  }
+  function exactTrailerDescriptor(entry){
+   if(entry?.type!=='Property'||entry.kind!=='init'||entry.computed||key(entry)!=='trailers')return false;
+   const value=entry.value;
+   if(value?.type!=='ObjectExpression'||value.properties.length!==2)return false;
+   const get=value.properties.find(p=>p.type==='Property'&&p.kind==='init'&&p.method&&!p.computed&&key(p)==='get');
+   const set=value.properties.find(p=>p.type==='Property'&&p.kind==='init'&&p.method&&!p.computed&&key(p)==='set');
+   if(!get||!set)return false;
+   const getter=get.value,setter=set.value;
+   if(getter.type!=='FunctionExpression'||getter.async||getter.generator||getter.params.length||getter.body.body.length!==1)fail(entry,'trailers 读取器不是封闭的 this.h2_trailers 访问器');
+   const returned=getter.body.body[0]?.argument;
+   if(getter.body.body[0]?.type!=='ReturnStatement'||returned?.type!=='MemberExpression'||returned.object.type!=='ThisExpression'||returned.computed||property(returned)!=='h2_trailers')fail(entry,'trailers 读取器不是封闭的 this.h2_trailers 访问器');
+   if(setter.type!=='FunctionExpression'||setter.async||setter.generator||setter.params.length!==1||setter.params[0].type!=='Identifier'||setter.body.body.length!==1)fail(entry,'trailers 写入器不是封闭的 this.h2_trailers 赋值');
+   const statement=setter.body.body[0],assignment=statement.expression;
+   if(statement.type!=='ExpressionStatement'||assignment?.type!=='AssignmentExpression'||assignment.operator!=='='||assignment.left.type!=='MemberExpression'||assignment.left.object.type!=='ThisExpression'||assignment.left.computed||property(assignment.left)!=='h2_trailers'||assignment.right.type!=='Identifier'||bindings.get(assignment.right)!==bindings.get(setter.params[0]))fail(entry,'trailers 写入器不是封闭的 this.h2_trailers 赋值');
+   return true;
+  }
+  // 只接受「已登记基态 + 恰好一个 trailers 访问器」。剥离后仍用同一
+  // methodContract 哈希匹配，因此其它字段、描述符标志或参数变化都不会通过。
+  function canonicalLoonCreateResponse(method){
+   if(method?.type!=='MethodDefinition'||method.static||method.computed||method.kind!=='method'||key(method)!=='createResponse')return null;
+   const fn=method.value,body=fn?.body?.body;
+   if(fn?.type!=='FunctionExpression'||fn.async||fn.generator||body?.length!==1||body[0].type!=='ReturnStatement')return null;
+   const call=body[0].argument;
+   if(call?.type!=='CallExpression'||call.arguments.length!==2||call.callee.type!=='MemberExpression'||property(call.callee)!=='create'||!free(call.callee.object,'Object'))return null;
+   const descriptors=call.arguments[1];
+   if(descriptors?.type!=='ObjectExpression'||descriptors.properties.length!==2)return null;
+   const names=descriptors.properties.map(p=>p.type==='Property'&&!p.computed?key(p):undefined).sort();
+   if(names[0]!=='bodyBytes'||names[1]!=='trailers')return null;
+   if(!exactTrailerDescriptor(descriptors.properties.find(p=>key(p)==='trailers')))return null;
+   const canonical=JSON.parse(JSON.stringify(fn));
+   canonical.body.body[0].argument.arguments[1].properties=canonical.body.body[0].argument.arguments[1].properties.filter(p=>key(p)!=='trailers');
+   return canonical;
   }
   function check(method,kind){
    const externalNames=new Map();
@@ -483,7 +521,13 @@ export function lowerPipeline(source,format,options={}) {
     const chain=method.value.body.body.at(-1)?.expression,caught=chain?.callee?.object,dispatch=caught?.callee?.object,compose=dispatch?.callee?.callee;
     if(compose?.type==='Identifier'&&functions.has(resolve(compose)?.type)&&methodContract(resolve(compose))===middlewareCompose)externalNames.set(compose.name,{reviewedExternal:'middleware-compose'});
    }
-   if(!method||!pipelineContracts[kind]?.includes(methodContract(method.value,classNames,externalNames)))fail(method??root,'未知的 '+kind+' 语义契约，拒绝替换 SDK 行为');
+   let value=method?.value,trailers=false;
+   if(method&&kind==='loon.createResponse'){
+    const canonical=canonicalLoonCreateResponse(method);
+    if(canonical){value=canonical;trailers=true;}
+   }
+   if(!method||!pipelineContracts[kind]?.includes(methodContract(value,classNames,externalNames)))fail(method??root,'未知的 '+kind+' 语义契约，拒绝替换 SDK 行为');
+   return trailers;
   }
   // Only this closed, inherited factory protocol is eligible. Other JS classes
   // continue through the general compiler rather than acquiring this privilege.
@@ -494,7 +538,10 @@ export function lowerPipeline(source,format,options={}) {
   const surge=[...family].find(c=>resolve(c.superClass)===root),loon=[...family].find(c=>resolve(c.superClass)===surge);
   if(!surge||!loon)fail(root,'无法确定平台类');
   for(const c of [surge,loon])if(c.body.body.some(m=>m.type!=='MethodDefinition'||m.static||m.computed))fail(c,'平台类包含额外初始化行为');
-  for(const [c,kind]of [[surge,'surge'],[loon,'loon']])for(const m of c.body.body)check(m,kind+'.'+key(m));
+  for(const [c,kind]of [[surge,'surge'],[loon,'loon']])for(const m of c.body.body){
+   const trailers=check(m,kind+'.'+key(m));
+   if(kind==='loon'&&key(m)==='createResponse'&&trailers)trailersDiscarded=true;
+  }
   for(const c of family){
    const keys=c.body.body.map(m=>String(m.static)+':'+key(m));
    if(new Set(keys).size!==keys.length)fail(c,'客户端成员重复声明');
@@ -545,9 +592,48 @@ export function lowerPipeline(source,format,options={}) {
   nativeMethods.push('abort(){return $native.abort();}');
   // Reject genuinely unmapped transport requirements independently of result
   // propagation. A missing API is never replaced by guessed device fields.
-  const outside=n=>![...family].some(c=>n.start>=c.start&&n.end<=c.end);
   const externalCalls=nodes.filter(n=>n.type==='CallExpression'&&n.callee.type==='MemberExpression'&&outside(n));
   for(const n of externalCalls)if(['done','exit','abort','notify','createRequest','createResponse'].includes(property(n.callee)))fail(n,'SDK 完成／通知方法从中间件内部调用，需要独立的提前终止传播证明');
+  // Egern 没有 HTTP trailers 等价物。仅在已接受安全 trailers 描述符时，
+  // 丢弃响应 trailers 的写入，并把其读取归为 undefined；随后仍扫描产物，
+  // 任何未证明形态或残留字段都会拒绝，绝不把旧能力带进输出。
+  if(trailersDiscarded){
+   const fetchesTrailers=n=>{
+    if(n?.type!=='MemberExpression'||n.computed||property(n)!=='trailers')return false;
+    const object=n.object;
+    if(object.type==='Identifier'){
+     const binding=bindings.get(object);
+     if(!binding||binding.writes.length)return false;
+     let init=binding.init;
+     if(init?.type==='AwaitExpression')init=init.argument;
+     return init?.type==='CallExpression'&&init.callee.type==='MemberExpression'&&property(init.callee)==='fetch';
+    }
+    return false;
+   };
+   for(const n of nodes){
+    if(n.type!=='MemberExpression'||!outside(n))continue;
+    const name=property(n);
+    if(name!=='trailers'&&name!=='h2_trailers')continue;
+    const parent=parents.get(n);
+    if(parent?.type==='AssignmentExpression'&&parent.left===n){
+     let statement=parent;
+     while(parents.get(statement)?.type==='SequenceExpression')statement=parents.get(statement);
+     statement=parents.get(statement);
+     if(parent.operator!=='='||statement?.type!=='ExpressionStatement')fail(n,'无法丢弃有副作用的 trailers 写入');
+     if(fetchesTrailers(parent.right)){
+      edits.set(parent,'void 0');
+      continue;
+     }
+     const pure=n=>n?.type==='Literal'||n?.type==='Identifier'||n?.type==='UnaryExpression'&&n.operator==='void'||n?.type==='MemberExpression'&&!n.computed;
+     if(!pure(parent.right))fail(n,'无法丢弃有副作用的 trailers 写入');
+     edits.set(parent,'void 0');
+     continue;
+    }
+    const response=n.object.type==='MemberExpression'&&!n.object.computed&&property(n.object)==='response';
+    if(response||fetchesTrailers(n)){edits.set(n,'void 0');continue;}
+    fail(n,'无法证明 trailers 访问只读取响应或已审查的 fetch 结果');
+   }
+  }
   // Select the author's default (Surge) protocol, independent of the module
   // syntax. Its optional trailer check/fallback remains ordinary upstream JS.
   // Native snapshots deliberately expose the documented message fields only.
@@ -603,7 +689,13 @@ export function lowerPipeline(source,format,options={}) {
   edits.set(root,originalRoot());
   lowered=true;
  }
- return {source:lowered?preamble.join('\n')+'\n'+emit(tree):source,lowered,gaps,verificationFormat:lowered?'surge':undefined};
+ const output=lowered?preamble.join('\n')+'\n'+emit(tree):source;
+ if(trailersDiscarded){
+  const checkTree=parse(output,{ecmaVersion:'latest',allowReturnOutsideFunction:true,allowAwaitOutsideFunction:true}),checkIx=index(checkTree);
+  const residual=checkIx.nodes.find(n=>n.type==='MemberExpression'&&['trailers','h2_trailers'].includes(property(n))||n.type==='Property'&&['trailers','h2_trailers'].includes(key(n)));
+  if(residual)fail(residual,'trailers 已裁定丢弃，但产物仍包含 trailers 字段');
+ }
+ return {source:output,lowered,gaps,verificationFormat:lowered?'surge':undefined};
 }
 
 // Erase a closed, reviewed MagicJS factory; map only the members actually used.
