@@ -90,6 +90,13 @@ class UnsupportedRuleTests(unittest.TestCase):
             convert_rules('PROCESS-NAME,Example.app', ignored_rule_types={'PROCESS-NAME'},
                           diagnostics=diagnostics)
 
+    def test_all_ignored_rules_report_the_unsupported_rule_reason(self):
+        with self.assertRaises(ConversionError) as raised:
+            convert_rules('PROCESS-NAME,Example.app', ignored_rule_types={'PROCESS-NAME'})
+        reason = str(raised.exception)
+        self.assertIn('不支持的规则', reason)
+        self.assertIn('PROCESS-NAME x 1', reason)
+
     def test_url_regex_and_user_agent_remain_supported_and_case_sensitive(self):
         converted = convert_rules('URL-REGEX,^https://Case/\nUSER-AGENT,MyApp')
         self.assertEqual(converted['url_regex_set'], ['^https://Case/'])

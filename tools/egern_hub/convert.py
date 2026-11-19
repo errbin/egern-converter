@@ -155,7 +155,7 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
     else:
         lines = list(active_lines(text))
     ignored_rule_types = {str(value).upper() for value in (ignored_rule_types or ())}
-    result, seen, flags = {}, {}, set()
+    result, seen, flags, ignored = {}, {}, set(), []
     for number, line in lines:
         try:
             if ignored_rule_types and isinstance(line, str):
@@ -163,13 +163,15 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
                 rule_type = active.split(',', 1)[0].strip().upper()
                 if rule_type in ignored_rule_types:
                     fields = next(csv.reader([active], skipinitialspace=True))
+                    diagnostic = {
+                        'type': rule_type,
+                        'line': number,
+                        'value': fields[1].strip() if len(fields) > 1 else '',
+                        'reason': 'Egern 规则集不支持该匹配类型',
+                    }
+                    ignored.append(diagnostic)
                     if diagnostics is not None:
-                        diagnostics.append({
-                            'type': rule_type,
-                            'line': number,
-                            'value': fields[1].strip() if len(fields) > 1 else '',
-                            'reason': 'Egern 规则集不支持该匹配类型',
-                        })
+                        diagnostics.append(diagnostic)
                     continue
             if source_format == 'domain-set':
                 if not isinstance(line, str) or not re.fullmatch(r'\.?[\w*-]+(?:\.[\w*-]+)*', line):
@@ -192,10 +194,10 @@ def convert_rules(text, source_format='surge', *, source_path='', include_loader
     if flags == {True}:
         result['no_resolve'] = True
     if not seen:
-        if diagnostics:
-            counts = Counter(row['type'] for row in diagnostics)
+        if ignored:
+            counts = Counter(row['type'] for row in ignored)
             detail = '、'.join(f'{rule_type} x {count}' for rule_type, count in sorted(counts.items()))
-            raise ConversionError(f'规则集为空（已跳过 Egern 不支持的 {detail}）')
+            raise ConversionError(f'规则集为空（已跳过全部不支持的规则：{detail}）')
         raise ConversionError('规则集为空')
     return result
 
