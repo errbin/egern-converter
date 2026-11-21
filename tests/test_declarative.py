@@ -102,6 +102,7 @@ class DeclarativeClassifierTests(unittest.TestCase):
             "function f(){return 'x'} $done({body: f()});",
             "var obj = JSON.parse($response.body); delete obj.a.b; delete obj.a; "
             "$done({body: JSON.stringify(obj)});",
+            "$done({body: 'fixed', headers: {'X-A': '1'}});",
             '"use strict"; var obj = JSON.parse($response.body); obj.a = 1; '
             "$done({body: JSON.stringify(obj)});",
             "var obj = JSON.parse($response.body); other.a = 1; "

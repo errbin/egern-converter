@@ -235,6 +235,9 @@ function classifyDeclarative(source){
 
   if(doneProperties.has('headers')&&!doneProperties.has('status')&&!doneProperties.has('body'))
     return classifyHeaders(tree,done,doneProperties)||{kind:'unsafe'};
+  // body 与 headers 同时出现时，map_local/jq 只能折叠 body，不能证明
+  // header 副作用也等价；保留 scriptings。
+  if(doneProperties.has('body')&&doneProperties.has('headers'))return {kind:'unsafe'};
 
   const bindings=new Map();
   const operations=[];
