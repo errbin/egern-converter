@@ -219,3 +219,24 @@ def validate_generated(scripts):
     errors = json.loads(result.stdout)
     if errors:
         raise ValueError('生成脚本语法错误：' + '；'.join(errors))
+
+
+def classify_declarative(scripts):
+    """静态识别可折叠为声明式规则的固定脚本，不执行任何上游代码。"""
+    validate_analysis_layout()
+    tool = Path(__file__).resolve().parents[2] / 'tools/js-analysis/check.mjs'
+    try:
+        result = subprocess.run(['node', str(tool), '--declarative'],
+                                input=json.dumps(scripts, ensure_ascii=False),
+                                text=True, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError('声明式降级分析需要 Node.js') from exc
+    if result.returncode:
+        raise ValueError('声明式降级分析失败：' + result.stderr[-800:])
+    try:
+        report = json.loads(result.stdout)
+    except ValueError as exc:
+        raise ValueError('声明式降级分析未返回 JSON') from exc
+    if not isinstance(report, dict) or set(report) != set(scripts):
+        raise ValueError('声明式降级分析返回的脚本集合不一致')
+    return report

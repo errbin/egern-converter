@@ -9,9 +9,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 import zlib
+
+import yaml
 
 from .layout import read_source
 from .js_analysis import analyze_many, emit_progress
@@ -273,6 +277,240 @@ def replay_case(source, platform, url, case):
                                    'headers':{'Content-Type':'application/json'},'body':body})
     return None
 
+OFFICIAL_REJECTS = frozenset({
+    'http://reject/', 'http://reject-200/', 'http://reject-dict/',
+    'http://reject-array/', 'http://reject-img/', 'http://reject-video/',
+})
+REDIRECT_CODES = frozenset({301, 302, 307, 308})
+MISSING = object()
+_INLINE_FLAGS = re.compile(r'\(\?[aiLmsuxU-]+([:)])')
+
+
+def is_anchored(match):
+    """`^`、`\\A` 或行内模式组内的开头锚点都视为已锚定。"""
+    if not isinstance(match, str):
+        return False
+    text = match
+    while True:
+        if text.startswith('^') or text.startswith('\\A'):
+            return True
+        group = _INLINE_FLAGS.match(text)
+        if not group:
+            return False
+        if group.group(1):
+            return text[group.end():].startswith('^')
+        text = text[group.end():]
+
+
+def _module_loader():
+    class Loader(yaml.SafeLoader):
+        pass
+    Loader.add_constructor('tag:yaml.org,2002:value',
+                           lambda loader, node: loader.construct_scalar(node))
+    return Loader
+
+
+_SENTINEL = re.compile(
+    r'(?m)^([ \t]*[^#\s][^:\n]*:[ \t]*)\{\{\{[^{}\n]+\}\}\}([ \t]*(?:#.*)?)$')
+
+
+def parse_module_yaml(text):
+    if not isinstance(text, str):
+        return text
+    return yaml.load(_SENTINEL.sub(
+        lambda row: row.group(1) + '"__egern_template_value__"' + row.group(2), text),
+        Loader=_module_loader())
+
+
+def iter_matches(obj):
+    """枚举所有声明式 match，保持输出顺序便于定位。"""
+    for index, row in enumerate(obj.get('url_rewrites') or []):
+        if isinstance(row, dict):
+            yield 'url_rewrites', index, row.get('match'), row
+    for index, row in enumerate(obj.get('rewrites') or []):
+        if isinstance(row, dict):
+            yield 'rewrites', index, row.get('match'), row
+    for index, row in enumerate(obj.get('header_rewrites') or []):
+        if not isinstance(row, dict):
+            continue
+        for action in ('add', 'delete', 'replace'):
+            entry = row.get(action)
+            if isinstance(entry, dict):
+                yield 'header_rewrites.' + action, index, entry.get('match'), entry
+    for index, row in enumerate(obj.get('body_rewrites') or []):
+        if not isinstance(row, dict):
+            continue
+        for phase, entry in row.items():
+            if phase in {'request_jq', 'response_jq', 'request_regex', 'response_regex'} \
+                    and isinstance(entry, dict):
+                yield 'body_rewrites.' + phase, index, entry.get('match'), entry
+    for index, row in enumerate(obj.get('map_locals') or []):
+        if isinstance(row, dict):
+            yield 'map_locals', index, row.get('match'), row
+    for index, row in enumerate(obj.get('scriptings') or []):
+        if not isinstance(row, dict):
+            continue
+        for phase, entry in row.items():
+            if phase in {'http_request', 'http_response'} and isinstance(entry, dict):
+                yield 'scriptings.' + str(phase), index, entry.get('match'), entry
+
+
+def iter_jq_filters(obj):
+    """返回所有 request_jq/response_jq 的 filter，包括原生 rewrites 动作。"""
+    for index, row in enumerate(obj.get('body_rewrites') or []):
+        if not isinstance(row, dict):
+            continue
+        for phase in ('request_jq', 'response_jq'):
+            entry = row.get(phase)
+            if isinstance(entry, dict) and isinstance(entry.get('filter'), str):
+                yield f'body_rewrites.{phase}[{index}]', entry['filter']
+    for index, row in enumerate(obj.get('rewrites') or []):
+        if not isinstance(row, dict):
+            continue
+        for action_index, action in enumerate(row.get('actions') or []):
+            if not isinstance(action, dict):
+                continue
+            for phase in ('request_body', 'response_body'):
+                value = action.get(phase)
+                if isinstance(value, dict) and isinstance(value.get('jq'), str):
+                    yield f'rewrites[{index}].actions[{action_index}].{phase}.jq', value['jq']
+
+
+def jq_parses(filter_text, executable='jq'):
+    """用 jq 编译过滤器；返回 (ok, returncode, stderr)。jq 缺失时 ok=None。"""
+    if not shutil.which(executable):
+        return None, None, f'{executable} 不可用'
+    result = subprocess.run([executable, '-n', '-c', filter_text],
+                            text=True, capture_output=True, timeout=20)
+    # jq 退出码 3 是编译错误；5 等运行错误不影响语法合法性。
+    return result.returncode != 3, result.returncode, result.stderr.strip()
+
+
+def location_is_valid(location):
+    """校验重定向目标；`$n` 捕获引用和模块参数模板属于合法写法。"""
+    if not isinstance(location, str) or not location:
+        return False
+    if location in OFFICIAL_REJECTS:
+        return True
+    if re.match(r'https?://reject', location):
+        # token 合法性由 reject 检查单独报告，避免同一问题重复计数。
+        return True
+    captures = bool(re.search(r'\$\d+', location))
+    expanded = re.sub(r'\{\{\{[^{}]+\}\}\}', 'placeholder', location)
+    expanded = re.sub(r'\$\d+', 'capture', expanded)
+    # 捕获组可以位于 URL 开头，也可能自身拼出完整 URL。
+    if captures and '://' not in expanded:
+        return not re.search(r'\s', location)
+    try:
+        parsed = urlsplit(expanded)
+    except ValueError:
+        return False
+    return parsed.scheme in {'http', 'https'} and bool(parsed.netloc)
+
+
+def validate_declarative_module(obj, *, jq_executable='jq', check_anchors=True):
+    """静态校验单个模块；返回发现列表，不修改输入。"""
+    findings = []
+    if not isinstance(obj, dict):
+        return findings
+    for section, index, match, entry in iter_matches(obj):
+        if not isinstance(match, str) or not match:
+            findings.append({'kind': 'match', 'section': section, 'index': index,
+                             'value': match, 'message': 'match 必须是非空字符串'})
+            continue
+        if check_anchors and not is_anchored(match):
+            findings.append({'kind': 'unanchored', 'section': section, 'index': index,
+                             'value': match, 'message': 'match 未以 ^ 锚定'})
+        if section == 'url_rewrites':
+            location = entry.get('location')
+            if not location_is_valid(location):
+                findings.append({'kind': 'location', 'section': section, 'index': index,
+                                 'value': location, 'message': 'location 不是合法 URL、官方 reject 或捕获模板'})
+            if re.match(r'https?://reject', location or '') \
+                    and location not in OFFICIAL_REJECTS:
+                findings.append({'kind': 'reject', 'section': section, 'index': index,
+                                 'value': location, 'message': '非官方 reject token'})
+            status = entry.get('status_code', MISSING)
+            if status is not MISSING and status not in REDIRECT_CODES:
+                findings.append({'kind': 'status', 'section': section, 'index': index,
+                                 'value': status, 'message': 'redirect status_code 非法'})
+    for path, filter_text in iter_jq_filters(obj):
+        ok, returncode, error = jq_parses(filter_text, jq_executable)
+        if ok is False:
+            findings.append({'kind': 'jq', 'section': path, 'index': None,
+                             'value': filter_text, 'message': f'jq 编译失败（{returncode}）：{error[:160]}'})
+        elif ok is None:
+            findings.append({'kind': 'jq-missing', 'section': path, 'index': None,
+                             'value': '', 'message': error})
+    for index, row in enumerate(obj.get('header_rewrites') or []):
+        if not isinstance(row, dict):
+            findings.append({'kind': 'header', 'section': 'header_rewrites', 'index': index,
+                             'value': row, 'message': 'header_rewrites 条目必须是对象'})
+            continue
+        actions = [name for name in ('add', 'delete', 'replace') if name in row]
+        if len(actions) != 1:
+            findings.append({'kind': 'header', 'section': 'header_rewrites', 'index': index,
+                             'value': row, 'message': 'header_rewrites 条目必须恰好包含一个动作'})
+            continue
+        action = actions[0]
+        data = row[action]
+        if not isinstance(data, dict) or not isinstance(data.get('match'), str) \
+                or not isinstance(data.get('name'), str) or not data.get('name'):
+            findings.append({'kind': 'header', 'section': 'header_rewrites', 'index': index,
+                             'value': row, 'message': 'header action 缺少 match/name'})
+            continue
+        if data.get('type', 'request') not in {'request', 'response'}:
+            findings.append({'kind': 'header', 'section': 'header_rewrites', 'index': index,
+                             'value': row, 'message': 'header type 必须是 request 或 response'})
+        if action in {'add', 'replace'} and not isinstance(data.get('value'), str):
+            findings.append({'kind': 'header', 'section': 'header_rewrites', 'index': index,
+                             'value': row, 'message': 'header add/replace 缺少字符串 value'})
+    return findings
+
+
+def validate_product_quality(resources, *, jq_executable='jq'):
+    """审计整个模块产物；调用方决定锚点问题是否阻断。"""
+    report = {'modules': 0, 'parsed': 0, 'matches': {}, 'unanchored': {},
+              'jq_total': 0, 'findings': []}
+    for resource in resources:
+        if not isinstance(resource, dict) or resource.get('kind') != 'modules':
+            continue
+        report['modules'] += 1
+        try:
+            obj = resource.get('_module') or parse_module_yaml(resource.get('yaml', ''))
+        except yaml.YAMLError as exc:
+            report['findings'].append({'kind': 'yaml', 'section': 'module',
+                                       'index': None, 'value': resource.get('id', ''),
+                                       'message': str(exc)[:200]})
+            continue
+        if not isinstance(obj, dict):
+            report['findings'].append({'kind': 'yaml', 'section': 'module',
+                                       'index': None, 'value': resource.get('id', ''),
+                                       'message': '模块不是对象'})
+            continue
+        report['parsed'] += 1
+        for section, index, match, entry in iter_matches(obj):
+            report['matches'][section] = report['matches'].get(section, 0) + 1
+            if not is_anchored(match):
+                report['unanchored'][section] = report['unanchored'].get(section, 0) + 1
+        report['jq_total'] += sum(1 for _ in iter_jq_filters(obj))
+        for finding in validate_declarative_module(obj, jq_executable=jq_executable,
+                                                   check_anchors=False):
+            report['findings'].append(dict(finding, module=resource.get('id', '')))
+    report['jq_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'jq')
+    report['jq_missing'] = sum(1 for row in report['findings'] if row['kind'] == 'jq-missing')
+    report['yaml_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'yaml')
+    report['match_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'match')
+    report['reject_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'reject')
+    report['location_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'location')
+    report['status_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'status')
+    report['header_bad'] = sum(1 for row in report['findings'] if row['kind'] == 'header')
+    report['unanchored_total'] = sum(report['unanchored'].values())
+    report['declarative_unanchored'] = sum(
+        count for section, count in report['unanchored'].items()
+        if not section.startswith('scriptings.'))
+    return report
+
 
 def verify_scripts(scripts, fetched, generated, fixture_dir=None, *, auto=True):
     fixtures = validate_fixtures(fixture_dir) if fixture_dir else {}
@@ -359,6 +597,7 @@ def main():
     parser.add_argument('--fixtures',type=Path,help='Optional external samples for supplemental differential checks')
     parser.add_argument('--output',type=Path,help='默认写入站点目录 verification.json')
     parser.add_argument('--require-covered',action='store_true',help='存在未触发行为、部分验证或未确认的脚本时返回非零退出码')
+    parser.add_argument('--strict-anchors',action='store_true',help='存在未以 ^ 锚定的 match 时返回非零退出码')
     args = parser.parse_args()
     manifest = json.loads((args.site/'conversion.json').read_text())
     scripts,fetched,generated = [],{},{}
@@ -374,11 +613,27 @@ def main():
                 parser.error(identity+': 原文或产物摘要已变更，请重新构建后验证')
         scripts.append(item);fetched[identity]=original;generated[identity]=artifact
     report = verify_scripts(scripts,fetched,generated,args.fixtures)
+    quality = None
+    modules_path = args.site/'modules.json'
+    if modules_path.is_file():
+        snapshot = json.loads(modules_path.read_text(encoding='utf-8'))
+        quality = validate_product_quality(snapshot.get('resources', []))
+        report['quality'] = quality
+        print(json.dumps({key: quality[key] for key in
+                          ('modules','parsed','jq_total','jq_bad','jq_missing',
+                           'yaml_bad','match_bad','reject_bad','location_bad',
+                           'status_bad','header_bad',
+                           'declarative_unanchored','unanchored_total')},
+                         ensure_ascii=False))
     output = args.output or args.site/'verification.json'
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(report['summary'],ensure_ascii=False)+' → '+str(output))
-    if report['summary'].get('failed') or report['unused_fixture_urls'] or report.get('unused_fixture_cases') or (args.require_covered and any(row['status'] not in {'passed','probe_passed'} for row in report['scripts'].values())):
+    quality_failed = bool(quality and any(quality[key] for key in (
+        'jq_bad', 'jq_missing', 'yaml_bad', 'match_bad', 'reject_bad',
+        'location_bad', 'status_bad', 'header_bad')))
+    anchor_failed = bool(quality and args.strict_anchors and quality['unanchored_total'])
+    if report['summary'].get('failed') or report['unused_fixture_urls'] or report.get('unused_fixture_cases') or (args.require_covered and any(row['status'] not in {'passed','probe_passed'} for row in report['scripts'].values())) or quality_failed or anchor_failed:
         raise SystemExit(1)
 
 
